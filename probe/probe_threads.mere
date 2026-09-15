@@ -1,0 +1,71 @@
+// probe/probe_threads.mere — can mengd serve two connections at once?
+//
+// `docker run` sends /wait BEFORE /start, on a separate connection, and /wait
+// does not return until the container exits. A server that handles one
+// connection to completion before accepting the next therefore DEADLOCKS on
+// the simplest possible run: the wait never returns because the start is never
+// accepted.
+//
+// So this is measured before the container routes are written. A client
+// connects twice; the first connection is answered only after the second one
+// has been served. If the accept loop is serial, the second client never gets
+// a reply and this hangs -- which is why the harness runs it under a timeout.
+
+extern fn unix_listen: str -> int;
+extern fn unix_accept: int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> int;
+extern fn mem_alloc: int -> int;
+extern fn str_ptr: str -> int;
+
+let reply = fn (fd: int) -> fn (body: str) ->
+  let msg = "HTTP/1.1 200 OK\r\nContent-Length: " ++ show (str_len body)
+            ++ "\r\nConnection: close\r\n\r\n" ++ body in
+  let p = str_ptr msg in
+  let rec send = fn (off: int) ->
+    if off >= str_len msg then off
+    else
+      let w = tcp_write fd (p + off) (str_len msg - off) in
+      if w <= 0 then off else send (off + w) in
+  let _ = send 0 in
+  let _ = tcp_close fd in
+  ();
+
+// The "slow" connection: it does not answer until the marker file appears,
+// which the second connection creates. One thread cannot do this.
+let slow = fn (fd: int) -> fn (marker: str) ->
+  let rec wait_for = fn (n: int) ->
+    if file_exists marker then n
+    else if n > 300 then n            // ~30 s, then give up and answer anyway
+    else let _ = sleep_ms 100 in wait_for (n + 1) in
+  let n = wait_for 0 in
+  reply fd (if file_exists marker then "slow-after-fast" else "slow-timed-out");
+
+let fast = fn (fd: int) -> fn (marker: str) ->
+  let _ = write_file marker "x" in
+  reply fd "fast";
+
+let serve = fn (sock: str) -> fn (marker: str) ->
+  let srv = unix_listen sock in
+  let _ = if srv < 0 then let _ = print_err "listen failed" in exit 1 else () in
+  let _ = print_err "ready" in
+  let buf = mem_alloc 4096 in
+  let rec loop = fn (n: int) ->
+    if n >= 2 then ()
+    else
+      let c = unix_accept srv in
+      if c < 0 then loop n
+      else
+        let _ = tcp_read c buf 4095 in
+        let _ = spawn (fn (u: unit) ->
+                  if n == 0 then slow c marker else fast c marker) in
+        loop (n + 1) in
+  let _ = loop 0 in
+  // Give the threads time to finish before the process exits.
+  let _ = sleep_ms 2000 in
+  ();
+
+match args () with
+| [sock, marker] -> serve sock marker
+| _ -> let _ = print_err "usage: probe_threads <sock> <marker>" in exit 2

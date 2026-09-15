@@ -113,9 +113,41 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## The next slice needs concurrency, and that was measured first
+
+`docker run` sends `/containers/{id}/wait` **before** `/containers/{id}/start`,
+on its own connection, and `/wait` does not return until the container exits. A
+server that finishes one connection before accepting the next therefore
+deadlocks on the simplest possible run — the wait cannot return because the
+start is never accepted. Detached (`-d`) does not avoid it:
+
+```
+POST /v1.54/containers/create?name=p23
+POST /v1.54/containers/<id>/wait?condition=next-exit     <- sent first
+POST /v1.54/containers/<id>/start
+```
+
+So the architecture question was measured before any container route was
+written:
+
+```sh
+sh probe/run_threads.sh
+```
+
+```
+  ok    spawn per connection: the second client is served while the first blocks
+  ok    without spawn it deadlocks, so the check can tell the difference
+```
+
+Mere's `spawn` is a real `pthread_create` on the C backend, and a thread per
+connection does it. The second line is the poison: the same probe with `spawn`
+removed, where both clients time out. A "concurrent" result from a harness that
+cannot report "serial" would not be a measurement.
+
 ## What is next
 
-The route the client asks for next. `/images/{name}/json` for inspect, then
-`/containers/*` and `/exec/*` so `docker run` works, then `/networks/*`,
-`/volumes/*` and `/events` for `docker compose up`. The container work itself
-goes to [mrun](https://github.com/284km/mrun).
+`/containers/create`, `/start`, `/wait`, `/json`, `/logs` and `DELETE` — the six
+that `docker run -d` uses — on a thread per connection, with the container run by
+[mrun](https://github.com/284km/mrun). Then `/attach`, which hijacks the
+connection and multiplexes stdout and stderr, for a foreground `docker run`.
+Then `/networks/*`, `/volumes/*` and `/events` for `docker compose up`.
