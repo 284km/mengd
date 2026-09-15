@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Api-Version: 1.54
+Builder-Version: 2
+Cache-Control: no-cache, no-store, must-revalidate
+Docker-Experimental: false
+Ostype: linux
+Pragma: no-cache
+Server: Docker/29.5.2 (linux)
+Swarm: inactive
+Date: <stripped>
+Content-Length: 2
+Content-Type: text/plain; charset=utf-8
+
+OK

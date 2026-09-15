@@ -1,0 +1,223 @@
+// mengd.mere — a Docker Engine API daemon, in Mere.
+//
+// The oracle is the `docker` CLI itself: whatever this returns has to be
+// something the real client accepts. oracle/expected/*.json is what the real
+// dockerd on this machine answered, kept for its SHAPE -- the key sets have to
+// match or the client's decoder finds a field missing.
+//
+// The VALUES are mengd's own. This is not Docker and does not claim to be: it
+// reports its own name, its own version, and zero containers because it has
+// none yet. Only the protocol is copied.
+
+extern fn unix_listen: str -> int;
+extern fn unix_accept: int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_to_str: int -> int -> str;
+extern fn str_ptr: str -> int;
+
+let mengd_version = "0.1.0";
+let api_version = "1.54";
+let min_api_version = "1.40";
+
+// ---- the smallest JSON writer that keeps this readable -------------------
+
+let esc = fn (v: str) ->
+  let n = str_len v in
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i == n then acc
+    else
+      let c = char_at v i in
+      go (i + 1) (acc ++ (if c == "\"" then "\\\"" else if c == "\\" then "\\\\" else c)) in
+  go 0 "";
+
+let s   = fn (v: str) -> "\"" ++ esc v ++ "\"";
+let n_  = fn (v: int) -> show v;
+let b   = fn (v: bool) -> if v then "true" else "false";
+let raw = fn (v: str) -> v;
+
+let rec join_pairs = fn (kvs: (str * str) list) -> fn (acc: str) ->
+  match kvs with
+  | [] -> acc
+  | [p, ...t] ->
+      let (k, v) = p in
+      let one = "\"" ++ k ++ "\":" ++ v in
+      join_pairs t (if str_len acc == 0 then one else acc ++ "," ++ one);
+
+let obj = fn (kvs: (str * str) list) -> "\{" ++ join_pairs kvs "" ++ "}";
+
+// ---- HTTP ----------------------------------------------------------------
+
+// Every response carries the headers the client reads during version
+// negotiation. Api-Version is the one that matters: the CLI downgrades itself
+// to it, and omitting it makes the client assume its own newest.
+let respond = fn (fd: int) -> fn (status: str) -> fn (ctype: str) -> fn (body: str) ->
+  let hdr = "HTTP/1.1 " ++ status ++ "\r\n"
+         ++ "Api-Version: " ++ api_version ++ "\r\n"
+         ++ "Docker-Experimental: false\r\n"
+         ++ "Ostype: linux\r\n"
+         ++ "Server: mengd/" ++ mengd_version ++ "\r\n"
+         ++ "Content-Type: " ++ ctype ++ "\r\n"
+         ++ "Content-Length: " ++ show (str_len body) ++ "\r\n"
+         ++ "Connection: close\r\n\r\n" in
+  let full = hdr ++ body in
+  // str_ptr hands back the string's own offset in the FFI arena, so the
+  // response goes out without a copy. The socket family's own idiom.
+  let p = str_ptr full in
+  let rec send = fn (off: int) ->
+    if off >= str_len full then off
+    else
+      let w = tcp_write fd (p + off) (str_len full - off) in
+      if w <= 0 then off else send (off + w) in
+  let _ = send 0 in
+  ();
+
+// "GET /v1.54/version HTTP/1.1" -> "/version". The client puts the negotiated
+// version in the path; a route table that matched on the whole thing would
+// stop working the day the client negotiates a different one.
+let strip_version = fn (p: str) ->
+  if str_len p < 3 then p
+  else if substring p 0 2 == "/v" then
+    let n = str_len p in
+    let rec go = fn (i: int) ->
+      if i >= n then p
+      else if char_at p i == "/" then substring p i n
+      else go (i + 1) in
+    go 2
+  else p;
+
+let req_method = fn (line: str) ->
+  let i = str_index_of line " " in
+  if i < 0 then "" else substring line 0 i;
+
+let req_path = fn (line: str) ->
+  let i = str_index_of line " " in
+  if i < 0 then "" else
+    let rest = substring line (i + 1) (str_len line) in
+    let j = str_index_of rest " " in
+    strip_version (if j < 0 then rest else substring rest 0 j);
+
+// ---- the routes ----------------------------------------------------------
+
+let version_body = fn (unit_: unit) ->
+  let engine = obj [("Name", s "Engine"), ("Version", s mengd_version),
+                    ("Details", obj [("ApiVersion", s api_version),
+                                     ("Arch", s "arm64"),
+                                     ("MinAPIVersion", s min_api_version),
+                                     ("Os", s "linux")])] in
+  obj [("Platform", obj [("Name", s "mengd")]),
+       ("Version", s mengd_version),
+       ("ApiVersion", s api_version),
+       ("MinAPIVersion", s min_api_version),
+       ("Os", s "linux"),
+       ("Arch", s "arm64"),
+       ("Components", raw ("[" ++ engine ++ "]")),
+       ("GitCommit", s ""),
+       ("GoVersion", s ""),
+       ("KernelVersion", s ""),
+       ("BuildTime", s "")];
+
+let info_body = fn (unit_: unit) ->
+  obj [
+    ("Architecture", s "aarch64"),
+    ("CDISpecDirs", raw "[]"),
+    ("CPUSet", b false),
+    ("CPUShares", b false),
+    ("CgroupDriver", s "cgroupfs"),
+    ("CgroupVersion", s "2"),
+    ("Containerd", raw "\{}"),
+    ("ContainerdCommit", raw "\{\"ID\":\"\"}"),
+    ("Containers", n_ 0),
+    ("ContainersPaused", n_ 0),
+    ("ContainersRunning", n_ 0),
+    ("ContainersStopped", n_ 0),
+    ("CpuCfsPeriod", b false),
+    ("CpuCfsQuota", b false),
+    ("Debug", b false),
+    ("DefaultRuntime", s "mrun"),
+    ("DiscoveredDevices", raw "[]"),
+    ("DockerRootDir", s "/var/lib/mengd"),
+    ("Driver", s "none"),
+    ("DriverStatus", raw "[]"),
+    ("ExperimentalBuild", b false),
+    ("FirewallBackend", raw "\{}"),
+    ("GenericResources", raw "null"),
+    ("HttpProxy", s ""),
+    ("HttpsProxy", s ""),
+    ("ID", s "mengd"),
+    ("IPv4Forwarding", b false),
+    ("Images", n_ 0),
+    ("IndexServerAddress", s "https://index.docker.io/v1/"),
+    ("InitBinary", s ""),
+    ("InitCommit", raw "\{\"ID\":\"\"}"),
+    ("Isolation", s ""),
+    ("KernelVersion", s ""),
+    ("Labels", raw "[]"),
+    ("LiveRestoreEnabled", b false),
+    ("LoggingDriver", s "none"),
+    ("MemTotal", n_ 0),
+    ("MemoryLimit", b false),
+    ("NCPU", n_ 1),
+    ("NEventsListener", n_ 0),
+    ("NFd", n_ 0),
+    ("NGoroutines", n_ 0),
+    ("Name", s "mengd"),
+    ("NoProxy", s ""),
+    ("OSType", s "linux"),
+    ("OSVersion", s ""),
+    ("OomKillDisable", b false),
+    ("OperatingSystem", s "linux"),
+    ("PidsLimit", b false),
+    ("Plugins", raw "\{}"),
+    ("RegistryConfig", raw "\{}"),
+    ("RuncCommit", raw "\{\"ID\":\"\"}"),
+    ("Runtimes", raw "\{}"),
+    ("SecurityOptions", raw "[]"),
+    ("ServerVersion", s mengd_version),
+    ("SwapLimit", b false),
+    ("Swarm", raw "\{}"),
+    ("SystemTime", s ""),
+    ("Warnings", raw "[]")
+  ];
+
+let handle = fn (fd: int) -> fn (m: str) -> fn (path: str) ->
+  if path == "/_ping" then
+    (if m == "HEAD" then respond fd "200 OK" "text/plain" ""
+     else respond fd "200 OK" "text/plain" "OK")
+  else if path == "/version" then respond fd "200 OK" "application/json" (version_body ())
+  else if path == "/info" then respond fd "200 OK" "application/json" (info_body ())
+  else
+    // A 404 that says what was asked for. The client prints the body, so an
+    // unimplemented route names itself instead of looking like a broken daemon.
+    let msg = obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))] in
+    respond fd "404 Not Found" "application/json" msg;
+
+// ---- accept loop ---------------------------------------------------------
+
+let serve = fn (sock: str) ->
+  let srv = unix_listen sock in
+  let _ = if srv < 0 then
+            let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1
+          else () in
+  let _ = print_err ("mengd " ++ mengd_version ++ " listening on " ++ sock) in
+  let buf = mem_alloc 65536 in
+  let rec loop = fn (unit_: unit) ->
+    let c = unix_accept srv in
+    if c < 0 then loop ()
+    else
+      let nread = tcp_read c buf 65535 in
+      let _ = if nread <= 0 then ()
+              else
+                let req = mem_to_str buf nread in
+                let e = str_index_of req "\r\n" in
+                let line = if e < 0 then req else substring req 0 e in
+                handle c (req_method line) (req_path line) in
+      let _ = tcp_close c in
+      loop () in
+  loop ();
+
+match args () with
+| [sock] -> serve sock
+| _ -> let _ = print_err "usage: mengd <socket-path>" in exit 2
