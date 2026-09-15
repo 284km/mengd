@@ -11,6 +11,7 @@
 
 import "vendor_json.mere";
 import "vendor_tar.mere";
+import "rootfs.mere";
 
 extern fn unix_listen: str -> int;
 extern fn unix_accept: int -> int;
@@ -24,6 +25,22 @@ extern fn mem_to_bytes: int -> int -> bytes;
 extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
+extern fn st_rename: str -> str -> int;
+extern fn st_spawn_logged: str -> str -> str -> str -> str -> int;
+extern fn st_wait: int -> int;
+extern fn st_kill: int -> int -> int;
+extern fn st_ignore_sigpipe: unit -> int;
+extern fn unix_time: unit -> int;
+extern fn st_slots: unit -> int;
+extern fn st_slot_acquire: unit -> int;
+extern fn st_slot_release: int -> int;
+extern fn gen_request_id: unit -> str;
+extern fn sha256_hex: str -> str;
+
+// A request trace behind an env var. The routes of one `docker run` land on
+// several connections and several threads, and "which request arrived" is the
+// first question every time something hangs.
+let env_or = fn (k: str) -> match env_var k with | Some v -> v | None -> "";
 
 let mengd_version = "0.1.0";
 let api_version = "1.54";
@@ -116,6 +133,41 @@ let req_method = fn (line: str) ->
   let i = str_index_of line " " in
   if i < 0 then "" else substring line 0 i;
 
+// Some routes have to answer in two parts. /wait sends its headers the moment
+// it is asked -- the client will not send /start until they arrive -- and the
+// JSON only when the container exits. That is what the real daemon does, and
+// the client depends on it: a wait that says nothing until it has an answer
+// deadlocks the simplest `docker run`, which is exactly what the first version
+// of this did.
+let write_str = fn (fd: int) -> fn (v: str) ->
+  let p = str_ptr v in
+  let rec go = fn (off: int) ->
+    if off >= str_len v then off
+    else
+      let w = tcp_write fd (p + off) (str_len v - off) in
+      if w <= 0 then off else go (off + w) in
+  go 0;
+
+let hex_of = fn (v: int) ->
+  let digits = "0123456789abcdef" in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
+  if v == 0 then "0" else go v "";
+
+let respond_chunked_head = fn (fd: int) -> fn (ctype: str) ->
+  let _ = write_str fd ("HTTP/1.1 200 OK\r\n"
+       ++ "Api-Version: " ++ api_version ++ "\r\n"
+       ++ "Ostype: linux\r\n"
+       ++ "Server: mengd/" ++ mengd_version ++ "\r\n"
+       ++ "Content-Type: " ++ ctype ++ "\r\n"
+       ++ "Transfer-Encoding: chunked\r\n\r\n") in
+  ();
+
+let send_chunk = fn (fd: int) -> fn (v: str) ->
+  let _ = write_str fd (hex_of (str_len v) ++ "\r\n" ++ v ++ "\r\n") in ();
+
+let end_chunks = fn (fd: int) -> let _ = write_str fd "0\r\n\r\n" in ();
+
 // "/v1.54/images/json?manifests=1" -> "/images/json". The client puts query
 // parameters on most routes, so a table matching whole paths misses every one
 // of them -- and would have, the first time /images/json was implemented.
@@ -123,12 +175,18 @@ let strip_query = fn (p: str) ->
   let i = str_index_of p "?" in
   if i < 0 then p else substring p 0 i;
 
-let req_path = fn (line: str) ->
+let req_target = fn (line: str) ->
   let i = str_index_of line " " in
   if i < 0 then "" else
     let rest = substring line (i + 1) (str_len line) in
     let j = str_index_of rest " " in
-    strip_version (strip_query (if j < 0 then rest else substring rest 0 j));
+    if j < 0 then rest else substring rest 0 j;
+
+let req_path = fn (line: str) -> strip_version (strip_query (req_target line));
+let req_query = fn (line: str) ->
+  let t = req_target line in
+  let i = str_index_of t "?" in
+  if i < 0 then "" else substring t (i + 1) (str_len t);
 
 // ---- reading a chunked request body --------------------------------------
 //
@@ -427,8 +485,272 @@ let images_body = fn (store: str) ->
         go more (if str_len acc == 0 then e else acc ++ "," ++ e) in
   "[" ++ go idx "" ++ "]";
 
+// ---- containers ----------------------------------------------------------
+//
+// State lives on disk, one directory per container, because the routes that
+// make up a single `docker run` are served on DIFFERENT CONNECTIONS and
+// therefore different threads: /wait is sent before /start and blocks until the
+// container exits. The filesystem is the shared state; there is nothing here a
+// shared data structure would do better, and a directory is something a person
+// can look at when this goes wrong.
+
+let cdir = fn (store: str) -> fn (id: str) -> store ++ "/containers/" ++ id;
+
+let cread = fn (store: str) -> fn (id: str) -> fn (f: str) ->
+  let p = cdir store id ++ "/" ++ f in
+  if file_exists p then read_file p else "";
+
+let cwrite = fn (store: str) -> fn (id: str) -> fn (f: str) -> fn (v: str) ->
+  write_file (cdir store id ++ "/" ++ f) v;
+
+// Resolve a name or a (possibly abbreviated) id to a full id.
+let resolve = fn (store: str) -> fn (want: str) ->
+  let d = store ++ "/containers" in
+  if not (file_exists d) then ""
+  else
+    let rec go = fn (xs: str list) ->
+      match xs with
+      | [] -> ""
+      | [h, ...t] ->
+          if h == want then h
+          else if str_index_of h want == 0 then h
+          else if cread store h "name" == want then h
+          else go t in
+    go (list_dir d);
+
+let read_body = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (rst) -> fn (clen: int) ->
+  let rec go = fn (left: int) -> fn (acc: str) ->
+    if left <= 0 then acc
+    else
+      let avail = rd_fill fd buf cap rst in
+      if avail == 0 then acc
+      else
+        let take = if avail < left then avail else left in
+        let p = (vec_get rst rd_pos : int) in
+        let chunk = mem_to_str (buf + p) take in
+        let _ = vec_set rst rd_pos (p + take) in
+        go (left - take) (acc ++ chunk) in
+  go clen "";
+
+let header_int = fn (req: str) -> fn (name: str) ->
+  let i = str_index_of req name in
+  if i < 0 then 0
+  else
+    let rest = substring req (i + str_len name) (str_len req) in
+    let e = str_index_of rest "\r" in
+    int_of_str (str_trim (if e < 0 then rest else substring rest 0 e));
+
+// The OCI bundle mrun is handed. Same shape `runc spec` writes, with this
+// container's command, environment and working directory in it.
+let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) -> fn (hostname: str) ->
+  let ns = fn (t: str) -> obj [("type", s t)] in
+  let m = fn (dest: str) -> fn (ty: str) -> fn (src: str) -> fn (opts: str) ->
+    obj [("destination", s dest), ("type", s ty), ("source", s src), ("options", raw opts)] in
+  obj [
+    ("ociVersion", s "1.0.2-dev"),
+    ("process", obj [("terminal", b false), ("user", obj [("uid", n_ 0), ("gid", n_ 0)]),
+                     ("args", raw args_json), ("env", raw env_json),
+                     ("cwd", s (if str_len cwd == 0 then "/" else cwd)),
+                     ("capabilities", obj [
+                        ("bounding", raw "[\"CAP_AUDIT_WRITE\",\"CAP_KILL\",\"CAP_NET_BIND_SERVICE\"]"),
+                        ("effective", raw "[\"CAP_AUDIT_WRITE\",\"CAP_KILL\",\"CAP_NET_BIND_SERVICE\"]"),
+                        ("permitted", raw "[\"CAP_AUDIT_WRITE\",\"CAP_KILL\",\"CAP_NET_BIND_SERVICE\"]"),
+                        ("ambient", raw "[]")]),
+                     ("rlimits", raw "[]"), ("noNewPrivileges", b true)]),
+    ("root", obj [("path", s "rootfs"), ("readonly", b false)]),
+    ("hostname", s (if str_len hostname == 0 then "mengd" else hostname)),
+    ("mounts", raw ("[" ++
+        m "/proc" "proc" "proc" "[]" ++ "," ++
+        m "/dev" "tmpfs" "tmpfs" "[\"nosuid\",\"strictatime\",\"mode=755\",\"size=65536k\"]" ++ "," ++
+        m "/dev/pts" "devpts" "devpts" "[\"nosuid\",\"noexec\",\"newinstance\",\"ptmxmode=0666\",\"mode=0620\"]" ++ "," ++
+        m "/dev/shm" "tmpfs" "shm" "[\"nosuid\",\"noexec\",\"nodev\",\"mode=1777\",\"size=65536k\"]" ++ "," ++
+        m "/dev/mqueue" "mqueue" "mqueue" "[\"nosuid\",\"noexec\",\"nodev\"]" ++ "," ++
+        m "/sys" "sysfs" "sysfs" "[\"nosuid\",\"noexec\",\"nodev\",\"ro\"]" ++
+      "]")),
+    ("linux", obj [
+        ("namespaces", raw ("[" ++ ns "pid" ++ "," ++ ns "network" ++ "," ++ ns "ipc"
+                             ++ "," ++ ns "uts" ++ "," ++ ns "mount" ++ "]")),
+        ("maskedPaths", raw "[\"/proc/acpi\",\"/proc/kcore\",\"/proc/keys\",\"/proc/timer_list\",\"/sys/firmware\"]"),
+        ("readonlyPaths", raw "[\"/proc/bus\",\"/proc/fs\",\"/proc/irq\",\"/proc/sys\",\"/proc/sysrq-trigger\"]")])];
+
+// Re-serialise a parsed string array. The create body gives Cmd and Env as
+// JSON; the OCI bundle wants them as JSON too, so they make a round trip
+// through the parser rather than being pasted across as raw text.
+let jstrs = fn (v: Json.json) ->
+  let rec go = fn (xs: Json.json list) -> fn (acc: str) ->
+    match xs with
+    | [] -> acc
+    | [h, ...t] ->
+        let one = s (jstr h) in
+        go t (if str_len acc == 0 then one else acc ++ "," ++ one) in
+  "[" ++ go (jarr v) "" ++ "]";
+
+let norm_tag = fn (name: str) ->
+  if str_index_of name ":" >= 0 then name else name ++ ":latest";
+
+// Find the image directory for a tag, from the same index /images/json reads.
+let image_dir = fn (store: str) -> fn (tag: str) ->
+  let want = norm_tag tag in
+  let rec go = fn (rest: str) ->
+    let i = str_index_of rest "\n" in
+    if i < 0 then ""
+    else
+      let l = substring rest 0 i in
+      if field l 1 == want then field l 2
+      else go (substring rest (i + 1) (str_len rest)) in
+  go (read_index store);
+
+let query_param = fn (q: str) -> fn (k: str) ->
+  let key = k ++ "=" in
+  let i = str_index_of q key in
+  if i < 0 then ""
+  else
+    let rest = substring q (i + str_len key) (str_len q) in
+    let e = str_index_of rest "&" in
+    if e < 0 then rest else substring rest 0 e;
+
+let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) ->
+  let spec = Json.parse_json body in
+  let img = jstr (jget spec "Image") in
+  let dir = image_dir store img in
+  if str_len dir == 0 then
+    // 404 from create is how the client learns an image is missing; it then
+    // tries to pull. Saying "not implemented" here would send it down that
+    // path for the wrong reason.
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such image: " ++ norm_tag img))])
+  else
+    let id = sha256_hex (gen_request_id ()) in
+    let cd = cdir store id in
+    let _ = mkdir_p (cd ++ "/bundle") in
+    let n = build_rootfs dir (cd ++ "/bundle/rootfs") in
+    if n < 0 then
+      respond fd "500 Internal Server Error" "application/json"
+        (obj [("message", s ("mengd: cannot build a rootfs from " ++ dir))])
+    else
+      let name0 = query_param q "name" in
+      let name = if str_len name0 == 0 then substring id 0 12 else name0 in
+      let env = match jget spec "Env" with | Json.JArr xs -> jstrs (Json.JArr xs)
+                | _ -> "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]" in
+      let cfg = oci_config (jstrs (jget spec "Cmd")) env
+                           (jstr (jget spec "WorkingDir")) (jstr (jget spec "Hostname")) in
+      let _ = write_file (cd ++ "/bundle/config.json") cfg in
+      let _ = cwrite store id "name" name in
+      let _ = cwrite store id "image" (norm_tag img) in
+      let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
+      let _ = cwrite store id "created" (show (unix_time ())) in
+      let _ = cwrite store id "state" "created" in
+      let _ = cwrite store id "exit" "0" in
+      respond fd "201 Created" "application/json"
+        (obj [("Id", s id), ("Warnings", raw "[]")]);
+
+let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
+  let cd = cdir store id in
+  let pid = st_spawn_logged runtime "run" id (cd ++ "/bundle") (cd ++ "/log") in
+  if pid < 0 then
+    respond fd "500 Internal Server Error" "application/json"
+      (obj [("message", s "mengd: cannot fork the runtime")])
+  else
+    let _ = cwrite store id "state" "running" in
+    let _ = cwrite store id "pid" (show pid) in
+    // 204 goes out BEFORE the wait: docker's start returns when the container
+    // has started, not when it has finished. The reaping happens on this
+    // thread afterwards, which is free once the response is written.
+    let _ = respond fd "204 No Content" "text/plain" "" in
+    let code = st_wait pid in
+    let _ = cwrite store id "exit" (show code) in
+    let _ = cwrite store id "state" "exited" in
+    ();
+
+let c_wait = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
+  // Headers first, before the container has even been started: the client
+  // sends /start only after these arrive.
+  let _ = respond_chunked_head fd "application/json" in
+  let rec poll = fn (n: int) ->
+    if cread store id "state" == "exited" then int_of_str (str_trim (cread store id "exit"))
+    else if n > 3000 then 0 - 1            // five minutes, then answer anyway
+    else let _ = sleep_ms 100 in poll (n + 1) in
+  let code = poll 0 in
+  let _ = send_chunk fd (obj [("StatusCode", n_ code)] ++ "\n") in
+  end_chunks fd;
+
+// Docker's log stream frames each piece as 8 bytes -- stream id, three zeroes,
+// then a four-byte big-endian length -- and then the payload. Everything here
+// is tagged stdout (1) because the runtime's two streams go to one file.
+let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
+  let body = cread store id "log" in
+  let n = str_len body in
+  let be = fn (v: int) -> fn (k: int) -> chr (bit_and (bit_shr v (8 * k)) 255) in
+  let frame = if n == 0 then ""
+              else chr 1 ++ chr 0 ++ chr 0 ++ chr 0
+                   ++ be n 3 ++ be n 2 ++ be n 1 ++ be n 0 ++ body in
+  respond fd "200 OK" "application/vnd.docker.multiplexed-stream" frame;
+
+// `docker ps` prints a COMMAND column, which is the argv as one string.
+let cmd_line = fn (store: str) -> fn (id: str) ->
+  let v = Json.parse_json (cread store id "cmd") in
+  let rec go = fn (xs: Json.json list) -> fn (acc: str) ->
+    match xs with
+    | [] -> acc
+    | [h, ...t] -> go t (if str_len acc == 0 then jstr h else acc ++ " " ++ jstr h) in
+  go (jarr v) "";
+
+let c_inspect_body = fn (store: str) -> fn (id: str) ->
+  let state = cread store id "state" in
+  let running = state == "running" in
+  obj [("Id", s id), ("Created", s (cread store id "created")),
+       ("Path", s (cmd_line store id)), ("Args", raw "[]"),
+       ("State", obj [("Status", s state), ("Running", b running),
+                      ("Paused", b false), ("Restarting", b false),
+                      ("OOMKilled", b false), ("Dead", b false),
+                      ("Pid", n_ (int_of_str (str_trim (cread store id "pid")))),
+                      ("ExitCode", n_ (int_of_str (str_trim (cread store id "exit")))),
+                      ("Error", s ""), ("StartedAt", s ""), ("FinishedAt", s "")]),
+       ("Image", s (cread store id "image")), ("ResolvConfPath", s ""),
+       ("HostnamePath", s ""), ("HostsPath", s ""), ("LogPath", s (cdir store id ++ "/log")),
+       ("Name", s ("/" ++ cread store id "name")), ("RestartCount", n_ 0),
+       ("Driver", s "none"), ("Platform", s "linux"), ("MountLabel", s ""),
+       ("ProcessLabel", s ""), ("AppArmorProfile", s ""), ("ExecIDs", raw "null"),
+       ("HostConfig", raw "\{}"), ("Mounts", raw "[]"),
+       ("Config", obj [("Image", s (cread store id "image")),
+                       ("Cmd", raw (cread store id "cmd")),
+                       ("Env", raw "[]"), ("Labels", raw "\{}")]),
+       ("NetworkSettings", raw "\{}"), ("Storage", raw "\{}"),
+       ("ImageManifestDescriptor", raw "null")];
+
+let c_list_body = fn (store: str) ->
+  let d = store ++ "/containers" in
+  if not (file_exists d) then "[]"
+  else
+    let rec go = fn (xs: str list) -> fn (acc: str) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] ->
+          let e = obj [("Id", s h), ("Names", raw ("[" ++ s ("/" ++ cread store h "name") ++ "]")),
+                       ("Image", s (cread store h "image")), ("ImageID", s ""),
+                       ("Command", s (cmd_line store h)),
+                       ("Created", n_ (int_of_str (str_trim (cread store h "created")))),
+                       ("Ports", raw "[]"),
+                       ("Labels", raw "\{}"), ("State", s (cread store h "state")),
+                       ("Status", s (cread store h "state")),
+                       ("HostConfig", raw "\{}"), ("NetworkSettings", raw "\{}"),
+                       ("Mounts", raw "[]")] in
+          go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
+    "[" ++ go (list_dir d) "" ++ "]";
+
+// "/containers/<id>/<verb>" -> the id and the verb. Returns "" for both when
+// the path is not that shape, so /containers/json is not mistaken for an id.
+let seg_after = fn (p: str) -> fn (prefix: str) ->
+  if str_index_of p prefix != 0 then ""
+  else substring p (str_len prefix) (str_len p);
+
+let split_slash = fn (p: str) ->
+  let i = str_index_of p "/" in
+  if i < 0 then (p, "") else (substring p 0 i, substring p (i + 1) (str_len p));
+
 let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
-             fn (store: str) -> fn (m: str) -> fn (path: str) ->
+             fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
+             fn (m: str) -> fn (path: str) ->
   if path == "/images/load" then
     let tarfile = store ++ "/incoming.tar" in
     // file_openrw creates but does NOT truncate, so a smaller archive written
@@ -456,6 +778,33 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   else if path == "/info" then respond fd "200 OK" "application/json" (info_body ())
   else if path == "/images/json" then
     respond fd "200 OK" "application/json" (images_body store)
+  else if path == "/containers/json" then
+    respond fd "200 OK" "application/json" (c_list_body store)
+  else if path == "/containers/create" then
+    let clen = header_int req "Content-Length: " in
+    let body = read_body fd buf cap st clen in
+    c_create fd store body q
+  else if str_index_of path "/containers/" == 0 then
+    let rest = seg_after path "/containers/" in
+    let pair = split_slash rest in
+    let (raw_id, verb) = pair in
+    let id = resolve store raw_id in
+    if str_len id == 0 then
+      respond fd "404 Not Found" "application/json"
+        (obj [("message", s ("No such container: " ++ raw_id))])
+    else if verb == "start" then c_start fd store id runtime
+    else if verb == "wait" then c_wait fd store id
+    else if verb == "logs" then c_logs fd store id
+    else if verb == "json" then
+      respond fd "200 OK" "application/json" (c_inspect_body store id)
+    else if str_len verb == 0 then
+      (if m == "DELETE" then
+         let _ = st_rmtree (cdir store id) in
+         respond fd "204 No Content" "text/plain" ""
+       else respond fd "404 Not Found" "application/json"
+              (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
+    else respond fd "404 Not Found" "application/json"
+           (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))])
   else
     // A 404 that says what was asked for. The client prints the body, so an
     // unimplemented route names itself instead of looking like a broken daemon.
@@ -464,18 +813,35 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
 
 // ---- accept loop ---------------------------------------------------------
 
-let serve = fn (sock: str) -> fn (store: str) ->
+let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
+  let _ = st_ignore_sigpipe () in
   let srv = unix_listen sock in
   let _ = if srv < 0 then
             let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1
           else () in
   let _ = print_err ("mengd " ++ mengd_version ++ " listening on " ++ sock) in
-  let buf = mem_alloc 65536 in
+  // One buffer per SLOT, allocated once. See store_shim.c: a buffer per
+  // connection exhausts the 16 MiB arena at the 231st request.
+  //
+  // One block and arithmetic, not a Vec of offsets: the compiler refuses to
+  // capture a Vec across a thread boundary -- "it is neither Send nor Sync" --
+  // which is the right answer, and an int is Send.
+  let bufsz = 65536 in
+  let pool_base = mem_alloc (st_slots () * bufsz) in
   let rec loop = fn (unit_: unit) ->
     let c = unix_accept srv in
     if c < 0 then loop ()
     else
-      let nread = tcp_read c buf 65535 in
+      // A thread per connection, and a buffer per thread. `docker run` sends
+      // /wait before /start on a separate connection and /wait does not return
+      // until the container exits, so a serial loop deadlocks -- measured in
+      // probe/run_threads.sh before any of this was written. The buffer has to
+      // be per-connection for the same reason: one shared arena slice would be
+      // two threads writing over each other's request.
+      let _ = spawn (fn (u: unit) ->
+      let slot = st_slot_acquire () in
+      let buf = pool_base + slot * bufsz in
+      let nread = tcp_read c buf (bufsz - 1) in
       let _ = if nread <= 0 then ()
               else
                 let req = mem_to_str buf nread in
@@ -484,12 +850,19 @@ let serve = fn (sock: str) -> fn (store: str) ->
                 let hend = str_index_of req "\r\n\r\n" in
                 let bstart = if hend < 0 then nread else hend + 4 in
                 let st = rd_new nread bstart in
-                handle c buf 65535 st store (req_method line) (req_path line) in
+                let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                          print_err ("mengd: " ++ req_method line ++ " " ++ req_path line)
+                        else () in
+                handle c buf (bufsz - 1) st store runtime req (req_query line)
+                       (req_method line) (req_path line) in
       let _ = tcp_close c in
+      let _ = st_slot_release slot in
+      ()) in
       loop () in
   loop ();
 
 match args () with
-| [sock] -> serve sock "/var/lib/mengd"
-| [sock, store] -> serve sock store
-| _ -> let _ = print_err "usage: mengd <socket-path> [store-dir]" in exit 2
+| [sock] -> serve sock "/var/lib/mengd" "/usr/local/bin/mrun"
+| [sock, store] -> serve sock store "/usr/local/bin/mrun"
+| [sock, store, runtime] -> serve sock store runtime
+| _ -> let _ = print_err "usage: mengd <socket-path> [store-dir] [runtime-path]" in exit 2

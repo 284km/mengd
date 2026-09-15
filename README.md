@@ -113,6 +113,50 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## It runs containers
+
+```sh
+export MERE=/path/to/mere MRUN_SRC=/path/to/mrun
+sh test/run_vm.sh
+```
+
+```
+  ok    docker load
+  ok    docker run -d
+  ok    docker logs prints what the container printed (hello-from-mengd)
+  ok    the exit status came back through mrun (7/exited)
+  ok    docker ps -a lists both (2)
+  ok    1000 connections (1000) without exhausting the buffer pool
+  ok    the daemon is still alive
+  ok    docker rm
+```
+
+`docker run -d`, `ps`, `logs`, `inspect` and `rm` work against mengd, with the
+container itself run by [mrun](https://github.com/284km/mrun). It has to happen
+on Linux, because a container is namespaces and mounts.
+
+### Three bugs only the real client could find
+
+**`/wait` has to answer in two parts.** The client sends it *before* `/start`
+and will not send `/start` until the response headers arrive; the JSON body
+comes when the container exits. A wait that says nothing until it has an answer
+deadlocks the simplest `docker run`, and did. The real daemon sends the headers
+in 0.00 s with `Transfer-Encoding: chunked` and the body minutes later, which is
+what this does now.
+
+**The daemon died of SIGPIPE.** `docker run -d` closes its `/wait` connection as
+soon as it has the id, and the next write killed the process — exit status 141,
+which is 128 + SIGPIPE and named the cause exactly.
+
+**A buffer per connection exhausted the FFI arena at the 231st request.** The
+arena is a bump allocator with no free, and the runtime's own message said what
+to do instead. There is now a fixed pool of 32, acquired and released around
+each connection, so a 33rd concurrent connection waits rather than corrupting
+anything. The first attempt kept the pool in a `Vec` and the compiler refused
+it — *"cannot capture `pool` : Vec['a, int] across a thread boundary (it is
+neither Send nor Sync)"* — which was right, and one block plus arithmetic on an
+`int` is both correct and simpler.
+
 ## Turning an image into a root filesystem
 
 ```sh
@@ -183,8 +227,10 @@ cannot report "serial" would not be a measurement.
 
 ## What is next
 
-`/containers/create`, `/start`, `/wait`, `/json`, `/logs` and `DELETE` — the six
-that `docker run -d` uses — on a thread per connection, with the container run by
-[mrun](https://github.com/284km/mrun). Then `/attach`, which hijacks the
-connection and multiplexes stdout and stderr, for a foreground `docker run`.
-Then `/networks/*`, `/volumes/*` and `/events` for `docker compose up`.
+`/attach`, which hijacks the connection and multiplexes stdout and stderr, for a
+foreground `docker run`. Then `/networks/*`, `/volumes/*` and `/events`, which is
+what `docker compose up` needs.
+
+Known gaps: stdout and stderr both go to one log file, so every log frame is
+tagged stdout; there is no cgroup accounting, no `--rm`, no ports, and no
+networking beyond the namespace mrun creates.
