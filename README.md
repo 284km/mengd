@@ -115,6 +115,17 @@ is what caught all three.
 
 ## It runs containers
 
+```
+$ docker run alpine sh -c 'echo to-stdout; echo to-stderr 1>&2; exit 5'
+to-stdout
+to-stderr
+$ echo $?
+5
+```
+
+Foreground and detached, with stdout and stderr kept apart and the exit status
+coming back through both.
+
 ```sh
 export MERE=/path/to/mere MRUN_SRC=/path/to/mrun
 sh test/run_vm.sh
@@ -134,6 +145,42 @@ sh test/run_vm.sh
 `docker run -d`, `ps`, `logs`, `inspect` and `rm` work against mengd, with the
 container itself run by [mrun](https://github.com/284km/mrun). It has to happen
 on Linux, because a container is namespaces and mounts.
+
+### The attach upgrade, and a probe that asked for less than the client does
+
+`/attach` hijacks the connection. Which response it gets depends on the request:
+a client sending `Upgrade: tcp` gets `101 UPGRADED` with
+`Content-Type: application/vnd.docker.multiplexed-stream`; one that does not
+gets `200 OK` with `raw-stream`.
+
+This was implemented wrong first, because the probe used to measure it was a
+hand-written request that omitted `Upgrade: tcp`. The real daemon answered 200,
+so 200 is what got built, and the real client said **`unable to upgrade to tcp,
+received 200`**. A probe that asks for less than the client asks for gets an
+answer to a different question.
+
+### Go escapes `>` and `&`, and it took the daemon down
+
+`docker run alpine sh -c 'echo x 1>&2'` sends the command as
+`"echo x 1\u003e\u00262"`: Go's `encoding/json` escapes `<`, `>` and `&` by
+default. The vendored JSON parser delegated unescaping to the `str_unescape`
+builtin, which does not know `\u` and **aborts the process** — so any command
+containing one of those three characters killed the daemon. Not an edge case;
+most shell commands.
+
+`vendor_json.mere` now decodes `\uXXXX` itself, surrogate pairs included, and
+says in its header that it diverges from upstream and why. The fix belongs in
+`contrib/json` rather than here.
+
+### The bug that looked intermittent and was not
+
+The same crash looked timing-dependent for an afternoon — it appeared, then five
+runs in a row passed. The passing runs used `echo x`; the failing ones used
+`1>&2`. It was perfectly deterministic and the variable was the test input, not
+the schedule. Chasing it as a race did find a real race, though: four concurrent
+`docker load`s unpacked into one shared staging directory and deleted each
+other's files, which showed up as `lchown(2) failed` on a file that had just
+vanished. Paths are per-request now, and four-at-once is in the test.
 
 ### Three bugs only the real client could find
 
@@ -231,6 +278,13 @@ cannot report "serial" would not be a measurement.
 foreground `docker run`. Then `/networks/*`, `/volumes/*` and `/events`, which is
 what `docker compose up` needs.
 
-Known gaps: stdout and stderr both go to one log file, so every log frame is
-tagged stdout; there is no cgroup accounting, no `--rm`, no ports, and no
-networking beyond the namespace mrun creates.
+Known gaps: the interleaving between stdout and stderr is not preserved (they
+are separate files, so each stream's own order survives and the order between
+them does not); no cgroup accounting, no `--rm`, no ports, and no networking
+beyond the namespace mrun creates.
+
+**And one that matters more than its size.** The vendored tar reader refuses a
+malformed archive by calling `exit`, which is right for a CLI and wrong inside a
+daemon: a client that uploads a bad tar takes the whole daemon down with it.
+mtar needs a non-exiting entry point before this is exposed to anything
+untrusted.

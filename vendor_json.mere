@@ -1,5 +1,15 @@
-// Vendored from merelang/mere contrib/json/json.mere (MIT), unmodified.
-// Mere has no package manager yet; re-vendor rather than edit in place.
+// Vendored from merelang/mere contrib/json/json.mere (MIT).
+//
+// DIVERGES FROM UPSTREAM in one place, marked below: \uXXXX escapes.
+//
+// Upstream delegates unescaping to the `str_unescape` builtin, which does not
+// know \u and aborts the process on one. Go's encoding/json escapes <, > and &
+// as \u003c, \u003e and \u0026 by default, so EVERY docker CLI request whose
+// payload contains one of those characters carries them -- `docker run alpine
+// sh -c 'echo x 1>&2'` sends "1\u003e\u00262". That is not an edge case; it is
+// most shell commands. This copy decodes them itself.
+//
+// This belongs upstream in contrib/json (or in the builtin) rather than here.
 // contrib/json/json.mere — JSON parser
 //
 // Implemented by combining stdlib (str ops + is_digit + try_or + fail) with
@@ -141,6 +151,70 @@ let parse_num = fn (s: str, i: int) ->
       // number, and the document that motivated the integer fast path has none.
       (JFloat (float_of_str (substring s start exp_end)), exp_end);
 
+// --- DIVERGENCE FROM UPSTREAM: a JSON-aware unescaper -----------------------
+//
+// Handles every escape RFC 8259 defines, including \uXXXX and surrogate pairs,
+// which the `str_unescape` builtin does not: it aborts on one, taking the
+// process with it.
+
+let hex4 = fn (s: str) -> fn (i: int) ->
+  let d = fn (k: int) ->
+    let c = ord (char_at s (i + k)) in
+    if c >= 48 then
+      (if c <= 57 then c - 48
+       else if c >= 97 then (if c <= 102 then c - 87 else 0)
+       else if c >= 65 then (if c <= 70 then c - 55 else 0)
+       else 0)
+    else 0 in
+  ((d 0 * 16 + d 1) * 16 + d 2) * 16 + d 3;
+
+// A codepoint as UTF-8. Mere strings are bytes, so this is the encoding step.
+let utf8_of = fn (cp: int) ->
+  if cp < 128 then chr cp
+  else if cp < 2048 then
+    chr (192 + cp / 64) ++ chr (128 + cp % 64)
+  else if cp < 65536 then
+    chr (224 + cp / 4096) ++ chr (128 + (cp / 64) % 64) ++ chr (128 + cp % 64)
+  else
+    chr (240 + cp / 262144) ++ chr (128 + (cp / 4096) % 64)
+    ++ chr (128 + (cp / 64) % 64) ++ chr (128 + cp % 64);
+
+let json_unescape = fn (v: str) ->
+  let n = str_len v in
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= n then acc
+    else
+      let c = char_at v i in
+      if c != "\\" then go (i + 1) (acc ++ c)
+      else if i + 1 >= n then acc ++ c
+      else
+        let e = char_at v (i + 1) in
+        if e == "n" then go (i + 2) (acc ++ chr 10)
+        else if e == "t" then go (i + 2) (acc ++ chr 9)
+        else if e == "r" then go (i + 2) (acc ++ chr 13)
+        else if e == "b" then go (i + 2) (acc ++ chr 8)
+        else if e == "f" then go (i + 2) (acc ++ chr 12)
+        else if e == "u" then
+          (if i + 5 >= n then acc
+           else
+             let cp = hex4 v (i + 2) in
+             // A high surrogate is only half a codepoint; the low half follows
+             // as a second \u escape and the pair encodes one character.
+             if cp >= 55296 then
+               (if cp < 56320 then
+                  (if i + 11 < n then
+                     (if char_at v (i + 6) == "\\" then
+                        (if char_at v (i + 7) == "u" then
+                           let lo = hex4 v (i + 8) in
+                           go (i + 12) (acc ++ utf8_of (65536 + (cp - 55296) * 1024 + (lo - 56320)))
+                         else go (i + 6) (acc ++ utf8_of cp))
+                      else go (i + 6) (acc ++ utf8_of cp))
+                   else go (i + 6) (acc ++ utf8_of cp))
+                else go (i + 6) (acc ++ utf8_of cp))
+             else go (i + 6) (acc ++ utf8_of cp))
+        else go (i + 2) (acc ++ e) in
+  go 0 "";
+
 let parse_raw_str = fn (s: str, i: int) ->
   // Returns (content, end_pos).  Handles `\"` `\\` `\n` `\t` `\r` `\/` via
   // str_unescape after scanning the raw region.
@@ -153,7 +227,8 @@ let parse_raw_str = fn (s: str, i: int) ->
     | _    -> scan (j + 1)
   in
   let close = scan i1 in
-  (str_unescape (substring s i1 close), close + 1);
+  (json_unescape (substring s i1 close), close + 1);
+
 
 let parse_jstr = fn (s: str, i: int) ->
   let (text, j) = parse_raw_str s i in

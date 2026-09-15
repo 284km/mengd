@@ -64,7 +64,26 @@ i=0; while [ \$i -lt 1000 ]; do curl -s --unix-socket /var/run/mengd.sock http:/
 [ "\$i" = 1000 ]; say \$? "1000 connections (\$i) without exhausting the buffer pool"
 pgrep mengd >/dev/null; say \$? "the daemon is still alive"
 
-timeout 20 docker rm -f ok1 bad1 >/dev/null 2>&1; say \$? "docker rm"
+# Foreground run: the client hijacks the connection with Upgrade: tcp and reads
+# the framed stream. Exit status has to come back through it too.
+o=\$(timeout 60 docker run --name fg alpine sh -c 'echo to-stdout; echo to-stderr 1>&2; exit 5' 2>/dev/null)
+rc=\$?
+[ "\$o" = "to-stdout" ]; say \$? "foreground run: stdout is stdout (\$o)"
+[ "\$rc" = 5 ]; say \$? "foreground run: the exit status reaches the shell (\$rc)"
+e=\$(timeout 60 docker run --name fg2 alpine sh -c 'echo O; echo E 1>&2' 2>&1 1>/dev/null)
+[ "\$e" = "E" ]; say \$? "foreground run: stderr is stderr (\$e)"
+
+# Go's encoding/json escapes < > and & by default, so the command above arrives
+# as "1\\u003e\\u00262". A JSON parser without \\u took the daemon down on it.
+pgrep mengd >/dev/null; say \$? "a command containing > and & did not kill the daemon"
+
+# Four at once: one shared staging directory had them deleting each other's files.
+for i in 1 2 3 4; do (timeout 60 docker load -i /var/tmp/mengd-test.tar >/dev/null 2>&1) & done; wait
+n=\$(timeout 20 docker images -q 2>/dev/null | wc -l | tr -d ' ')
+[ "\$n" = 1 ]; say \$? "four concurrent loads leave one image (\$n)"
+pgrep mengd >/dev/null; say \$? "and the daemon survived them"
+
+timeout 20 docker rm -f ok1 bad1 fg fg2 >/dev/null 2>&1; say \$? "docker rm"
 n=\$(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "and they are gone (\$n)"
 

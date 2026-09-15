@@ -53,21 +53,24 @@ int st_rmtree(const char *path) { return rmtree(path); }
 /* Fork, point stdout AND stderr at one log file, chdir into the bundle, and
  * exec the runtime. The parent gets the pid back.
  *
- * Both streams go to the same file. Docker's log stream tags each frame as
- * stdout or stderr and this cannot tell them apart, which is a real difference
- * from the real daemon and is written down in the README rather than papered
- * over: everything comes back tagged stdout.
+ * The two streams go to SEPARATE files, because docker's log protocol tags
+ * every frame as stdout (1) or stderr (2) and a single file cannot say which.
+ * What is still lost is the interleaving: two files cannot record that a line
+ * of stderr came between two lines of stdout. The real daemon multiplexes at
+ * the source and keeps it.
  */
 int st_spawn_logged(const char *path, const char *a1, const char *a2,
-                    const char *cwd, const char *logfile) {
+                    const char *cwd, const char *outfile, const char *errfile) {
     pid_t p = fork();
     if (p < 0) return -1;
     if (p > 0) return (int)p;
 
-    int fd = open(logfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) _exit(125);
-    dup2(fd, 1); dup2(fd, 2);
-    if (fd > 2) close(fd);
+    int o = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int e = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (o < 0 || e < 0) _exit(125);
+    dup2(o, 1); dup2(e, 2);
+    if (o > 2) close(o);
+    if (e > 2) close(e);
     if (cwd && cwd[0] && chdir(cwd) != 0) _exit(126);
     char *argv[4] = { (char *)path, (char *)a1, (char *)a2, NULL };
     execv(path, argv);

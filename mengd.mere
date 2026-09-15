@@ -26,7 +26,7 @@ extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
 extern fn st_rename: str -> str -> int;
-extern fn st_spawn_logged: str -> str -> str -> str -> str -> int;
+extern fn st_spawn_logged: str -> str -> str -> str -> str -> str -> int;
 extern fn st_wait: int -> int;
 extern fn st_kill: int -> int -> int;
 extern fn st_ignore_sigpipe: unit -> int;
@@ -421,17 +421,23 @@ let field = fn (line: str) -> fn (k: int) ->
 // id is the digest of a config blob INSIDE the archive, so nothing can be
 // decided before unpacking -- which is why a duplicate has to be cleaned up
 // afterwards rather than skipped beforehand.
-let register_image = fn (store: str) -> fn (tarfile: str) ->
+let register_image = fn (store: str) -> fn (tarfile: str) -> fn (uniq: str) ->
   let idx = read_index store in
-  let stage = store ++ "/images/.staging" in
+  let stage = store ++ "/images/.staging-" ++ uniq in
+  let tr = fn (m: str) -> if str_len (env_or "MENGD_TRACE") > 0 then print_err ("mengd: reg " ++ m) else () in
+  let _ = tr "rmtree" in
   let _ = st_rmtree stage in
   let _ = mkdir_p stage in
+  let _ = tr "walk" in
   let _ = walk tarfile stage true in
+  let _ = tr "walked" in
   let dir = stage in
   let mpath = dir ++ "/manifest.json" in
   if not (file_exists mpath) then ""
   else
+    let _ = tr "parse manifest" in
     let m = jfirst (Json.parse_json (read_file mpath)) in
+    let _ = tr "parsed" in
     let cfg = jstr (jget m "Config") in
     let tag = jstr (jfirst (jget m "RepoTags")) in
     let id = "sha256:" ++ basename cfg in
@@ -610,7 +616,15 @@ let query_param = fn (q: str) -> fn (k: str) ->
     if e < 0 then rest else substring rest 0 e;
 
 let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) ->
+  // Length only. A create body carries the container's environment, which is
+  // where people put credentials; a daemon log is not the place for it.
+  let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+            print_err ("mengd: create body " ++ show (str_len body) ++ " bytes")
+          else () in
+  let tc = fn (m: str) -> if str_len (env_or "MENGD_TRACE") > 0 then print_err ("mengd: create " ++ m) else () in
+  let _ = tc "parse body" in
   let spec = Json.parse_json body in
+  let _ = tc "parsed" in
   let img = jstr (jget spec "Image") in
   let dir = image_dir store img in
   if str_len dir == 0 then
@@ -623,7 +637,9 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
     let id = sha256_hex (gen_request_id ()) in
     let cd = cdir store id in
     let _ = mkdir_p (cd ++ "/bundle") in
+    let _ = tc "build_rootfs" in
     let n = build_rootfs dir (cd ++ "/bundle/rootfs") in
+    let _ = tc "rootfs done" in
     if n < 0 then
       respond fd "500 Internal Server Error" "application/json"
         (obj [("message", s ("mengd: cannot build a rootfs from " ++ dir))])
@@ -632,6 +648,7 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let name = if str_len name0 == 0 then substring id 0 12 else name0 in
       let env = match jget spec "Env" with | Json.JArr xs -> jstrs (Json.JArr xs)
                 | _ -> "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]" in
+      let _ = tc "oci_config" in
       let cfg = oci_config (jstrs (jget spec "Cmd")) env
                            (jstr (jget spec "WorkingDir")) (jstr (jget spec "Hostname")) in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
@@ -640,13 +657,15 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
+      let _ = tc "created" in
       let _ = cwrite store id "exit" "0" in
       respond fd "201 Created" "application/json"
         (obj [("Id", s id), ("Warnings", raw "[]")]);
 
 let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
   let cd = cdir store id in
-  let pid = st_spawn_logged runtime "run" id (cd ++ "/bundle") (cd ++ "/log") in
+  let pid = st_spawn_logged runtime "run" id (cd ++ "/bundle")
+                            (cd ++ "/log.out") (cd ++ "/log.err") in
   if pid < 0 then
     respond fd "500 Internal Server Error" "application/json"
       (obj [("message", s "mengd: cannot fork the runtime")])
@@ -674,17 +693,64 @@ let c_wait = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
   let _ = send_chunk fd (obj [("StatusCode", n_ code)] ++ "\n") in
   end_chunks fd;
 
-// Docker's log stream frames each piece as 8 bytes -- stream id, three zeroes,
-// then a four-byte big-endian length -- and then the payload. Everything here
-// is tagged stdout (1) because the runtime's two streams go to one file.
-let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
-  let body = cread store id "log" in
+// Docker's stream framing: eight bytes -- stream id, three zeroes, then a
+// four-byte big-endian length -- and then that many bytes. 1 is stdout, 2 is
+// stderr, which is why the runtime's two streams go to two files.
+let be32 = fn (v: int) -> fn (k: int) -> chr (bit_and (bit_shr v (8 * k)) 255);
+
+let frame_of = fn (stream: int) -> fn (body: str) ->
   let n = str_len body in
-  let be = fn (v: int) -> fn (k: int) -> chr (bit_and (bit_shr v (8 * k)) 255) in
-  let frame = if n == 0 then ""
-              else chr 1 ++ chr 0 ++ chr 0 ++ chr 0
-                   ++ be n 3 ++ be n 2 ++ be n 1 ++ be n 0 ++ body in
-  respond fd "200 OK" "application/vnd.docker.multiplexed-stream" frame;
+  if n == 0 then ""
+  else chr stream ++ chr 0 ++ chr 0 ++ chr 0
+       ++ be32 n 3 ++ be32 n 2 ++ be32 n 1 ++ be32 n 0 ++ body;
+
+let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
+  // One frame per stream. The interleaving between them is not recoverable
+  // from two files; each stream's own order is.
+  let body = frame_of 1 (cread store id "log.out")
+          ++ frame_of 2 (cread store id "log.err") in
+  respond fd "200 OK" "application/vnd.docker.multiplexed-stream" body;
+
+// Attach is a hijacked connection: headers immediately -- the client sends
+// /start only after they arrive, exactly like /wait -- and then the framed
+// stream until the container exits. No Content-Length and no chunking; the
+// connection IS the stream.
+//
+// WHICH headers depends on the request. A client that asks to upgrade gets
+// 101; one that does not gets 200. This was got wrong the first time by
+// probing with a hand-written request that omitted `Upgrade: tcp` -- the real
+// daemon answered 200, so 200 was what got implemented, and the real client
+// said "unable to upgrade to tcp, received 200". A probe that asks for less
+// than the client asks for gets an answer to a different question.
+let c_attach = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (req: str) ->
+  let wants_upgrade = str_index_of req "Upgrade: tcp" >= 0 in
+  let _ = write_str fd
+      (if wants_upgrade then
+         "HTTP/1.1 101 UPGRADED\r\n"
+         ++ "Content-Type: application/vnd.docker.multiplexed-stream\r\n"
+         ++ "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+       else
+         "HTTP/1.1 200 OK\r\n"
+         ++ "Content-Type: application/vnd.docker.raw-stream\r\n\r\n") in
+  let tail = fn (f: str) -> fn (stream: int) -> fn (sent: int) ->
+    let body = cread store id f in
+    let n = str_len body in
+    if n <= sent then sent
+    else
+      let _ = write_str fd (frame_of stream (substring body sent n)) in
+      n in
+  let rec pump = fn (o: int) -> fn (e: int) -> fn (n: int) ->
+    let o2 = tail "log.out" 1 o in
+    let e2 = tail "log.err" 2 e in
+    if cread store id "state" == "exited" then
+      // One more pass after the exit: the runtime's last write can land
+      // between the poll and the state file being updated.
+      let _ = tail "log.out" 1 o2 in
+      let _ = tail "log.err" 2 e2 in
+      ()
+    else if n > 3000 then ()
+    else let _ = sleep_ms 50 in pump o2 e2 (n + 1) in
+  pump 0 0 0;
 
 // `docker ps` prints a COMMAND column, which is the argv as one string.
 let cmd_line = fn (store: str) -> fn (id: str) ->
@@ -707,7 +773,7 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
                       ("ExitCode", n_ (int_of_str (str_trim (cread store id "exit")))),
                       ("Error", s ""), ("StartedAt", s ""), ("FinishedAt", s "")]),
        ("Image", s (cread store id "image")), ("ResolvConfPath", s ""),
-       ("HostnamePath", s ""), ("HostsPath", s ""), ("LogPath", s (cdir store id ++ "/log")),
+       ("HostnamePath", s ""), ("HostsPath", s ""), ("LogPath", s (cdir store id ++ "/log.out")),
        ("Name", s ("/" ++ cread store id "name")), ("RestartCount", n_ 0),
        ("Driver", s "none"), ("Platform", s "linux"), ("MountLabel", s ""),
        ("ProcessLabel", s ""), ("AppArmorProfile", s ""), ("ExecIDs", raw "null"),
@@ -752,7 +818,14 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
              fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
              fn (m: str) -> fn (path: str) ->
   if path == "/images/load" then
-    let tarfile = store ++ "/incoming.tar" in
+    // Per-request paths. One shared staging directory meant four concurrent
+    // loads unpacked into the same tree and deleted each other's files: the
+    // visible symptoms were `lchown(2) failed` on a file that had just
+    // vanished, and a JSON parse of a manifest that was being rewritten
+    // underneath it ("unknown escape '\u'" -- reading somebody else's bytes).
+    // Neither pointed at concurrency; the four-at-once test did.
+    let uniq = gen_request_id () in
+    let tarfile = store ++ "/incoming-" ++ uniq ++ ".tar" in
     // file_openrw creates but does NOT truncate, so a smaller archive written
     // after a larger one leaves the tail of the larger one behind: after an
     // 8 MB alpine followed a 17 MB redis, this file was still 17 MB. It read
@@ -766,7 +839,8 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
       respond fd "400 Bad Request" "application/json"
         (obj [("message", s "mengd: empty or unreadable request body")])
     else
-      let tag = register_image store tarfile in
+      let tag = register_image store tarfile uniq in
+      let _ = st_rmtree tarfile in
       if str_len tag == 0 then
         respond fd "500 Internal Server Error" "application/json"
           (obj [("message", s "mengd: the archive has no manifest.json")])
@@ -795,6 +869,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     else if verb == "start" then c_start fd store id runtime
     else if verb == "wait" then c_wait fd store id
     else if verb == "logs" then c_logs fd store id
+    else if verb == "attach" then c_attach fd store id req
     else if verb == "json" then
       respond fd "200 OK" "application/json" (c_inspect_body store id)
     else if str_len verb == 0 then
