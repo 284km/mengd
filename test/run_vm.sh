@@ -83,6 +83,29 @@ n=\$(timeout 20 docker images -q 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 1 ]; say \$? "four concurrent loads leave one image (\$n)"
 pgrep mengd >/dev/null; say \$? "and the daemon survived them"
 
+# A malformed archive used to take the daemon down: the vendored reader refused
+# by calling exit. Any client could stop the service by uploading junk.
+head -c 300 /var/tmp/mengd-test.tar > /var/tmp/trunc.tar
+head -c 100000 /dev/urandom > /var/tmp/junk.tar
+printf 'not a tar at all' > /var/tmp/tiny.tar
+badok=1
+for f in trunc junk tiny; do
+  msg=\$(timeout 30 docker load -i /var/tmp/\$f.tar 2>&1 | head -1)
+  case "\$msg" in *"cannot read that archive"*) ;; *) badok=0 ;; esac
+  pgrep mengd >/dev/null || badok=0
+done
+[ "\$badok" = 1 ]; say \$? "three malformed archives are refused and the daemon survives"
+
+# The reason quotes the archive, which is attacker-controlled bytes, and the
+# path it was reading, which is the daemon's own storage layout.
+msg=\$(timeout 30 docker load -i /var/tmp/junk.tar 2>&1 | head -1)
+case "\$msg" in *"/var/lib/mengd"*) false ;; *) true ;; esac
+say \$? "the error does not hand back the daemon's internal path"
+printf '%s' "\$msg" | LC_ALL=C grep -q '[^[:print:][:space:]]' && false || true
+say \$? "and does not reflect raw bytes from the archive"
+
+timeout 30 docker load -i /var/tmp/mengd-test.tar >/dev/null 2>&1; say \$? "a good archive still loads afterwards"
+
 timeout 20 docker rm -f ok1 bad1 fg fg2 >/dev/null 2>&1; say \$? "docker rm"
 n=\$(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "and they are gone (\$n)"

@@ -283,8 +283,16 @@ are separate files, so each stream's own order survives and the order between
 them does not); no cgroup accounting, no `--rm`, no ports, and no networking
 beyond the namespace mrun creates.
 
-**And one that matters more than its size.** The vendored tar reader refuses a
-malformed archive by calling `exit`, which is right for a CLI and wrong inside a
-daemon: a client that uploads a bad tar takes the whole daemon down with it.
-mtar needs a non-exiting entry point before this is exposed to anything
-untrusted.
+### The denial of service that was in the README before it was in the code
+
+The vendored tar reader refused a malformed archive by calling `exit` — correct
+for a CLI, and a way for any client to stop the daemon by uploading junk.
+`walk` now returns -1 and leaves the reason behind, mtar's own CLI turns that
+back into a message and exit 3, and `/images/load` answers 400. Three malformed
+archives are in the test and the daemon has to still be serving afterwards.
+
+Returning the reason needed two more fixes. It quotes the entry it choked on,
+which is **attacker-controlled bytes** — a junk archive reflected raw control
+characters into whatever terminal read the error — and the path it was reading,
+which is the daemon's own storage layout. The reason is now printable-only,
+length-capped, and says "the uploaded archive" where the path was.

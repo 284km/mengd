@@ -2,6 +2,10 @@
 // Mere has no package manager yet; re-vendor rather than edit in place.
 // mengd uses mtar to unpack what `docker load` sends -- the same reader that
 // is checked against bsdtar and GNU tar in its own repository.
+//
+// `walk` returns -1 on a refused archive rather than exiting, which is what
+// makes it usable here: a client that uploads a malformed tar must not be
+// able to stop the daemon. fs_last_error () has the reason.
 // tar.mere — a POSIX USTAR reader, scoped to what real container images use.
 //
 // THE SCOPE IS MEASURED, NOT GUESSED. test/CORPUS records the sweep: 7 layers
@@ -21,6 +25,10 @@ extern fn fs_unlink: str -> int;
 extern fn fs_lchmod: str -> int -> int;
 extern fn fs_lchown: str -> int -> int -> int;
 extern fn fs_is_symlink: str -> int;
+extern fn fs_fail: str -> str -> int;
+extern fn fs_last_error: unit -> str;
+extern fn fs_clear_error: unit -> int;
+extern fn fs_has_error: unit -> int;
 
 let block = 512;
 
@@ -111,9 +119,12 @@ let symlink_ancestor = fn (dest: str) -> fn (name: str) ->
 
 // ---- refusals: name what was refused, never approximate it ---------------
 
-let refuse = fn (what: str) -> fn (ctx: str) ->
-  let _ = print_err ("mtar: refused: " ++ what ++ "  [" ++ ctx ++ "]") in
-  exit 3;
+// A refusal RECORDS its reason and the walk unwinds with -1. It does not exit:
+// this reader is vendored into a daemon that serves `docker load`, where a
+// malformed archive from any client would otherwise take the process down.
+// mtar.mere turns a -1 back into the old behaviour -- message on stderr,
+// exit 3 -- so the CLI is unchanged.
+let refuse = fn (what: str) -> fn (ctx: str) -> fs_fail what ctx;
 
 // typeflag bytes. '0'=48 '1'=49 '2'=50 '5'=53. A NUL typeflag is the older
 // spelling of a regular file and is accepted as one; every other value is
@@ -124,22 +135,34 @@ let kind_of = fn (t: int) -> fn (name: str) ->
   else if t == 49 then "hardlink"
   else if t == 50 then "symlink"
   else if t == 53 then "dir"
-  else if t == 120 then refuse "a PAX extended header (typeflag 'x')" name
-  else if t == 103 then refuse "a PAX global header (typeflag 'g')" name
-  else if t == 76  then refuse "a GNU long name (typeflag 'L')" name
-  else if t == 75  then refuse "a GNU long link name (typeflag 'K')" name
-  else refuse ("typeflag " ++ show t) name;
+  else if t == 120 then let _ = refuse "a PAX extended header (typeflag 'x')" name in ""
+  else if t == 103 then let _ = refuse "a PAX global header (typeflag 'g')" name in ""
+  else if t == 76  then let _ = refuse "a GNU long name (typeflag 'L')" name in ""
+  else if t == 75  then let _ = refuse "a GNU long link name (typeflag 'K')" name in ""
+  else let _ = refuse ("typeflag " ++ show t) name in "";
 
 // ---- the walk ------------------------------------------------------------
 //
 // mode 0 = list, mode 1 = extract. One walk with two readers, so a listing
 // and an extraction can never disagree about what the archive contains.
 
+// Returns the number of entries, or -1 when the archive was refused. The
+// reason is in fs_last_error (); callers that want the CLI's old behaviour
+// print it and exit, callers inside a daemon report it and keep serving.
 let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
+  let _ = fs_clear_error () in
   let fh = file_openrw path in
   let fsize = file_size path in
   let rec go = fn (off: int) -> fn (count: int) ->
-    if off + block > fsize then count
+    // A partial block is not the end of an archive, it is a truncated one. The
+    // first version returned `count` here, so a file cut off mid-header was
+    // reported as a valid archive with however many entries had been read --
+    // and a 300-byte fragment as a valid EMPTY one.
+    if off >= fsize then count
+    else if off + block > fsize then
+      let _ = refuse ("a partial final block (" ++ show (fsize - off)
+                      ++ " bytes, expected " ++ show block ++ ")") path in
+      0 - 1
     else
       let hb = file_pread_bytes fh off block in
       let b = bytebuf_of_bytes hb in
@@ -168,23 +191,26 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
               let t = bytebuf_get b 156 in
               let link = str_at b 157 100 in
               let kind = kind_of t name in
+              if fs_has_error () == 1 then 0 - 1 else
               let _ =
                 if not do_extract then ()
                 else if name_escapes name then
-                  refuse "R1/R2: a name that leaves the destination" name
+                  let _ = refuse "R1/R2: a name that leaves the destination" name in ()
                 else if kind == "hardlink" then
                   (if name_escapes link then
-                     refuse "R4: a hardlink target that leaves the destination"
-                            (name ++ " -> " ++ link)
+                     let _ = refuse "R4: a hardlink target that leaves the destination"
+                                   (name ++ " -> " ++ link) in ()
                    else ())
                 else () in
+              if fs_has_error () == 1 then 0 - 1 else
               let _ =
                 if do_extract then
                   let anc = symlink_ancestor dest name in
                   if str_len anc > 0 then
-                    refuse ("R3: an ancestor is a symlink (" ++ anc ++ ")") name
+                    let _ = refuse ("R3: an ancestor is a symlink (" ++ anc ++ ")") name in ()
                   else ()
                 else () in
+              if fs_has_error () == 1 then 0 - 1 else
               let out = join2 dest name in
               let _ =
                 if not do_extract then
@@ -203,24 +229,25 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
                       let _ = fs_chmod out mode in ()
                     else if kind == "symlink" then
                       let rc = fs_symlink link out in
-                      if rc != 0 then refuse "symlink(2) failed" name
+                      if rc != 0 then let _ = refuse "symlink(2) failed" name in ()
                       else
                         // The archive records a mode for the symlink itself
                         // (0777 throughout the corpus) and symlink(2) applies
                         // the umask instead. lchmod puts it back; on Linux the
                         // shim reports 1 (not applicable) and we accept that.
                         let rc2 = fs_lchmod out mode in
-                        if rc2 < 0 then refuse "lchmod(2) failed" name else ()
+                        if rc2 < 0 then let _ = refuse "lchmod(2) failed" name in () else ()
                     else
                       let rc = fs_link (join2 dest link) out in
-                      if rc != 0 then refuse "link(2) failed" (name ++ " -> " ++ link) else ()
+                      if rc != 0 then let _ = refuse "link(2) failed" (name ++ " -> " ++ link) in () else ()
                 in
               let _ =
                 if do_extract then
                   let rc = fs_lchown out uid gid in
-                  if rc < 0 then refuse "lchown(2) failed" name else ()
+                  if rc < 0 then let _ = refuse "lchown(2) failed" name in () else ()
                 else () in
-              go (off + block + round_up size) (count + 1) in
+              if fs_has_error () == 1 then 0 - 1
+              else go (off + block + round_up size) (count + 1) in
   let n = go 0 0 in
   let _ = file_close fh in
   n;

@@ -59,3 +59,29 @@ int fs_is_symlink(const char *path) {
     if (lstat(path, &st) != 0) return 0;
     return S_ISLNK(st.st_mode) ? 1 : 0;
 }
+
+/* ---- a refusal that a library can survive ------------------------------ */
+/*
+ * The reader used to refuse by printing and calling exit(3). That is right for
+ * a CLI and a denial of service inside anything long-lived: mengd vendors this
+ * reader and serves `docker load`, so any client that uploaded a malformed
+ * archive took the whole daemon down.
+ *
+ * So a refusal is now RECORDED and the walk unwinds with -1. The CLI reads the
+ * message back and exits 3 itself, which keeps its behaviour identical; a
+ * library caller checks the return value and stays alive.
+ *
+ * One slot per thread: two concurrent extractions must not overwrite each
+ * other's reason, and mengd extracts concurrently.
+ */
+#include <stdio.h>
+#include <string.h>
+static _Thread_local char fs_err[512];
+
+int fs_fail(const char *what, const char *ctx) {
+    snprintf(fs_err, sizeof fs_err, "%s  [%s]", what ? what : "", ctx ? ctx : "");
+    return -1;
+}
+const char *fs_last_error(void) { return fs_err; }
+int fs_clear_error(void) { fs_err[0] = 0; return 0; }
+int fs_has_error(void) { return fs_err[0] != 0 ? 1 : 0; }

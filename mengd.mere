@@ -34,6 +34,7 @@ extern fn unix_time: unit -> int;
 extern fn st_slots: unit -> int;
 extern fn st_slot_acquire: unit -> int;
 extern fn st_slot_release: int -> int;
+extern fn fs_last_error: unit -> str;
 extern fn gen_request_id: unit -> str;
 extern fn sha256_hex: str -> str;
 
@@ -371,6 +372,28 @@ let info_body = fn (unit_: unit) ->
     ("Warnings", raw "[]")
   ];
 
+// A refusal's reason quotes the archive: the entry name it choked on, and the
+// path it was reading. Neither can go back to the client as-is. The name is
+// attacker-controlled bytes -- a junk archive reflects random control
+// characters into whatever terminal reads the error -- and the path is the
+// daemon's own storage layout, which is nobody's business.
+let safe_reason = fn (why: str) -> fn (tarfile: str) ->
+  let n = str_len why in
+  let lim = if n > 200 then 200 else n in
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= lim then acc
+    else
+      let c = char_at why i in
+      let o = ord c in
+      // The internal path always appears bracketed at the end; cut there.
+      if i + str_len tarfile <= n then
+        (if substring why i (i + str_len tarfile) == tarfile
+         then acc ++ "the uploaded archive"
+         else go (i + 1) (acc ++ (if o < 32 then "?" else if o > 126 then "?" else c)))
+      else go (i + 1) (acc ++ (if o < 32 then "?" else if o > 126 then "?" else c)) in
+  let r = go 0 "" in
+  if n > 200 then r ++ "..." else r;
+
 let load_body = fn (msg: str) -> obj [("stream", s ("Loaded image: " ++ msg ++ "\n"))];
 
 // ---- the image store -----------------------------------------------------
@@ -429,8 +452,15 @@ let register_image = fn (store: str) -> fn (tarfile: str) -> fn (uniq: str) ->
   let _ = st_rmtree stage in
   let _ = mkdir_p stage in
   let _ = tr "walk" in
-  let _ = walk tarfile stage true in
+  let unpacked = walk tarfile stage true in
   let _ = tr "walked" in
+  // A refused archive is a bad request, not a dead daemon. mtar returns -1 and
+  // leaves the reason in fs_last_error (); before that it called exit, and any
+  // client could stop the daemon by uploading a malformed tar.
+  if unpacked < 0 then
+    let _ = st_rmtree stage in
+    ""
+  else
   let dir = stage in
   let mpath = dir ++ "/manifest.json" in
   if not (file_exists mpath) then ""
@@ -842,8 +872,11 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
       let tag = register_image store tarfile uniq in
       let _ = st_rmtree tarfile in
       if str_len tag == 0 then
-        respond fd "500 Internal Server Error" "application/json"
-          (obj [("message", s "mengd: the archive has no manifest.json")])
+        let why = safe_reason (fs_last_error ()) tarfile in
+        respond fd "400 Bad Request" "application/json"
+          (obj [("message", s ("mengd: cannot read that archive"
+                               ++ (if str_len why == 0 then ": no manifest.json"
+                                   else ": " ++ why)))])
       else respond fd "200 OK" "application/json" (load_body tag)
   else if path == "/_ping" then
     (if m == "HEAD" then respond fd "200 OK" "text/plain" ""
