@@ -1,0 +1,13 @@
+// mkrootfs.mere — the rootfs builder as a CLI, so it can be diffed against
+// `docker export` without standing a daemon up.
+//
+//   mkrootfs <image-dir> <dest>
+
+import "rootfs.mere";
+
+match args () with
+| [imgdir, dest] ->
+    let n = build_rootfs imgdir dest in
+    if n < 0 then let _ = print_err "mkrootfs: no manifest.json in that image" in exit 1
+    else print_err ("mkrootfs: " ++ show n ++ " entries")
+| _ -> let _ = print_err "usage: mkrootfs <image-dir> <dest>" in exit 2

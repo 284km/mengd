@@ -1,0 +1,56 @@
+// rootfs.mere — turn a loaded image into a root filesystem.
+//
+// The layers in a `docker save` archive are gzipped tars, applied in the order
+// manifest.json lists them. mengd unpacks them with mgz and mtar, both vendored,
+// rather than shelling out: the point of the exercise is that the pieces are
+// the ones written here.
+//
+// The oracle is `docker export` of the same image -- the real daemon's own
+// answer to "what does this image's filesystem contain".
+
+import "vendor_inflate.mere";
+import "vendor_tar.mere";
+import "vendor_json.mere";
+
+extern fn st_rmtree: str -> int;
+
+let rec rf_assoc = fn (ps: (str * Json.json) list) -> fn (k: str) ->
+  match ps with
+  | [] -> Json.JNull
+  | [p, ...t] -> let (k2, v) = p in if k2 == k then v else rf_assoc t k;
+let rf_get = fn (o: Json.json) -> fn (k: str) ->
+  match o with | Json.JObj kvs -> rf_assoc kvs k | _ -> Json.JNull;
+let rf_str = fn (v: Json.json) -> match v with | Json.JStr x -> x | _ -> "";
+let rf_arr = fn (v: Json.json) -> match v with | Json.JArr xs -> xs | _ -> [];
+
+// Apply one layer. A layer blob is gzip; the tar inside it goes on top of
+// whatever the layers below put there, which is what makes the order matter.
+let apply_layer = fn (imgdir: str) -> fn (dest: str) -> fn (rel: str) -> fn (tmp: str) ->
+  let blob = imgdir ++ "/" ++ rel in
+  if not (file_exists blob) then 0 - 1
+  else
+    let data = read_file_bytes blob in
+    let plain = if is_gzip data then gunzip data else data in
+    let _ = write_file_bytes tmp plain in
+    let n = walk tmp dest true in
+    n;
+
+// Returns the number of entries applied, or -1 if the image has no manifest.
+let build_rootfs = fn (imgdir: str) -> fn (dest: str) ->
+  let mpath = imgdir ++ "/manifest.json" in
+  if not (file_exists mpath) then 0 - 1
+  else
+    let m = match rf_arr (Json.parse_json (read_file mpath)) with
+            | [] -> Json.JNull
+            | [h, ...t] -> h in
+    let _ = mkdir_p dest in
+    let tmp = dest ++ "/.layer.tar" in
+    let rec go = fn (xs: Json.json list) -> fn (acc: int) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] ->
+          let n = apply_layer imgdir dest (rf_str h) tmp in
+          if n < 0 then 0 - 1 else go t (acc + n) in
+    let total = go (rf_arr (rf_get m "Layers")) 0 in
+    let _ = st_rmtree tmp in
+    total;

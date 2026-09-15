@@ -113,6 +113,43 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## Turning an image into a root filesystem
+
+```sh
+sh test/rootfs.sh              # alpine
+IMAGE=redis:7-alpine sh test/rootfs.sh
+```
+
+```
+  ok    nothing in the built rootfs that the image did not describe
+  ok    the only paths missing are the 5 the runtime adds
+  ok    1160 shared paths match exactly (type, mode, content, link target)
+  ok    every allowed exception is still an actual difference
+```
+
+Layers are gzipped tars applied in the order `manifest.json` gives them, so
+mengd vendors [mgz](https://github.com/284km/mgz) for the gzip and
+[mtar](https://github.com/284km/mtar) for the tar — three Mere libraries in a
+row, each checked against a system tool in its own repository. mgz takes 0.4 s
+on a 4 MB layer against the system `gunzip`'s 0.01 s, and produces the same
+8,939,520 bytes with the same sha256.
+
+The oracle is `docker export`, which is not expected to be identical: it dumps a
+CONTAINER, so it carries what the runtime added on top of the image. Those eight
+paths are listed by name — five added (`.dockerenv`, the device nodes,
+`etc/resolv.conf`) and three replaced (`etc/hostname`, `etc/hosts`, `etc/mtab`).
+Anything else is a defect, **and the list is checked for staleness**: an entry
+that stops differing is a failure too, because a stale allowance is cover for
+the next real difference.
+
+### The comparison measured the shell first
+
+The first run reported 340 differing paths, which looked like a serious bug in
+the layer application and was not. The reference was extracted with `tar x`
+rather than `tar xp`, so the umask had dropped the sticky bit on `/tmp` and the
+mode of every one of the image's 335 symlinks. The built rootfs was right and
+the oracle was wrong.
+
 ## The next slice needs concurrency, and that was measured first
 
 `docker run` sends `/containers/{id}/wait` **before** `/containers/{id}/start`,
