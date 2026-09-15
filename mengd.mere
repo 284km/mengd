@@ -9,6 +9,9 @@
 // reports its own name, its own version, and zero containers because it has
 // none yet. Only the protocol is copied.
 
+import "vendor_json.mere";
+import "vendor_tar.mere";
+
 extern fn unix_listen: str -> int;
 extern fn unix_accept: int -> int;
 extern fn tcp_read: int -> int -> int -> int;
@@ -17,6 +20,10 @@ extern fn tcp_close: int -> int;
 extern fn mem_alloc: int -> int;
 extern fn mem_to_str: int -> int -> str;
 extern fn str_ptr: str -> int;
+extern fn mem_to_bytes: int -> int -> bytes;
+extern fn mem_get_u8: int -> int -> int;
+extern fn st_rename: str -> str -> int;
+extern fn st_rmtree: str -> int;
 
 let mengd_version = "0.1.0";
 let api_version = "1.54";
@@ -24,13 +31,30 @@ let min_api_version = "1.40";
 
 // ---- the smallest JSON writer that keeps this readable -------------------
 
+// JSON forbids a raw control character inside a string. The first version
+// escaped only the quote and the backslash, and the `docker load` reply --
+// which ends in a newline, because that is what the client prints -- came back
+// from the client as `invalid character '\n' in string`. A writer that only
+// escapes the two obvious characters is wrong for every message with a newline
+// in it, which is most of them.
 let esc = fn (v: str) ->
   let n = str_len v in
   let rec go = fn (i: int) -> fn (acc: str) ->
     if i == n then acc
     else
       let c = char_at v i in
-      go (i + 1) (acc ++ (if c == "\"" then "\\\"" else if c == "\\" then "\\\\" else c)) in
+      let o = ord c in
+      let e = if c == "\"" then "\\\""
+              else if c == "\\" then "\\\\"
+              else if o == 10 then "\\n"
+              else if o == 13 then "\\r"
+              else if o == 9 then "\\t"
+              else if o == 8 then "\\b"
+              else if o == 12 then "\\f"
+              else if o < 32 then "\\u00" ++ (if o < 16 then "0" else "1")
+                                  ++ char_at "0123456789abcdef" (o % 16)
+              else c in
+      go (i + 1) (acc ++ e) in
   go 0 "";
 
 let s   = fn (v: str) -> "\"" ++ esc v ++ "\"";
@@ -92,12 +116,119 @@ let req_method = fn (line: str) ->
   let i = str_index_of line " " in
   if i < 0 then "" else substring line 0 i;
 
+// "/v1.54/images/json?manifests=1" -> "/images/json". The client puts query
+// parameters on most routes, so a table matching whole paths misses every one
+// of them -- and would have, the first time /images/json was implemented.
+let strip_query = fn (p: str) ->
+  let i = str_index_of p "?" in
+  if i < 0 then p else substring p 0 i;
+
 let req_path = fn (line: str) ->
   let i = str_index_of line " " in
   if i < 0 then "" else
     let rest = substring line (i + 1) (str_len line) in
     let j = str_index_of rest " " in
-    strip_version (if j < 0 then rest else substring rest 0 j);
+    strip_version (strip_query (if j < 0 then rest else substring rest 0 j));
+
+// ---- reading a chunked request body --------------------------------------
+//
+// `docker load` sends the tar with Transfer-Encoding: chunked and no length.
+// The body has to be STREAMED: the FFI arena is 16 MiB, and a real image is
+// bigger than that (postgres:17-alpine is 415 MB), so anything that buffered
+// the whole body would work on alpine and fail on the first real image.
+//
+// State is a vec because the loop needs to mutate it: [have, pos, outoff].
+
+let rd_have = 0; let rd_pos = 1; let rd_out = 2;
+
+// `have` and `pos` start at whatever the header read already pulled in: the
+// first bytes of the body almost always arrive in the same packet as the
+// headers, and dropping them would corrupt the very first chunk.
+let rd_new = fn (have: int) -> fn (pos: int) ->
+  let v = vec_new () in
+  let _ = vec_push v have in
+  let _ = vec_push v pos in
+  let _ = vec_push v 0 in
+  v;
+
+// Refill from the socket. Returns how many bytes are now available.
+let rd_fill = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+  let have = (vec_get st rd_have : int) in
+  let pos = (vec_get st rd_pos : int) in
+  if pos < have then have - pos
+  else
+    let n = tcp_read fd buf cap in
+    if n <= 0 then 0
+    else
+      let _ = vec_set st rd_have n in
+      let _ = vec_set st rd_pos 0 in
+      n;
+
+let rd_byte = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+  if rd_fill fd buf cap st == 0 then 0 - 1
+  else
+    let p = (vec_get st rd_pos : int) in
+    let c = mem_get_u8 buf p in
+    let _ = vec_set st rd_pos (p + 1) in
+    c;
+
+// A chunk header is about eight bytes, so reading it a byte at a time costs
+// nothing and avoids a compacting buffer.
+let rd_line = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+  let rec go = fn (acc: str) ->
+    let c = rd_byte fd buf cap st in
+    if c < 0 then acc
+    else if c == 10 then acc
+    else if c == 13 then go acc
+    else go (acc ++ chr c) in
+  go "";
+
+let hex_val = fn (h: str) ->
+  let n = str_len h in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == n then acc
+    else
+      let c = ord (char_at h i) in
+      if c >= 48 then
+        (if c <= 57 then go (i + 1) (acc * 16 + (c - 48))
+         else if c >= 97 then (if c <= 102 then go (i + 1) (acc * 16 + (c - 87)) else acc)
+         else if c >= 65 then (if c <= 70 then go (i + 1) (acc * 16 + (c - 55)) else acc)
+         else acc)
+      else acc in
+  go 0 0;
+
+// Copy exactly n body bytes to the open file: whatever is already buffered
+// first, then straight from the socket in buffer-sized reads.
+let rd_copy = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+              fn (fh: File) -> fn (n: int) ->
+  let rec go = fn (left: int) ->
+    if left <= 0 then 0
+    else
+      let avail = rd_fill fd buf cap st in
+      if avail == 0 then left
+      else
+        let take = if avail < left then avail else left in
+        let p = (vec_get st rd_pos : int) in
+        let off = (vec_get st rd_out : int) in
+        let _ = file_pwrite_bytes fh off (mem_to_bytes (buf + p) take) in
+        let _ = vec_set st rd_pos (p + take) in
+        let _ = vec_set st rd_out (off + take) in
+        go (left - take) in
+  go n;
+
+let recv_chunked = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) -> fn (path: str) ->
+  let fh = file_openrw path in
+  let rec go = fn (total: int) ->
+    let line = rd_line fd buf cap st in
+    let n = hex_val line in
+    if n == 0 then total
+    else
+      let missing = rd_copy fd buf cap st fh n in
+      let _ = rd_line fd buf cap st in    // the CRLF that closes the chunk
+      if missing > 0 then total + n - missing else go (total + n) in
+  let total = go 0 in
+  let _ = file_close fh in
+  total;
 
 // ---- the routes ----------------------------------------------------------
 
@@ -182,12 +313,149 @@ let info_body = fn (unit_: unit) ->
     ("Warnings", raw "[]")
   ];
 
-let handle = fn (fd: int) -> fn (m: str) -> fn (path: str) ->
-  if path == "/_ping" then
+let load_body = fn (msg: str) -> obj [("stream", s ("Loaded image: " ++ msg ++ "\n"))];
+
+// ---- the image store -----------------------------------------------------
+//
+// One line per image in <store>/images.index, tab separated:
+//   id \t repotag \t dir \t size
+// A text file rather than a database because there is nothing here a database
+// would do better yet, and a line is something a person can read when this
+// goes wrong.
+
+let rec jassoc = fn (ps: (str * Json.json) list) -> fn (k: str) ->
+  match ps with
+  | [] -> Json.JNull
+  | [p, ...t] -> let (k2, v) = p in if k2 == k then v else jassoc t k;
+let jget = fn (o: Json.json) -> fn (k: str) ->
+  match o with | Json.JObj kvs -> jassoc kvs k | _ -> Json.JNull;
+let jstr = fn (v: Json.json) -> match v with | Json.JStr x -> x | _ -> "";
+let jarr = fn (v: Json.json) -> match v with | Json.JArr xs -> xs | _ -> [];
+let jfirst = fn (v: Json.json) -> match jarr v with | [] -> Json.JNull | [h, ...t] -> h;
+
+let basename = fn (p: str) ->
+  let n = str_len p in
+  let rec go = fn (i: int) -> fn (last: int) ->
+    if i == n then (if last < 0 then p else substring p (last + 1) n)
+    else go (i + 1) (if char_at p i == "/" then i else last) in
+  go 0 (0 - 1);
+
+let index_path = fn (store: str) -> store ++ "/images.index";
+
+let read_index = fn (store: str) ->
+  let p = index_path store in
+  if file_exists p then read_file p else "";
+
+let field = fn (line: str) -> fn (k: int) ->
+  let n = str_len line in
+  let rec go = fn (i: int) -> fn (start: int) -> fn (seen: int) ->
+    if i == n then (if seen == k then substring line start n else "")
+    else if char_at line i == "\t" then
+      (if seen == k then substring line start i else go (i + 1) (i + 1) (seen + 1))
+    else go (i + 1) start seen in
+  go 0 0 0;
+
+// Load: unpack with mtar, read the tar's own manifest.json for the tag and the
+// config digest, and record it. The config blob's digest IS the image id --
+// which is why the destination directory is numbered instead: the id is not
+// known until after the archive has been unpacked.
+// Unpack into a staging directory, then find out what was unpacked. The image
+// id is the digest of a config blob INSIDE the archive, so nothing can be
+// decided before unpacking -- which is why a duplicate has to be cleaned up
+// afterwards rather than skipped beforehand.
+let register_image = fn (store: str) -> fn (tarfile: str) ->
+  let idx = read_index store in
+  let stage = store ++ "/images/.staging" in
+  let _ = st_rmtree stage in
+  let _ = mkdir_p stage in
+  let _ = walk tarfile stage true in
+  let dir = stage in
+  let mpath = dir ++ "/manifest.json" in
+  if not (file_exists mpath) then ""
+  else
+    let m = jfirst (Json.parse_json (read_file mpath)) in
+    let cfg = jstr (jget m "Config") in
+    let tag = jstr (jfirst (jget m "RepoTags")) in
+    let id = "sha256:" ++ basename cfg in
+    let size = fn (unit_: unit) ->
+      let rec go = fn (xs: Json.json list) -> fn (acc: int) ->
+        match xs with
+        | [] -> acc
+        | [h, ...t] ->
+            let f = dir ++ "/" ++ jstr h in
+            go t (acc + (if file_exists f then file_size f else 0)) in
+      go (jarr (jget m "Layers")) 0 in
+    // Loading the same image twice must not add a second row -- and must not
+    // leave the tree it just unpacked behind either.
+    if str_index_of idx (id ++ "\t") >= 0 then
+      let _ = st_rmtree stage in
+      tag
+    else
+      let sz = size () in
+      let final = store ++ "/images/" ++ substring id 7 19 in
+      let _ = st_rmtree final in
+      let rc = st_rename stage final in
+      if rc != 0 then
+        let _ = print_err ("mengd: cannot move the staged image into place: " ++ final) in
+        ""
+      else
+        let line = id ++ "\t" ++ tag ++ "\t" ++ final ++ "\t" ++ show sz ++ "\n" in
+        let _ = write_file (index_path store) (idx ++ line) in
+        tag;
+
+// Walks the index text directly instead of splitting it into a list first:
+// one pass, and no intermediate that has to be reversed.
+let images_body = fn (store: str) ->
+  let idx = read_index store in
+  let rec go = fn (rest: str) -> fn (acc: str) ->
+    let i = str_index_of rest "\n" in
+    if i < 0 then acc
+    else
+      let l = substring rest 0 i in
+      let more = substring rest (i + 1) (str_len rest) in
+      if str_len l == 0 then go more acc
+      else
+        let id = field l 0 in
+        let tag = field l 1 in
+        let sz = int_of_str (field l 3) in
+        let e = obj [("Containers", n_ (0 - 1)), ("Created", n_ 0),
+                     ("Descriptor", raw "null"), ("Id", s id),
+                     ("Labels", raw "null"), ("ParentId", s ""),
+                     ("RepoDigests", raw "[]"),
+                     ("RepoTags", raw ("[" ++ s tag ++ "]")),
+                     ("SharedSize", n_ (0 - 1)), ("Size", n_ sz)] in
+        go more (if str_len acc == 0 then e else acc ++ "," ++ e) in
+  "[" ++ go idx "" ++ "]";
+
+let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+             fn (store: str) -> fn (m: str) -> fn (path: str) ->
+  if path == "/images/load" then
+    let tarfile = store ++ "/incoming.tar" in
+    // file_openrw creates but does NOT truncate, so a smaller archive written
+    // after a larger one leaves the tail of the larger one behind: after an
+    // 8 MB alpine followed a 17 MB redis, this file was still 17 MB. It read
+    // correctly only because a tar ends in zero blocks and the walk stops
+    // there -- a reader that trusted file_size would have seen 9 MB of the
+    // previous image.
+    let _ = st_rmtree tarfile in
+    let n = recv_chunked fd buf cap st tarfile in
+    let _ = print_err ("mengd: received " ++ show n ++ " bytes into " ++ tarfile) in
+    if n <= 0 then
+      respond fd "400 Bad Request" "application/json"
+        (obj [("message", s "mengd: empty or unreadable request body")])
+    else
+      let tag = register_image store tarfile in
+      if str_len tag == 0 then
+        respond fd "500 Internal Server Error" "application/json"
+          (obj [("message", s "mengd: the archive has no manifest.json")])
+      else respond fd "200 OK" "application/json" (load_body tag)
+  else if path == "/_ping" then
     (if m == "HEAD" then respond fd "200 OK" "text/plain" ""
      else respond fd "200 OK" "text/plain" "OK")
   else if path == "/version" then respond fd "200 OK" "application/json" (version_body ())
   else if path == "/info" then respond fd "200 OK" "application/json" (info_body ())
+  else if path == "/images/json" then
+    respond fd "200 OK" "application/json" (images_body store)
   else
     // A 404 that says what was asked for. The client prints the body, so an
     // unimplemented route names itself instead of looking like a broken daemon.
@@ -196,7 +464,7 @@ let handle = fn (fd: int) -> fn (m: str) -> fn (path: str) ->
 
 // ---- accept loop ---------------------------------------------------------
 
-let serve = fn (sock: str) ->
+let serve = fn (sock: str) -> fn (store: str) ->
   let srv = unix_listen sock in
   let _ = if srv < 0 then
             let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1
@@ -213,11 +481,15 @@ let serve = fn (sock: str) ->
                 let req = mem_to_str buf nread in
                 let e = str_index_of req "\r\n" in
                 let line = if e < 0 then req else substring req 0 e in
-                handle c (req_method line) (req_path line) in
+                let hend = str_index_of req "\r\n\r\n" in
+                let bstart = if hend < 0 then nread else hend + 4 in
+                let st = rd_new nread bstart in
+                handle c buf 65535 st store (req_method line) (req_path line) in
       let _ = tcp_close c in
       loop () in
   loop ();
 
 match args () with
-| [sock] -> serve sock
-| _ -> let _ = print_err "usage: mengd <socket-path>" in exit 2
+| [sock] -> serve sock "/var/lib/mengd"
+| [sock, store] -> serve sock store
+| _ -> let _ = print_err "usage: mengd <socket-path> [store-dir]" in exit 2

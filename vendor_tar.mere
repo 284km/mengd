@@ -1,0 +1,226 @@
+// Vendored from 284km/mtar tar.mere, unmodified.
+// Mere has no package manager yet; re-vendor rather than edit in place.
+// mengd uses mtar to unpack what `docker load` sends -- the same reader that
+// is checked against bsdtar and GNU tar in its own repository.
+// tar.mere — a POSIX USTAR reader, scoped to what real container images use.
+//
+// THE SCOPE IS MEASURED, NOT GUESSED. test/CORPUS records the sweep: 7 layers
+// across alpine / redis:7-alpine / postgres:17-alpine, 5,800 entries. What
+// appears there is typeflag 0 (regular), 1 (hardlink), 2 (symlink) and
+// 5 (directory), magic "ustar\0", octal sizes, names under 100 bytes.
+// alpine ALONE would have hidden the 258 hardlinks -- one image is not a corpus.
+//
+// Everything outside that set is REFUSED BY NAME rather than approximated,
+// so the first image that needs PAX ('x'), a GNU long name ('L') or a
+// base-256 size says exactly which one it wanted.
+
+extern fn fs_symlink: str -> str -> int;
+extern fn fs_link: str -> str -> int;
+extern fn fs_chmod: str -> int -> int;
+extern fn fs_unlink: str -> int;
+extern fn fs_lchmod: str -> int -> int;
+extern fn fs_lchown: str -> int -> int -> int;
+extern fn fs_is_symlink: str -> int;
+
+let block = 512;
+
+// ---- header field readers (offsets are relative to the 512-byte block) ----
+
+let str_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (maxlen: int) ->
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i == maxlen then acc
+    else
+      let c = bytebuf_get b (off + i) in
+      if c == 0 then acc else go (i + 1) (acc ++ chr c) in
+  go 0 "";
+
+// Octal ASCII, NUL- or space-padded. Non-digits are skipped, which is the
+// same answer as stopping at the first one for a well-formed field.
+let oct_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (len: int) ->
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == len then acc
+    else
+      let c = bytebuf_get b (off + i) in
+      if c >= 48 then
+        (if c <= 55 then go (i + 1) (acc * 8 + (c - 48)) else go (i + 1) acc)
+      else go (i + 1) acc in
+  go 0 0;
+
+// The header checksum, computed with the checksum field itself read as spaces.
+let header_sum = fn (b: ByteBuf[R]) ->
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == block then acc
+    else
+      let c = if i >= 148 then (if i < 156 then 32 else bytebuf_get b i)
+              else bytebuf_get b i in
+      go (i + 1) (acc + c) in
+  go 0 0;
+
+let all_zero = fn (b: ByteBuf[R]) ->
+  let rec go = fn (i: int) ->
+    if i == block then true
+    else if bytebuf_get b i == 0 then go (i + 1) else false in
+  go 0;
+
+let round_up = fn (n: int) -> ((n + block - 1) / block) * block;
+
+// ---- path helpers --------------------------------------------------------
+
+let dirname = fn (p: str) ->
+  let rec go = fn (i: int) -> fn (last: int) ->
+    if i == str_len p then last
+    else go (i + 1) (if char_at p i == "/" then i else last) in
+  let cut = go 0 (0 - 1) in
+  if cut < 0 then "." else substring p 0 cut;
+
+let join2 = fn (a: str) -> fn (b: str) -> a ++ "/" ++ b;
+
+// ---- escape routes: see SECURITY_ROUTES ---------------------------------
+//
+// R1/R2 are decided from the name alone. R3 has to ask the filesystem, because
+// the symlink an entry writes through may have come from an earlier LAYER, not
+// from this archive. R5 (a symlink whose target is absolute or has "..") is
+// NOT refused: 1,836 of the corpus's 2,356 entries are exactly that, and a
+// stored target writes nothing.
+
+let ends_with_dotdot = fn (p: str) ->
+  let n = str_len p in
+  if n < 3 then false else substring p (n - 3) n == "/..";
+
+// R1 + R2: a name that can leave the destination on its own.
+let name_escapes = fn (p: str) ->
+  if str_len p == 0 then true
+  else if char_at p 0 == "/" then true
+  else if p == ".." then true
+  else if str_len p >= 3 then
+    (if substring p 0 3 == "../" then true
+     else if str_index_of p "/../" >= 0 then true
+     else ends_with_dotdot p)
+  else false;
+
+// R3: is any ancestor of dest/name an existing symlink?
+let symlink_ancestor = fn (dest: str) -> fn (name: str) ->
+  let n = str_len name in
+  let rec go = fn (i: int) -> fn (found: str) ->
+    if i >= n then found
+    else if char_at name i == "/" then
+      let anc = dest ++ "/" ++ substring name 0 i in
+      if fs_is_symlink anc == 1 then anc else go (i + 1) found
+    else go (i + 1) found in
+  go 0 "";
+
+// ---- refusals: name what was refused, never approximate it ---------------
+
+let refuse = fn (what: str) -> fn (ctx: str) ->
+  let _ = print_err ("mtar: refused: " ++ what ++ "  [" ++ ctx ++ "]") in
+  exit 3;
+
+// typeflag bytes. '0'=48 '1'=49 '2'=50 '5'=53. A NUL typeflag is the older
+// spelling of a regular file and is accepted as one; every other value is
+// refused by name.
+let kind_of = fn (t: int) -> fn (name: str) ->
+  if t == 48 then "file"
+  else if t == 0 then "file"
+  else if t == 49 then "hardlink"
+  else if t == 50 then "symlink"
+  else if t == 53 then "dir"
+  else if t == 120 then refuse "a PAX extended header (typeflag 'x')" name
+  else if t == 103 then refuse "a PAX global header (typeflag 'g')" name
+  else if t == 76  then refuse "a GNU long name (typeflag 'L')" name
+  else if t == 75  then refuse "a GNU long link name (typeflag 'K')" name
+  else refuse ("typeflag " ++ show t) name;
+
+// ---- the walk ------------------------------------------------------------
+//
+// mode 0 = list, mode 1 = extract. One walk with two readers, so a listing
+// and an extraction can never disagree about what the archive contains.
+
+let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
+  let fh = file_openrw path in
+  let fsize = file_size path in
+  let rec go = fn (off: int) -> fn (count: int) ->
+    if off + block > fsize then count
+    else
+      let hb = file_pread_bytes fh off block in
+      let b = bytebuf_of_bytes hb in
+      if all_zero b then count
+      else
+        let name0 = str_at b 0 100 in
+        let sum_want = oct_at b 148 8 in
+        let sum_got = header_sum b in
+        if sum_want != sum_got then
+          refuse ("a header whose checksum is " ++ show sum_got
+                  ++ " but claims " ++ show sum_want) name0
+        else
+          let magic = str_at b 257 5 in
+          if magic != "ustar" then
+            refuse ("magic " ++ magic ++ " (only POSIX ustar is implemented)") name0
+          else
+            if bytebuf_get b 124 >= 128 then
+              refuse "a base-256 size field (file larger than 8 GiB)" name0
+            else
+              let prefix = str_at b 345 155 in
+              let name = if str_len prefix == 0 then name0 else prefix ++ "/" ++ name0 in
+              let size = oct_at b 124 12 in
+              let mode = oct_at b 100 8 in
+              let uid = oct_at b 108 8 in
+              let gid = oct_at b 116 8 in
+              let t = bytebuf_get b 156 in
+              let link = str_at b 157 100 in
+              let kind = kind_of t name in
+              let _ =
+                if not do_extract then ()
+                else if name_escapes name then
+                  refuse "R1/R2: a name that leaves the destination" name
+                else if kind == "hardlink" then
+                  (if name_escapes link then
+                     refuse "R4: a hardlink target that leaves the destination"
+                            (name ++ " -> " ++ link)
+                   else ())
+                else () in
+              let _ =
+                if do_extract then
+                  let anc = symlink_ancestor dest name in
+                  if str_len anc > 0 then
+                    refuse ("R3: an ancestor is a symlink (" ++ anc ++ ")") name
+                  else ()
+                else () in
+              let out = join2 dest name in
+              let _ =
+                if not do_extract then
+                  print (kind ++ " " ++ show mode ++ " " ++ show size ++ " " ++ name
+                         ++ (if str_len link == 0 then "" else " -> " ++ link))
+                else
+                  if kind == "dir" then
+                    let _ = mkdir_p out in
+                    let _ = fs_chmod out mode in ()
+                  else
+                    let _ = mkdir_p (dirname out) in
+                    let _ = fs_unlink out in
+                    if kind == "file" then
+                      let data = file_pread_bytes fh (off + block) size in
+                      let _ = write_bytes out data in
+                      let _ = fs_chmod out mode in ()
+                    else if kind == "symlink" then
+                      let rc = fs_symlink link out in
+                      if rc != 0 then refuse "symlink(2) failed" name
+                      else
+                        // The archive records a mode for the symlink itself
+                        // (0777 throughout the corpus) and symlink(2) applies
+                        // the umask instead. lchmod puts it back; on Linux the
+                        // shim reports 1 (not applicable) and we accept that.
+                        let rc2 = fs_lchmod out mode in
+                        if rc2 < 0 then refuse "lchmod(2) failed" name else ()
+                    else
+                      let rc = fs_link (join2 dest link) out in
+                      if rc != 0 then refuse "link(2) failed" (name ++ " -> " ++ link) else ()
+                in
+              let _ =
+                if do_extract then
+                  let rc = fs_lchown out uid gid in
+                  if rc < 0 then refuse "lchown(2) failed" name else ()
+                else () in
+              go (off + block + round_up size) (count + 1) in
+  let n = go 0 0 in
+  let _ = file_close fh in
+  n;

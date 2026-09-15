@@ -1,0 +1,325 @@
+// Vendored from merelang/mere contrib/json/json.mere (MIT), unmodified.
+// Mere has no package manager yet; re-vendor rather than edit in place.
+// contrib/json/json.mere — JSON parser
+//
+// Implemented by combining stdlib (str ops + is_digit + try_or + fail) with
+// user-defined sum types, polymorphic list / pattern matching, and mutually
+// recursive fns.
+//
+// Phase 40 (contrib stage 2): moved from examples/json_parser.mere.
+// Phase 41: with qualified pattern match now supported across all 4 backend
+// codegens, this lib is wrapped in `module Json { ... }` for namespacing.
+//
+// Usage:
+//   import "contrib/json/json.mere";
+//   let v = Json.parse_json "[1, 2]";
+//   match v with
+//   | Json.JArr xs -> ...
+//   | Json.JNull -> ...
+//   | _ -> ...
+//
+// The trailing self-test block (`let run_case = ...` and below) is kept as a
+// demo and lives outside the `Json` module. Feel free to remove it in real use.
+
+module Json {
+
+// JSON has ONE number type and this has two, which is a deliberate choice and
+// not an oversight. A number written with a decimal point or an exponent
+// becomes `JFloat`; one written as an integer stays `JNum`, an int.
+//
+// Why not a single `JFloat` for everything: (1) it would silently change every
+// existing reader of `JNum`, (2) `to_json_str` would stop round-tripping --
+// `12` would come back as `12.0` -- and (3) the documents this parser is
+// actually pointed at distinguish the two. An array index, a byte offset and a
+// glTF accessor's `count` are integers and must stay exact; a colour component
+// and a node's translation are not. A reader that does not care can call
+// `as_float`, which widens either.
+type json =
+  | JNull
+  | JBool of bool
+  | JNum   of int
+  | JFloat of float
+  | JStr   of str
+  | JArr   of json list
+  | JObj   of (str * json) list;
+
+// Either flavour of number as a double, for the readers that do not care which
+// way it was written. An int above 2^53 loses precision here, which is the same
+// thing JSON itself does to it.
+let as_float = fn (v: json) ->
+  match v with
+  | JNum n -> float_of_int n
+  | JFloat f -> f
+  | _ -> fail "as_float: not a number";
+
+// === Whitespace skip ===
+
+let rec skip_ws = fn (s: str, i: int) ->
+  if i >= str_len s then i
+  else if is_space (char_at s i) then skip_ws s (i + 1)
+  else i;
+
+let expect_char = fn (s: str, i: int, c: str) ->
+  if i >= str_len s || char_at s i != c
+    then fail ("expected " ++ c ++ " at pos " ++ str_of_int i)
+  else i + 1;
+
+// === Atoms ===
+
+// Compares in place: `char_at` hands out a shared one-byte string, so the
+// loop allocates nothing, where `substring s i (i + n) == kw` copied the
+// keyword out of the input once per literal (160,000 copies on the benchmark
+// document -- 2.4 MB that existed only to be compared and dropped).
+let parse_keyword = fn (s: str, i: int, kw: str, value: json) ->
+  let n = str_len kw in
+  let rec same = fn (j: int) ->
+    j == n || (char_at s (i + j) == char_at kw j && same (j + 1)) in
+  if i + n <= str_len s && same 0
+  then (value, i + n)
+  else fail ("expected '" ++ kw ++ "' at pos " ++ str_of_int i);
+
+let parse_null  = fn (s: str, i: int) -> parse_keyword s i "null"  JNull;
+let parse_true  = fn (s: str, i: int) -> parse_keyword s i "true"  (JBool true);
+let parse_false = fn (s: str, i: int) -> parse_keyword s i "false" (JBool false);
+
+let parse_num = fn (s: str, i: int) ->
+  let start = i in
+  let i1 =
+    if i < str_len s && char_at s i == '-' then i + 1
+    else i
+  in
+  let rec scan = fn (j: int) ->
+    if j >= str_len s then j
+    else if is_digit (char_at s j) then scan (j + 1)
+    else j
+  in
+  let int_end = scan i1 in
+  if int_end == i1 then fail ("expected digit at pos " ++ str_of_int i1)
+  else
+    // Where the number stops being an integer. JSON's grammar is
+    // int [frac] [exp]; the presence of either tail is what decides which
+    // constructor this is, not the value -- `1.0` is a JFloat and `1` is a
+    // JNum, so writing the document back out gives the bytes that came in.
+    // A fraction needs at least one digit after the point. JSON says so, and
+    // an earlier version of this did not check it: `1.` parsed as 1.0, where
+    // the integer-only parser this replaced rejected it by leaving the '.'
+    // behind for the caller to trip over. A parser that gets more permissive
+    // while gaining a feature has made the language it accepts a secret.
+    let frac_end =
+      if int_end < str_len s && char_at s int_end == '.' then
+        let d = scan (int_end + 1) in
+        if d == int_end + 1 then fail ("expected digit after '.' at pos " ++ str_of_int (int_end + 1))
+        else d
+      else int_end in
+    let exp_end =
+      if frac_end < str_len s
+         && (char_at s frac_end == 'e' || char_at s frac_end == 'E')
+      then
+        let after_e = frac_end + 1 in
+        let after_sign =
+          if after_e < str_len s
+             && (char_at s after_e == '+' || char_at s after_e == '-')
+          then after_e + 1 else after_e in
+        let d = scan after_sign in
+        if d == after_sign then fail ("expected digit after exponent at pos " ++ str_of_int after_sign)
+        else d
+      else frac_end in
+    if exp_end == int_end then
+      // The integer path, unchanged: accumulate the digits directly rather than
+      // `int_of_str (substring ...)`, because the substring was a 16-byte
+      // allocation per number whose only reader was int_of_str (320,000 of them
+      // on the benchmark document).
+      let rec digits = fn (j: int) -> fn (acc: int) ->
+        if j == int_end then acc else digits (j + 1) (acc * 10 + (ord (char_at s j) - 48)) in
+      let mag = digits i1 0 in
+      (JNum (if i1 == start then mag else 0 - mag), int_end)
+    else
+      // The float path DOES take the substring. It could be avoided the same
+      // way, but only by writing a decimal-to-binary conversion by hand and
+      // getting the rounding right twice; `float_of_str` is the one the rest of
+      // the language already agrees on. The allocation is per fractional
+      // number, and the document that motivated the integer fast path has none.
+      (JFloat (float_of_str (substring s start exp_end)), exp_end);
+
+let parse_raw_str = fn (s: str, i: int) ->
+  // Returns (content, end_pos).  Handles `\"` `\\` `\n` `\t` `\r` `\/` via
+  // str_unescape after scanning the raw region.
+  let i1 = expect_char s i '"' in
+  let rec scan = fn (j: int) ->
+    if j >= str_len s then fail "unterminated string"
+    else match char_at s j with
+    | '\\' -> scan (j + 2)         // skip escape pair (whatever follows)
+    | '"'  -> j
+    | _    -> scan (j + 1)
+  in
+  let close = scan i1 in
+  (str_unescape (substring s i1 close), close + 1);
+
+let parse_jstr = fn (s: str, i: int) ->
+  let (text, j) = parse_raw_str s i in
+  (JStr text, j);
+
+// === Value dispatcher (mutual recursion with array / object) ===
+
+let rec parse_value = fn (s: str, i0: int) ->
+  let i = skip_ws s i0 in
+  if i >= str_len s then fail "unexpected EOF"
+  else
+    match char_at s i with
+    | 'n' -> parse_null  s i
+    | 't' -> parse_true  s i
+    | 'f' -> parse_false s i
+    | '"' -> parse_jstr  s i
+    | '[' -> parse_array s i
+    | '{' -> parse_object s i
+    | '-' -> parse_num s i
+    | c when is_digit c -> parse_num s i
+    | c -> fail ("unexpected '" ++ c ++ "' at pos " ++ str_of_int i)
+
+and parse_array = fn (s: str, i: int) ->
+  let i = expect_char s i '[' in
+  let i = skip_ws s i in
+  if i < str_len s && char_at s i == ']'
+  then (JArr Nil, i + 1)
+  else
+    // Q-106: the elements go into a ListBuf and come out in order. The
+    // reversed accumulator this used to build -- one cons per element, all
+    // of them garbage the moment `rev` returned -- was 30 MB of a 105 MB run
+    // on the benchmark document.
+    let b = lb_new () in
+    let rec loop = fn (j: int) ->
+      let (v, j) = parse_value s j in
+      let _ = lb_push b v in
+      let j = skip_ws s j in
+      if j >= str_len s then fail "unexpected EOF in array"
+      else
+        match char_at s j with
+        | ',' -> loop (j + 1)
+        | ']' -> (JArr (lb_to_list b), j + 1)
+        | _   -> fail ("expected ',' or ']' at pos " ++ str_of_int j)
+    in
+    loop i
+
+and parse_object = fn (s: str, i: int) ->
+  let i = expect_char s i '{' in
+  let i = skip_ws s i in
+  if i < str_len s && char_at s i == '}'
+  then (JObj Nil, i + 1)
+  else
+    let b = lb_new () in
+    let rec loop = fn (j: int) ->
+      let j = skip_ws s j in
+      let (key, j) = parse_raw_str s j in
+      let j = skip_ws s j in
+      let j = expect_char s j ':' in
+      let (v, j) = parse_value s j in
+      let _ = lb_push b (key, v) in
+      let j = skip_ws s j in
+      if j >= str_len s then fail "unexpected EOF in object"
+      else
+        match char_at s j with
+        | ',' -> loop (j + 1)
+        | '}' -> (JObj (lb_to_list b), j + 1)
+        | _   -> fail ("expected ',' or '}' at pos " ++ str_of_int j)
+    in
+    loop i;
+
+// === Top-level entry: parses a single JSON value, allows trailing ws ===
+
+let parse_json = fn (s: str) ->
+  let (v, i) = parse_value s 0 in
+  let i = skip_ws s i in
+  if i != str_len s
+    then fail ("trailing input at pos " ++ str_of_int i)
+  else v;
+
+// === Serialisation (was contrib/json/writer.mere) ==================
+// Kept in the same module so it shares the `json` type with the parser:
+// `to_json_str (parse_json s)` type-checks (previously the writer
+// declared its own top-level `json`, so parser + writer didn't compose).
+
+let rec write_join = fn (sb) -> fn (items) -> fn (sep) -> fn (write_item) ->
+  match items with
+  | Nil -> ()
+  | Cons (h, Nil) -> write_item sb h
+  | Cons (h, t) -> let __ = write_item sb h in
+                   let __ = strbuf_push sb sep in
+                   write_join sb t sep write_item;
+
+let escape_str = fn (s: str) ->
+  let buf = strbuf_new () in
+  let n = str_len s in
+  let rec loop = fn (i) ->
+    if i >= n then ()
+    else
+      let ch = char_at s i in
+      let __ = if ch == "\"" then
+                 let __ = strbuf_push buf "\\" in strbuf_push buf "\""
+               else if ch == "\\" then
+                 let __ = strbuf_push buf "\\" in strbuf_push buf "\\"
+               else
+                 strbuf_push buf ch
+      in
+      loop (i + 1)
+  in
+  let __ = loop 0 in
+  strbuf_to_str buf;
+
+let rec write_json = fn (sb) -> fn (v) ->
+  match v with
+  | JNull -> strbuf_push sb "null"
+  | JBool b -> strbuf_push sb (if b then "true" else "false")
+  | JNum n -> strbuf_push sb (show n)
+  // `str_of_float` prints a form JSON accepts, including the exponent one, and
+  // round-trips through `float_of_str`. It cannot print an infinity or a NaN
+  // here because neither can be parsed from valid JSON -- the one way in is an
+  // overflowing literal like 1e400, which `float_of_str` turns into an infinity
+  // and this would then write as `inf`, which is not JSON. Left as it is
+  // because refusing at write time would be refusing in the wrong place.
+  | JFloat f -> strbuf_push sb (str_of_float f)
+  | JStr s ->
+      let __ = strbuf_push sb "\"" in
+      let __ = strbuf_push sb (escape_str s) in
+      strbuf_push sb "\""
+  | JArr items ->
+      let __ = strbuf_push sb "[" in
+      let __ = write_join sb items "," (fn sb2 -> fn item -> write_json sb2 item) in
+      strbuf_push sb "]"
+  | JObj pairs ->
+      let __ = strbuf_push sb "\{" in
+      let __ = write_join sb pairs "," (fn sb2 -> fn p ->
+        let __ = strbuf_push sb2 "\"" in
+        let __ = strbuf_push sb2 (escape_str (fst p)) in
+        let __ = strbuf_push sb2 "\":" in
+        write_json sb2 (snd p))
+      in
+      strbuf_push sb "}";
+
+let to_json_str = fn (v) ->
+  let buf = strbuf_new () in
+  let __ = write_json buf v in
+  strbuf_to_str buf;
+
+let rec write_pretty = fn (sb) -> fn (v) ->
+  match v with
+  | JArr items ->
+      let __ = strbuf_push sb "[" in
+      let __ = write_join sb items ", " (fn sb2 -> fn item -> write_pretty sb2 item) in
+      strbuf_push sb "]"
+  | JObj pairs ->
+      let __ = strbuf_push sb "\{\n" in
+      let __ = write_join sb pairs ",\n" (fn sb2 -> fn p ->
+        let __ = strbuf_push sb2 "  \"" in
+        let __ = strbuf_push sb2 (escape_str (fst p)) in
+        let __ = strbuf_push sb2 "\": " in
+        write_pretty sb2 (snd p))
+      in
+      strbuf_push sb "\n}"
+  | other -> write_json sb other;
+
+let to_pretty_str = fn (v) ->
+  let buf = strbuf_new () in
+  let __ = write_pretty buf v in
+  strbuf_to_str buf;
+
+};   // end of `module Json`

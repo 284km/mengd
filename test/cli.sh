@@ -16,16 +16,18 @@ M="$MERE/_build/default/bin/mere.exe"
 command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 2; }
 out="$here/.build"; mkdir -p "$out"
 sock="${SOCK:-/tmp/mengd-test.sock}"
+store_dir="$out/store"
+rm -rf "$store_dir"; mkdir -p "$store_dir"
 
 echo "== build =="
 "$M" -c "$here/mengd.mere" > "$out/mengd.c" 2> "$out/emit.err" || {
   echo "FAIL: mere -c refused" >&2; sed -n '1,20p' "$out/emit.err" >&2; exit 1; }
 [ -s "$out/mengd.c" ] || { echo "FAIL: emitted C is empty" >&2; exit 1; }
-cc -O1 -o "$out/mengd" "$out/mengd.c" "$here/unix_shim.c" 2> "$out/cc.err" || {
+cc -O1 -o "$out/mengd" "$out/mengd.c" "$here/unix_shim.c" "$here/fs_shim.c" "$here/store_shim.c" 2> "$out/cc.err" || {
   echo "FAIL: cc" >&2; sed -n '1,20p' "$out/cc.err" >&2; exit 1; }
 
 rm -f "$sock"
-"$out/mengd" "$sock" > "$out/mengd.log" 2>&1 &
+"$out/mengd" "$sock" "$store_dir" > "$out/mengd.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null; rm -f "$sock"' EXIT
 i=0; while [ ! -S "$sock" ] && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.1; done
@@ -77,6 +79,68 @@ DOCKER_HOST="unix://$sock" docker ps > "$out/ps.txt" 2>&1
 if [ $? = 0 ]; then echo "  FAIL  docker ps should not have succeeded"; fail=1
 else grep -q "GET /containers/json is not implemented" "$out/ps.txt"
      say $? "an unimplemented route names the method and path"; fi
+
+echo "== images: load, list, and load the same thing again =="
+fix="$out/fixture.tar"
+if [ ! -f "$fix" ]; then
+  # Built against the ambient daemon, before DOCKER_HOST is pointed at mengd.
+  docker save alpine:latest -o "$fix" 2>/dev/null || { echo "  SKIP  no alpine:latest to save"; fix=""; }
+fi
+if [ -n "$fix" ]; then
+  DOCKER_HOST="unix://$sock" docker load -i "$fix" > "$out/load.txt" 2>&1
+  say $? "docker load exits 0"
+  grep -q "Loaded image: alpine:latest" "$out/load.txt"
+  say $? "it reports the tag out of the archive's own manifest"
+
+  DOCKER_HOST="unix://$sock" docker images > "$out/images.txt" 2>&1
+  say $? "docker images exits 0"
+  grep -q "alpine:latest" "$out/images.txt"; say $? "the loaded image is listed"
+
+  # The archive names the image only from INSIDE, so a duplicate can be
+  # detected just by unpacking it -- and the unpacked tree has to go away
+  # again. It did not, the first time: 7.9 MB per repeated load.
+  before=$(ls -A "$store_dir/images" 2>/dev/null | wc -l | tr -d ' ')
+  DOCKER_HOST="unix://$sock" docker load -i "$fix" >/dev/null 2>&1
+  after=$(ls -A "$store_dir/images" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$before" = "$after" ]; say $? "a repeated load leaves no extra directory ($before -> $after)"
+  rows=$(grep -c . "$store_dir/images.index" 2>/dev/null || echo 0)
+  [ "$rows" = 1 ]; say $? "and no second row in the index ($rows)"
+
+  # file_openrw creates without truncating, so a smaller archive after a larger
+  # one leaves the larger one's tail behind. Detecting that needs LARGER THEN
+  # SMALLER: the first version of this check loaded the same fixture twice, so
+  # both writes were the same length and removing the truncate left it green.
+  big=""
+  for img in $(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'); do
+    [ "$img" = "alpine:latest" ] && continue
+    docker save "$img" -o "$out/big.tar" 2>/dev/null || continue
+    [ "$(ls -l "$out/big.tar" | awk '{print $5}')" -gt "$(ls -l "$fix" | awk '{print $5}')" ] && { big="$out/big.tar"; break; }
+  done
+  if [ -z "$big" ]; then
+    echo "  SKIP  no image larger than the fixture: cannot test the truncate"
+    fail=1   # a check that cannot run is not a check that passed
+  else
+    DOCKER_HOST="unix://$sock" docker load -i "$big" >/dev/null 2>&1
+    DOCKER_HOST="unix://$sock" docker load -i "$fix" >/dev/null 2>&1
+    ins=$(ls -l "$store_dir/incoming.tar" 2>/dev/null | awk '{print $5}')
+    fs=$(ls -l "$fix" | awk '{print $5}')
+    [ "$ins" = "$fs" ]
+    say $? "after a larger archive, the next one is exactly its own size ($ins vs $fs)"
+  fi
+
+  curl -s --unix-socket "$sock" "http://localhost/v1.54/images/json" > "$out/images.mine.json"
+  python3 - "$out/images.mine.json" "$here/oracle/expected/images_json.keys" <<'PY2'
+import json, sys
+mine = json.load(open(sys.argv[1]))
+ref = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+if not mine: print("  FAIL  /images/json returned nothing"); sys.exit(1)
+missing = sorted(set(ref) - set(mine[0])); extra = sorted(set(mine[0]) - set(ref))
+if missing or extra:
+    print(f"  FAIL  /images/json entry keys differ: missing {missing} extra {extra}"); sys.exit(1)
+print(f"  ok    /images/json entries carry all {len(ref)} keys dockerd's do")
+PY2
+  [ $? = 0 ] || fail=1
+fi
 
 [ "$fail" = 0 ] && echo "mengd PASS" || echo "mengd FAIL"
 exit "$fail"
