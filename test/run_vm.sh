@@ -677,6 +677,35 @@ o=\$(timeout 60 docker run --rm alpine:latest sh -c "(echo probe | nc -w 3 \$ip1
 [ "\$o" = "ON-THE-BRIDGE" ]; say \$? "and can reach another container on it (\$o)"
 timeout 20 docker rm -f br1 >/dev/null 2>&1
 
+# IPv6 ON THE SAME NETWORK. One lease, two addresses: the v6 address ends in
+# the same number as the v4 one, so a container's two addresses can never
+# disagree about which container it is. Unique-local, because there is nothing
+# upstream to be global for -- this network reaches the containers on it, and
+# says so rather than implying more.
+timeout 30 docker network create sixnet >/dev/null 2>&1
+timeout 60 docker run -d --name six --network sixnet alpine:latest \
+  sh -c 'while true; do echo V6-SERVED | nc -l -p 9000; done' >/dev/null 2>&1
+sleep 3
+v4=\$(timeout 20 docker inspect -f '{{.NetworkSettings.IPAddress}}' six 2>/dev/null)
+v6=\$(timeout 20 docker inspect -f '{{.NetworkSettings.GlobalIPv6Address}}' six 2>/dev/null)
+echo "\$v6" | grep -q "^fd00:"; say \$? "inspect reports a v6 address (\$v4 \$v6)"
+[ "\${v6##*:}" = "\${v4##*.}" ]; say \$? "and it ends in the same number as the v4 one"
+o=\$(timeout 30 docker exec six ip -6 -o addr show eth0 2>/dev/null | grep -c "\$v6/64")
+[ "\$o" = 1 ]; say \$? "the container has it on eth0 (\$o)"
+
+# The only question that matters, and it is asked the moment the container
+# starts: an address that is still TENTATIVE from duplicate detection answers
+# nothing, and a container that connects immediately would lose that race
+# sometimes -- which is worse than always.
+o=\$(timeout 60 docker run --rm --network sixnet alpine:latest \
+       sh -c "(echo probe | nc -w 3 \$v6 9000) || echo NO-V6" 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "V6-SERVED" ]; say \$? "one container reaches another over IPv6 (\$o)"
+h=\$(timeout 60 docker run --rm --network sixnet alpine:latest \
+       sh -c 'grep -c "^fd00:" /etc/hosts' 2>/dev/null | tr -d '\\r\\n')
+[ -n "\$h" ] && [ "\$h" -ge 1 ]; say \$? "and the names on it resolve to v6 as well (\$h lines)"
+timeout 20 docker rm -f six >/dev/null 2>&1
+timeout 20 docker network rm sixnet >/dev/null 2>&1
+
 # ONE SERVICE REACHING ANOTHER. A network was a directory with an id in it, so
 # up succeeded, said nothing, and the services could not find each other --
 # the failure this whole daemon keeps producing: correct-looking and silent.

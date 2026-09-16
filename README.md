@@ -772,8 +772,7 @@ and the difference that makes creating a network worth doing. A container that
 names a network which does not exist is refused by name rather than quietly
 isolated.
 
-Still outside: **outbound NAT** and IPv6. NAT is not an omission that can be
-filled in here — the machine this daemon is built for has *no network interface
+Still outside: **outbound NAT**. It is not an omission that can be filled in here — the machine this daemon is built for has *no network interface
 of its own*, so there is nothing to translate to; a container reaches the
 outside through the proxy, which is the same path a build step uses. On a
 machine that does have a network, `--network host` is the answer until this
@@ -1030,3 +1029,28 @@ two probes — and `write_file` into a directory that has gone raises, which in
 Mere ends the **daemon** rather than the write. `docker container prune` beside
 a running check was enough to find it. It is the same shape as `read_file_or`,
 on the other side.
+
+## IPv6
+
+A container on a user network gets a v6 address as well, from a unique-local
+prefix per network: `fd00:<n>::/64`, and **the same last number as its v4
+address** — one lease, two addresses, so a container's two addresses can never
+disagree about which container it is.
+
+Unique-local because there is nothing upstream to be global for. What this buys
+is containers reaching each other over v6; outbound is outbound, and that is
+the same missing interface as for v4.
+
+Neither the address nor the route can be an ioctl — `SIOCSIFADDR` is an IPv4
+interface and there is no v6 equivalent — so both are netlink, which this
+daemon already speaks for the veth pair.
+
+**Duplicate address detection is turned off on these interfaces, deliberately.**
+A fresh v6 address is *tentative* for about a second, and a socket bound to a
+tentative address fails with `EADDRNOTAVAIL`. A container that connects the
+moment it starts — which is what a compose service does — would lose that race
+*sometimes*, which is worse than always. Both ends of the veth pair are made
+here and nobody else can hold the address, so detection has nothing to find.
+
+A kernel built without IPv6 is a smaller machine, not a broken one: the v6 part
+says so and the rest still works.

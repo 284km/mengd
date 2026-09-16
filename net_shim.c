@@ -40,6 +40,9 @@ int nw_netns_del(const char *a) { (void)a; return nw_no(); }
 int nw_config_in(const char *a, const char *b, const char *c, const char *d, const char *e) {
     (void)a;(void)b;(void)c;(void)d;(void)e; return nw_no(); }
 int nw_rename_in(const char *a, const char *b, const char *c) { (void)a;(void)b;(void)c; return nw_no(); }
+int nw_bridge6(const char *a, const char *b, int c) { (void)a;(void)b;(void)c; return nw_no(); }
+int nw_config6_in(const char *a, const char *b, const char *c, int d, const char *e) {
+    (void)a;(void)b;(void)c;(void)d;(void)e; return nw_no(); }
 #else
 #define _GNU_SOURCE
 #include <errno.h>
@@ -227,6 +230,147 @@ int nw_veth(const char *host_if, const char *peer_if, const char *nspath) {
     if (h->nlmsg_type == NLMSG_ERROR) {
         struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
         if (e->error != 0) { errno = -e->error; return nw_fail("RTM_NEWLINK veth"); }
+    }
+    return 0;
+}
+
+/* ---- IPv6 ----------------------------------------------------------------
+ *
+ * An address and a route, and neither can be an ioctl: SIOCSIFADDR is an IPv4
+ * interface and there is no v6 equivalent. Everything here is netlink, which
+ * this file already speaks for the veth pair.
+ *
+ * The addresses are a unique local prefix, fd00:<n>::/64, one prefix per
+ * network and the SAME last number as the v4 address in it -- one lease, two
+ * addresses, so a container's two addresses can never disagree about which
+ * container it is.
+ */
+struct nl6 {
+    struct nlmsghdr n;
+    char body[512];
+};
+
+static int nl6_send(struct nl6 *req) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (s < 0) return nw_fail("netlink socket");
+    struct sockaddr_nl k;
+    memset(&k, 0, sizeof k);
+    k.nl_family = AF_NETLINK;
+    if (sendto(s, req, req->n.nlmsg_len, 0, (struct sockaddr *)&k, sizeof k) < 0) {
+        int r = nw_fail("netlink send"); close(s); return r;
+    }
+    char resp[4096];
+    ssize_t n = recv(s, resp, sizeof resp, 0);
+    close(s);
+    if (n < 0) return nw_fail("netlink recv");
+    struct nlmsghdr *h = (struct nlmsghdr *)resp;
+    if (h->nlmsg_type == NLMSG_ERROR) {
+        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+        /* EEXIST is the address already being there, which is the normal
+         * answer on a restart and not a failure. */
+        if (e->error != 0 && e->error != -EEXIST) { errno = -e->error; return nw_fail("netlink"); }
+    }
+    return 0;
+}
+
+static void nl6_put(struct nl6 *req, int type, const void *data, int len) {
+    struct rtattr *a = (struct rtattr *)((char *)req + NLMSG_ALIGN(req->n.nlmsg_len));
+    a->rta_type = type;
+    a->rta_len = RTA_LENGTH(len);
+    memcpy(RTA_DATA(a), data, (size_t)len);
+    req->n.nlmsg_len = NLMSG_ALIGN(req->n.nlmsg_len) + RTA_LENGTH(len);
+}
+
+static int nw_addr6(const char *ifname, const char *addr, int prefixlen) {
+    unsigned idx = if_nametoindex(ifname);
+    if (idx == 0) return nw_fail("if_nametoindex");
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, addr, &a6) != 1) { errno = EINVAL; return nw_fail("inet_pton"); }
+    struct nl6 req;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    req.n.nlmsg_type = RTM_NEWADDR;
+    struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(&req.n);
+    ifa->ifa_family = AF_INET6;
+    ifa->ifa_prefixlen = (unsigned char)prefixlen;
+    ifa->ifa_scope = 0;
+    ifa->ifa_index = idx;
+    nl6_put(&req, IFA_LOCAL, &a6, sizeof a6);
+    nl6_put(&req, IFA_ADDRESS, &a6, sizeof a6);
+    return nl6_send(&req);
+}
+
+static int nw_route6(const char *ifname, const char *gw) {
+    unsigned idx = if_nametoindex(ifname);
+    if (idx == 0) return nw_fail("if_nametoindex");
+    struct in6_addr g;
+    if (inet_pton(AF_INET6, gw, &g) != 1) { errno = EINVAL; return nw_fail("inet_pton"); }
+    struct nl6 req;
+    memset(&req, 0, sizeof req);
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    req.n.nlmsg_type = RTM_NEWROUTE;
+    struct rtmsg *rt = (struct rtmsg *)NLMSG_DATA(&req.n);
+    rt->rtm_family = AF_INET6;
+    rt->rtm_dst_len = 0;                 /* ::/0 */
+    rt->rtm_table = RT_TABLE_MAIN;
+    rt->rtm_protocol = RTPROT_BOOT;
+    rt->rtm_scope = RT_SCOPE_UNIVERSE;
+    rt->rtm_type = RTN_UNICAST;
+    nl6_put(&req, RTA_GATEWAY, &g, sizeof g);
+    unsigned oif = idx;
+    nl6_put(&req, RTA_OIF, &oif, sizeof oif);
+    return nl6_send(&req);
+}
+
+/* DAD leaves a fresh address TENTATIVE for about a second, and a socket bound
+ * to a tentative address fails with EADDRNOTAVAIL. A container that connects
+ * the moment it starts -- which is what a compose service does -- would lose
+ * that race sometimes, which is worse than always. Both ends of a veth pair
+ * are made here and nobody else can hold the address, so duplicate detection
+ * has nothing to find. */
+static void nw_v6_sysctl(const char *ifname) {
+    const char *keys[] = {"disable_ipv6", "accept_dad"};
+    const char *vals[] = {"0", "0"};
+    for (size_t i = 0; i < 2; i++) {
+        char p[256];
+        snprintf(p, sizeof p, "/proc/sys/net/ipv6/conf/%s/%s", ifname, keys[i]);
+        int fd = open(p, O_WRONLY);
+        if (fd < 0) continue;
+        if (write(fd, vals[i], strlen(vals[i])) < 0) { /* best effort */ }
+        close(fd);
+    }
+}
+
+int nw_bridge6(const char *bridge, const char *addr, int prefixlen) {
+    nw_v6_sysctl(bridge);
+    return nw_addr6(bridge, addr, prefixlen);
+}
+
+/* Inside the container: the address, and the way out through the bridge. In a
+ * child, for the same reason as everything else here -- setns is a one-way
+ * door for the process that walks through it. */
+int nw_config6_in(const char *nspath, const char *ifname, const char *addr,
+                  int prefixlen, const char *gw) {
+    pid_t pid = fork();
+    if (pid < 0) return nw_fail("fork");
+    if (pid == 0) {
+        int nsfd = open(nspath, O_RDONLY | O_CLOEXEC);
+        if (nsfd < 0) _exit(11);
+        if (setns(nsfd, CLONE_NEWNET) != 0) _exit(12);
+        nw_v6_sysctl("all");
+        nw_v6_sysctl(ifname);
+        if (nw_addr6(ifname, addr, prefixlen) != 0) _exit(13);
+        if (gw && gw[0] && nw_route6(ifname, gw) != 0) _exit(14);
+        _exit(0);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) return nw_fail("waitpid");
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        snprintf(NW_ERR, sizeof NW_ERR, "giving %s an IPv6 address in %s failed at step %d",
+                 ifname, nspath, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        return -1;
     }
     return 0;
 }

@@ -45,6 +45,8 @@ extern fn nw_veth: str -> str -> str -> int;
 extern fn nw_netns_add: str -> int;
 extern fn nw_netns_del: str -> int;
 extern fn nw_config_in: str -> str -> str -> str -> str -> int;
+extern fn nw_bridge6: str -> str -> int -> int;
+extern fn nw_config6_in: str -> str -> str -> int -> str -> int;
 extern fn nw_rename_in: str -> str -> str -> int;
 extern fn nw_last_error: unit -> str;
 extern fn st_rename: str -> str -> int;
@@ -1629,6 +1631,16 @@ let net_prefix = fn (store: str) -> fn (name: str) ->
   let o = int_or (read_file_or (ndir store name ++ "/octet") "") 0 in
   if o == 0 then "" else "10.88." ++ show o;
 
+// The same network, spelled in v6. A unique local prefix per network, and the
+// SAME last number as the v4 address in it -- one lease, two addresses, so a
+// container's two addresses can never disagree about which container it is.
+//
+// Unique-local (fd00::/8) because there is nothing upstream to be global for:
+// this network reaches the containers on it and says so.
+let net_prefix6 = fn (store: str) -> fn (name: str) ->
+  let o = int_or (read_file_or (ndir store name ++ "/octet") "") 0 in
+  if o == 0 then "" else "fd00:" ++ show o ++ "::";
+
 // An address, taken so that nobody else can take it.
 //
 // Reading the addresses in use and picking the next one is a read and then a
@@ -2243,8 +2255,11 @@ let net_hosts = fn (store: str) -> fn (name: str) ->
       | [h, ...t] ->
           let n = read_file_or (d ++ "/" ++ h ++ "/net") "" in
           let ip = read_file_or (d ++ "/" ++ h ++ "/ip") "" in
+          let ip6 = read_file_or (d ++ "/" ++ h ++ "/ip6") "" in
           if n != name || str_len ip == 0 then table t acc
-          else table t (acc ++ ip ++ "\t" ++ net_names_of store h ++ "\n") in
+          else table t (acc ++ ip ++ "\t" ++ net_names_of store h ++ "\n"
+                            ++ (if str_len ip6 == 0 then ""
+                                else ip6 ++ "\t" ++ net_names_of store h ++ "\n")) in
     let body = table ids "" in
     let rec each = fn (xs: str list) ->
       match xs with
@@ -2274,9 +2289,17 @@ let net_up = fn (store: str) -> fn (id: str) -> fn (name: str) ->
   else
     let br = net_bridge_of nid in
     let gw = pre ++ ".1" in
+    let pre6 = net_prefix6 store name in
+    let gw6 = pre6 ++ "1" in
     if nw_bridge br gw "255.255.255.0" != 0 then
       "mengd: cannot bring up the bridge " ++ br ++ ": " ++ nw_last_error ()
     else
+      // The v6 side of the same bridge. NOT fatal on its own: a kernel built
+      // without IPv6 is a smaller machine, not a broken one, and everything
+      // else here still works on it.
+      let _ = if str_len pre6 > 0 && nw_bridge6 br gw6 64 != 0 then
+                (let _ = print_err ("mengd: no IPv6 on " ++ br ++ ": " ++ nw_last_error ()) in ())
+              else () in
       let ns = netns_path id in
       let _ = mkdir_p netns_dir in
       // A namespace left over from a previous run of this same container: the
@@ -2303,6 +2326,16 @@ let net_up = fn (store: str) -> fn (id: str) -> fn (name: str) ->
           else if nw_config_in ns "eth0" ip "255.255.255.0" gw != 0 then
             "mengd: " ++ nw_last_error ()
           else
+            // The same container, the same number, in v6. Not fatal on its
+            // own: a kernel without IPv6 is a smaller machine, not a broken
+            // one, and everything else here still works on it.
+            let last = (let i = last_index_of_str ip "." in substring ip (i + 1) (str_len ip)) in
+            let ip6 = pre6 ++ last in
+            let _ = if str_len pre6 == 0 then ()
+                    else if nw_config6_in ns "eth0" ip6 64 gw6 != 0 then
+                      (let _ = print_err ("mengd: no IPv6 for " ++ substring id 0 12
+                                       ++ ": " ++ nw_last_error ()) in ())
+                    else (let _ = cwrite store id "ip6" ip6 in ()) in
             // Names, but only on a network somebody asked for. Docker's
             // default bridge resolves no container names either -- that is the
             // difference between it and a network you created, and inventing
@@ -3222,10 +3255,17 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
         raw (let n = cread store id "net" in
              let ip = cread store id "ip" in
              if str_len n == 0 || str_len ip == 0 then "\{}"
-             else "\{\"IPAddress\":" ++ s ip
+             else
+               let ip6 = cread store id "ip6" in
+               "\{\"IPAddress\":" ++ s ip
+               ++ ",\"GlobalIPv6Address\":" ++ s ip6
+               ++ ",\"GlobalIPv6PrefixLen\":" ++ (if str_len ip6 == 0 then "0" else "64")
                ++ ",\"Networks\":\{" ++ s n ++ ":"
                ++ obj [("IPAddress", s ip), ("Gateway", s (net_prefix store n ++ ".1")),
                        ("IPPrefixLen", raw "24"),
+                       ("GlobalIPv6Address", s ip6),
+                       ("GlobalIPv6PrefixLen", raw (if str_len ip6 == 0 then "0" else "64")),
+                       ("IPv6Gateway", s (if str_len ip6 == 0 then "" else net_prefix6 store n ++ "1")),
                        ("Aliases", raw (let a = cread store id "aliases" in
                                         if str_len a == 0 then "[]"
                                         else "[" ++ jstrs_of_csv a ++ "]"))]
