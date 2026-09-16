@@ -147,6 +147,26 @@ if [ -x /usr/local/bin/mreg ]; then
 
   o=\$(timeout 90 docker run --rm localhost:5000/gate/alpine:v1 echo pulled-and-ran 2>/dev/null)
   [ "\$o" = "pulled-and-ran" ]; say \$? "a container runs from the pulled image (\$o)"
+
+  # An image with a DELETION in it. A tar archive cannot say "delete", so the
+  # image format says it with a filename -- .wh.x beside x -- and a daemon that
+  # reads those as files hands back a rootfs with the deleted file still in it,
+  # plus a stray .wh. file. Nothing fails in that case, which is why it needs
+  # its own image: alpine:latest has no whiteouts, so the pull check above is
+  # green either way.
+  DOCKER_HOST= docker build -q -t localhost:5000/gate/wh:v1 - >/dev/null 2>&1 <<'WHDF'
+FROM alpine:latest
+RUN echo kept > /kept.txt && mkdir -p /d && echo a > /d/a && echo b > /d/b
+RUN rm /etc/motd && rm /d/a
+WHDF
+  DOCKER_HOST= docker push localhost:5000/gate/wh:v1 >/dev/null 2>&1; say \$? "seed: an image whose top layer deletes files"
+  DOCKER_HOST= docker rmi localhost:5000/gate/wh:v1 >/dev/null 2>&1
+  timeout 120 docker pull localhost:5000/gate/wh:v1 >/dev/null 2>&1; say \$? "pulled it"
+  o=\$(timeout 90 docker run --rm localhost:5000/gate/wh:v1 sh -c 'cat /kept.txt; ls /etc/motd /d/a >/dev/null 2>&1 && echo STILL-THERE; ls /d; ls -a /etc | grep -c "^\.wh\."' 2>/dev/null | tr '\n' ' ')
+  echo "\$o" | grep -q "kept" && ! echo "\$o" | grep -q "STILL-THERE"
+  say \$? "the deleted files are gone in the container (\$o)"
+  echo "\$o" | grep -q " b " || echo "\$o" | grep -q "b 0"
+  say \$? "its sibling and the lower layers survived"
   pkill mreg 2>/dev/null || true
 else
   echo "  SKIP  mreg not installed: the pull path is untested"

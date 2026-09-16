@@ -172,3 +172,51 @@ const char *fs_readlink(const char *path) {
     FS_LINK[n > 0 ? n : 0] = 0;
     return FS_LINK;
 }
+
+/* Remove a path and everything under it, for the whiteout rule: a layer entry
+ * named .wh.x deletes x from every layer below, and x may be a whole subtree.
+ *
+ * Written out with opendir/readdir rather than nftw: glibc puts nftw behind a
+ * feature-test macro, so the version that compiled here refused to compile on
+ * the Linux image -- and defining the macro would have changed what every
+ * other declaration in this file means.
+ *
+ * Symlinks are unlinked, never followed: following one would delete outside
+ * the destination, which is the escape the extractor's R3 rule refuses.
+ * Missing is not a failure -- a whiteout for something no lower layer had is a
+ * no-op, and builders emit those. */
+int fs_rmtree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    if (!S_ISDIR(st.st_mode)) return unlink(path) == 0 ? 0 : -1;
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char child[4096];
+        if (snprintf(child, sizeof child, "%s/%s", path, e->d_name) >= (int)sizeof child) { rc = -1; continue; }
+        if (fs_rmtree(child) != 0) rc = -1;
+    }
+    closedir(d);
+    if (rc != 0) return rc;
+    return rmdir(path) == 0 ? 0 : -1;
+}
+
+/* Everything in a directory, but not the directory. The opaque whiteout
+ * (.wh..wh..opq) says "the layers below contributed nothing here". */
+int fs_empty_dir(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char child[4096];
+        if (snprintf(child, sizeof child, "%s/%s", path, e->d_name) >= (int)sizeof child) { rc = -1; continue; }
+        if (fs_rmtree(child) != 0) rc = -1;
+    }
+    closedir(d);
+    return rc;
+}

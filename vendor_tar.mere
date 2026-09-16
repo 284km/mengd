@@ -33,6 +33,8 @@ extern fn fs_fail: str -> str -> int;
 extern fn fs_last_error: unit -> str;
 extern fn fs_clear_error: unit -> int;
 extern fn fs_has_error: unit -> int;
+extern fn fs_rmtree: str -> int;
+extern fn fs_empty_dir: str -> int;
 
 let block = 512;
 
@@ -86,6 +88,32 @@ let dirname = fn (p: str) ->
   if cut < 0 then "." else substring p 0 cut;
 
 let join2 = fn (a: str) -> fn (b: str) -> a ++ "/" ++ b;
+
+// ---- whiteouts -----------------------------------------------------------
+//
+// A tar archive has no notion of deletion. A container image layer needs one,
+// so the image format spells it as a FILENAME: `.wh.x` beside x means "x is
+// gone", and `.wh..wh..opq` in a directory means "the layers below contributed
+// nothing to this directory".
+//
+// THE READER CANNOT DECIDE THIS. `tar x` on an archive that happens to hold a
+// file called `.wh.x` must write that file -- the name means nothing there.
+// Only the caller applying a LAYER knows the convention is in force, so it is
+// a parameter and not a rule of this file.
+
+let wh_prefix = ".wh.";
+let wh_opaque = ".wh..wh..opq";
+
+let basename = fn (p: str) ->
+  let n = str_len p in
+  let rec go = fn (i: int) ->
+    if i < 0 then p
+    else if char_at p i == "/" then substring p (i + 1) n
+    else go (i - 1) in
+  go (n - 1);
+
+let starts_wh = fn (b: str) ->
+  str_len b > 4 && substring b 0 4 == wh_prefix;
 
 // ---- escape routes: see SECURITY_ROUTES ---------------------------------
 //
@@ -149,15 +177,23 @@ let kind_of = fn (t: int) -> fn (name: str) ->
 //
 // mode 0 = list, mode 1 = extract. One walk with two readers, so a listing
 // and an extraction can never disagree about what the archive contains.
+//
+// With `whiteouts`, the same walk runs TWICE: phase 0 applies the deletions,
+// phase 1 writes the entries. Two phases rather than one pass, because a
+// whiteout is a statement about the layers BELOW, and this layer may put
+// something back in the place it just cleared -- `.wh.x` followed by `x`, or
+// an opaque directory that is then refilled. In one pass the answer depends on
+// the order the archive happens to list the directory in. It is the same
+// parser and the same refusals both times; only the action differs.
 
 // Returns the number of entries, or -1 when the archive was refused. The
 // reason is in fs_last_error (); callers that want the CLI's old behaviour
 // print it and exit, callers inside a daemon report it and keep serving.
-let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
+let walk_opt = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) -> fn (whiteouts: bool) ->
   let _ = fs_clear_error () in
   let fh = file_openrw path in
   let fsize = file_size path in
-  let rec go = fn (off: int) -> fn (count: int) ->
+  let rec go = fn (ph: int) -> fn (off: int) -> fn (count: int) ->
     // A partial block is not the end of an archive, it is a truncated one. The
     // first version returned `count` here, so a file cut off mid-header was
     // reported as a valid archive with however many entries had been read --
@@ -216,8 +252,20 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
                 else () in
               if fs_has_error () == 1 then 0 - 1 else
               let out = join2 dest name in
+              let bn = basename name in
+              let is_wh = whiteouts && do_extract && starts_wh bn in
               let _ =
-                if not do_extract then
+                if ph == 0 then
+                  // Phase 0 deletes and does nothing else.
+                  (if not is_wh then ()
+                   else if bn == wh_opaque then
+                     (let rc = fs_empty_dir (dirname out) in
+                      if rc != 0 then let _ = refuse "an opaque whiteout that could not be applied" name in () else ())
+                   else
+                     (let rc = fs_rmtree (join2 (dirname out) (substring bn 4 (str_len bn))) in
+                      if rc != 0 then let _ = refuse "a whiteout that could not be applied" name in () else ()))
+                else if is_wh then ()   // phase 0 dealt with it; it is not a file
+                else if not do_extract then
                   print (kind ++ " " ++ show mode ++ " " ++ show size ++ " " ++ name
                          ++ (if str_len link == 0 then "" else " -> " ++ link))
                 else
@@ -256,15 +304,24 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
                       if rc != 0 then let _ = refuse "link(2) failed" (name ++ " -> " ++ link) in () else ()
                 in
               let _ =
-                if do_extract then
+                if do_extract && ph == 1 && not is_wh then
                   let rc = fs_lchown out uid gid in
                   if rc < 0 then let _ = refuse "lchown(2) failed" name in () else ()
                 else () in
               if fs_has_error () == 1 then 0 - 1
-              else go (off + block + round_up size) (count + 1) in
-  let n = go 0 0 in
+              else go ph (off + block + round_up size) (count + 1) in
+  // Phase 0 first and phase 1 only if it survived: an archive this walk is
+  // going to refuse should not have had half its deletions applied and then
+  // nothing written.
+  let n = if do_extract && whiteouts then
+            (let d = go 0 0 0 in if d < 0 then d else go 1 0 0)
+          else go 1 0 0 in
   let _ = file_close fh in
   n;
+
+// The plain reader: a name beginning with `.wh.` is a name, not a deletion.
+let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
+  walk_opt path dest do_extract false;
 
 
 // ---- writing ---------------------------------------------------------------

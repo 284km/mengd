@@ -47,7 +47,9 @@ let apply_layer = fn (imgdir: str) -> fn (dest: str) -> fn (rel: str) -> fn (tmp
       let data = bytebuf_of_bytes (read_bytes blob) in
       let _ = if is_gzip data then (let (len, crc) = gunzip_to data tmp in ())
               else (let _ = write_bytes tmp (bytes_of_bytebuf data) in ()) in
-      let n = walk tmp dest true in
+      // `layer`, not `extract`: in an image, a name beginning with `.wh.` is a
+      // deletion of what the layers below put there, not a file to write.
+      let n = walk_opt tmp dest true true in
       n
     };
 
