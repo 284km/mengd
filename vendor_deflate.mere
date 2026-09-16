@@ -1,0 +1,713 @@
+// Vendored from 284km/mgz deflate.mere by tools/vendor-mgz.sh. Do not edit here.
+// The only change is the import path: the vendored files sit beside each
+// other here under different names.
+// DEFLATE compressor (gzip container), dynamic-Huffman + LZ77, in pure Mere.
+// The counterpart to inflate.mere. A greedy longest-match LZ77 (naive window
+// scan) turns the input into literal/back-reference tokens; their frequencies
+// drive a per-block Huffman tree (node-pool merge + canonical codes per RFC
+// 1951 §3.2.2). The block header packs HLIT/HDIST/HCLEN, the code-length
+// alphabet (run-length coded with symbols 16/17/18), then the data, all
+// LSB-first across byte boundaries via a bit WRITER. If a Huffman code would
+// exceed the format's 15-bit limit (rare, only for very skewed alphabets) the
+// block falls back to a stored (uncompressed) block, which is always valid.
+// Output is valid gzip: system gunzip AND inflate.mere both round-trip it
+// byte-identically with a verified CRC-32, and it is competitive with gzip -9.
+//
+// A module: definitions only, no program. `mgzip.mere` is the CLI.
+// Exports used by other packages:
+//   deflate_body data -> vec   raw DEFLATE (dynamic Huffman, stored fallback)
+//   deflate_gzip data -> vec   the same wrapped in a gzip member
+//   crc32_vec    data -> int
+
+// 0xFFFFFFFF does not fit a signed 32-bit int, and one backend has one. Written
+// this way it is the all-ones mask on every width: 2^32 - 1 where an int is
+// wider than 32 bits, and -1 where it is exactly 32, since the shift produces 0
+// there. Both are the right mask for their width.
+
+// The sign bit, cleared, which turns the arithmetic right shift into the
+// logical one CRC-32 needs. `bit_shr` propagates the sign on every backend
+// (`bit_shr (0 - 1) 1` is -1), and a CRC accumulator STARTS as all ones -- so
+// where an int is 32 bits wide it is negative from the first step and the top
+// bit never leaves. Masking after the shift removes it. Above 32 bits the
+// accumulator is positive and the mask is a no-op.
+// The reversed CRC-32 polynomial. Its top bit is set, so as one literal it does
+// not fit a signed 32-bit int either; assembled from halves it is the same 32
+// bits on every width (negative where the int is exactly 32 wide, which is
+// what those bits mean there).
+let vec_of = fn xs ->
+  let v = vec_new () in
+  let rec go = fn l -> match l with Nil -> v | Cons (h, t) -> let _ = vec_push v (h : int) in go t in
+  go xs;
+let g_len_base = vec_of (Cons (3, Cons (4, Cons (5, Cons (6, Cons (7, Cons (8, Cons (9, Cons (10, Cons (11, Cons (13, Cons (15, Cons (17, Cons (19, Cons (23, Cons (27, Cons (31, Cons (35, Cons (43, Cons (51, Cons (59, Cons (67, Cons (83, Cons (99, Cons (115, Cons (131, Cons (163, Cons (195, Cons (227, Cons (258, Nil))))))))))))))))))))))))))))));
+let g_len_extra = vec_of (Cons (0, Cons (0, Cons (0, Cons (0, Cons (0, Cons (0, Cons (0, Cons (0, Cons (1, Cons (1, Cons (1, Cons (1, Cons (2, Cons (2, Cons (2, Cons (2, Cons (3, Cons (3, Cons (3, Cons (3, Cons (4, Cons (4, Cons (4, Cons (4, Cons (5, Cons (5, Cons (5, Cons (5, Cons (0, Nil))))))))))))))))))))))))))))));
+let g_dist_base = vec_of (Cons (1, Cons (2, Cons (3, Cons (4, Cons (5, Cons (7, Cons (9, Cons (13, Cons (17, Cons (25, Cons (33, Cons (49, Cons (65, Cons (97, Cons (129, Cons (193, Cons (257, Cons (385, Cons (513, Cons (769, Cons (1025, Cons (1537, Cons (2049, Cons (3073, Cons (4097, Cons (6145, Cons (8193, Cons (12289, Cons (16385, Cons (24577, Nil)))))))))))))))))))))))))))))));
+let g_dist_extra = vec_of (Cons (0, Cons (0, Cons (0, Cons (0, Cons (1, Cons (1, Cons (2, Cons (2, Cons (3, Cons (3, Cons (4, Cons (4, Cons (5, Cons (5, Cons (6, Cons (6, Cons (7, Cons (7, Cons (8, Cons (8, Cons (9, Cons (9, Cons (10, Cons (10, Cons (11, Cons (11, Cons (12, Cons (12, Cons (13, Cons (13, Nil)))))))))))))))))))))))))))))));
+
+import "./vendor_crc32.mere";
+
+// The iteration over a byte VECTOR, which is what this compressor's input is.
+// The arithmetic is in crc32.mere, written out here twice until it was not.
+let crc32_vec = fn bytes ->
+  let n = vec_len bytes in
+  let rec go = fn i -> fn (crc: int) ->
+    if i == n then crc
+    else go (i + 1) (crc_byte crc (vec_get bytes i)) in
+  bit_xor (go 0 mask32) mask32;
+
+// ---- bit writer: state vec [bitbuf, bitcnt]; out = byte vec ------------
+let bw_new = fn () ->
+  let s = vec_new () in
+  let _ = vec_push s 0 in    // bit buffer (accumulates LSB-first)
+  let _ = vec_push s 0 in    // bit count
+  s;
+// push `n` bits of `v` (v's low n bits), LSB-first into the stream
+let bw_bits = fn s -> fn out -> fn (v: int) -> fn (n: int) ->
+  let rec go = fn i ->
+    if i == n then ()
+    else
+      let bit = bit_and (bit_shr v i) 1 in
+      let buf = bit_or (vec_get s 0) (bit_shl bit (vec_get s 1)) in
+      let cnt = (vec_get s 1 : int) + 1 in
+      let _ = vec_set s 0 buf in
+      let _ = vec_set s 1 cnt in
+      let _ = if cnt == 8 then
+          let _ = vec_push out (bit_and buf 0xFF) in
+          let _ = vec_set s 0 0 in
+          vec_set s 1 0
+        else () in
+      go (i + 1) in
+  go 0;
+// flush remaining bits (pad with zeros to a byte)
+let bw_flush = fn s -> fn out ->
+  if (vec_get s 1 : int) > 0 then
+    let _ = vec_push out (bit_and (vec_get s 0) 0xFF) in
+    let _ = vec_set s 0 0 in vec_set s 1 0
+  else ();
+
+// reverse the low `n` bits of `v` (canonical codes are emitted MSB-first, but
+// bw_bits pushes LSB-first, so pre-reverse).
+let rev_bits = fn (v: int) -> fn (n: int) ->
+  let rec go = fn i -> fn (acc: int) ->
+    if i == n then acc
+    else go (i + 1) (bit_or (bit_shl acc 1) (bit_and (bit_shr v i) 1)) in
+  go 0 0;
+
+// length 3..258 -> (code_sym 257.., extra_nbits, extra_val)
+let len_encode = fn (len: int) ->
+  let rec go = fn i ->
+    if i == 28 then
+      // last entry: length 258 exactly
+      (285, 0, 0)
+    else
+      let base = (vec_get g_len_base i : int) in
+      let nb = (vec_get g_len_extra i : int) in
+      let next = (vec_get g_len_base (i + 1) : int) in
+      if len < next then (257 + i, nb, len - base)
+      else go (i + 1) in
+  go 0;
+// distance 1..32768 -> (code_sym 0.., extra_nbits, extra_val)
+let dist_encode = fn (dist: int) ->
+  let rec go = fn i ->
+    if i == 29 then (29, (vec_get g_dist_extra 29 : int), dist - (vec_get g_dist_base 29 : int))
+    else
+      let base = (vec_get g_dist_base i : int) in
+      let nb = (vec_get g_dist_extra i : int) in
+      let next = (vec_get g_dist_base (i + 1) : int) in
+      if dist < next then (i, nb, dist - base)
+      else go (i + 1) in
+  go 0;
+// ---- finding a match -------------------------------------------------------
+//
+// The first version scanned EVERY distance from 1 to 32768 at every position,
+// with no early exit. It is the obvious thing to write and it is unusable: an
+// 8.9 MB layer took SIX MINUTES AND NINE SECONDS, against 0.1 s for the system
+// gzip at a ratio within 2%. The ratio was never the problem.
+//
+// A hash chain is what gzip does. Three bytes hash to a bucket; `head` holds
+// the most recent position in each bucket and `prev` chains back through the
+// older ones, so the candidates examined are the positions that ACTUALLY START
+// WITH THE SAME THREE BYTES rather than every position in the window.
+//
+// Two limits keep the worst case bounded, and both cost ratio in principle:
+// the chain is walked at most `max_chain` links, and a match at least
+// `nice_len` long is taken without looking further. Measured against the same
+// oracle, on the same layer -- see the README table.
+//
+// `prev` is indexed by position within the window, so a link whose slot has
+// been reused by a newer position ends the walk early. Giving it one slot per
+// position instead -- 71 MB more on a 9 MB layer -- was tried and changed NOT
+// ONE BYTE of the output on any input measured here: the most recent
+// occurrence is almost always the match that gets taken, and lazy matching
+// plus `nice_len` stop the search before the chain matters. The smaller one is
+// kept because it is the same answer for less.
+let dfl_hbits = 15;
+let dfl_hsize = 32768;
+let dfl_hmask = 32767;
+let dfl_max_chain = 128;
+let dfl_nice_len = 128;
+
+let dfl_hash = fn data -> fn (pos: int) -> fn (n: int) ->
+  if pos + 2 >= n then 0
+  else
+    bit_and (bit_xor (bit_xor (bit_shl (vec_get data pos : int) 10)
+                              (bit_shl (vec_get data (pos + 1) : int) 5))
+                     (vec_get data (pos + 2) : int)) dfl_hmask;
+
+// The position is named `pos`, not `p`, on purpose: the C backend's lambda
+// lifter resolves an inner closure's free variables by NAME, so when this
+// module is imported into a program that also binds `p` somewhere, `p` is
+// taken to be already in scope and dropped from the capture set -- the lifted
+// C function then references a parameter it no longer has and the build fails.
+let find_match = fn data -> fn (pos: int) -> fn (n: int) -> fn (head) -> fn (prev) ->
+  if pos + 2 >= n then (0, 0)
+  else
+    let h = dfl_hash data pos n in
+    let rec mlen = fn (start: int) -> fn (k: int) ->
+      if k == 258 then 258
+      else if pos + k >= n then k
+      else if (vec_get data (start + k) : int) == (vec_get data (pos + k) : int) then mlen start (k + 1)
+      else k in
+    let rec walk = fn (cand: int) -> fn (chain: int) -> fn (blen: int) -> fn (bdist: int) ->
+      if cand < 0 || chain == 0 || pos - cand > 32768 || pos - cand <= 0 then (blen, bdist)
+      else
+        let l = mlen cand 0 in
+        let (b2, d2) = if l > blen then (l, pos - cand) else (blen, bdist) in
+        if b2 >= dfl_nice_len then (b2, d2)
+        else walk (vec_get prev (bit_and cand dfl_hmask) : int) (chain - 1) b2 d2 in
+    walk (vec_get head h : int) dfl_max_chain 0 0;
+
+// build Huffman code lengths for `nsym` symbols from their frequencies, using
+// a node pool: nf[] = frequency, nl[]/nr[] = child pool indices, leafsym[] =
+// symbol (-1 for internal). Repeatedly merge the two smallest-frequency alive
+// nodes, then DFS the root to read each leaf's depth as its code length.
+let build_lengths = fn freq -> fn (nsym: int) -> fn (maxbits: int) ->
+  let nf = vec_new () in let nl = vec_new () in let nr = vec_new () in
+  let rec seed = fn i ->
+    if i == nsym then ()
+    else
+      let _ = if (vec_get freq i : int) > 0 then
+          let _ = vec_push nf (vec_get freq i) in
+          let _ = vec_push nl (0 - 1) in
+          let _ = vec_push nr (0 - 1) in ()
+        else () in
+      seed (i + 1) in
+  let _ = seed 0 in
+  let syms = vec_new () in
+  let rec seed2 = fn i ->
+    if i == nsym then ()
+    else let _ = if (vec_get freq i : int) > 0 then vec_push syms i else () in seed2 (i + 1) in
+  let _ = seed2 0 in
+  let nleaves = vec_len nf in
+  let lengths = vec_new () in
+  let rec zl = fn i -> if i == nsym then () else let _ = vec_push lengths 0 in zl (i + 1) in
+  let _ = zl 0 in
+  if nleaves == 0 then lengths
+  else if nleaves == 1 then
+    // one symbol: give it a 1-bit code (DEFLATE requires >= 1 bit)
+    let _ = vec_set lengths (vec_get syms 0) 1 in lengths
+  else
+    let alive = vec_new () in
+    let rec al = fn i -> if i == nleaves then () else let _ = vec_push alive 1 in al (i + 1) in
+    let _ = al 0 in
+    let leafsym = vec_new () in
+    let rec ls = fn i -> if i == nleaves then () else let _ = vec_push leafsym (vec_get syms i) in ls (i + 1) in
+    let _ = ls 0 in
+    let rec merge = fn (remaining: int) ->
+      if remaining == 1 then ()
+      else
+        let np = vec_len nf in
+        let find_min = fn (skip: int) ->
+          let rec go = fn i -> fn (best: int) ->
+            if i == np then best
+            else if (vec_get alive i : int) == 1 && i != skip
+                    && (best < 0 || (vec_get nf i : int) < (vec_get nf best : int))
+            then go (i + 1) i else go (i + 1) best in
+          go 0 (0 - 1) in
+        let a = find_min (0 - 1) in
+        let b = find_min a in
+        let _ = vec_set alive a 0 in let _ = vec_set alive b 0 in
+        let _ = vec_push nf ((vec_get nf a : int) + (vec_get nf b : int)) in
+        let _ = vec_push nl a in let _ = vec_push nr b in
+        let _ = vec_push leafsym (0 - 1) in
+        let _ = vec_push alive 1 in
+        merge (remaining - 1) in
+    let _ = merge nleaves in
+    let root = vec_len nf - 1 in
+    let rec assign = fn (node: int) -> fn (depth: int) ->
+      let sym = (vec_get leafsym node : int) in
+      if sym >= 0 then vec_set lengths sym depth
+      else
+        let _ = assign (vec_get nl node) (depth + 1) in
+        assign (vec_get nr node) (depth + 1) in
+    let _ = assign root 0 in
+    // deflate_body checks vmax > maxbits and falls back to stored, so no
+    // in-place length-limiting fixup is needed here.
+    let _ = maxbits in
+    lengths;
+
+// ---- codes that are too long ----------------------------------------------
+//
+// A Huffman tree built by merging is OPTIMAL and may be deeper than the format
+// allows: 15 bits for the literal and distance alphabets, 7 for the
+// code-length one. This did not limit anything -- it detected the overflow and
+// fell back to a STORED block, which throws away all the compression rather
+// than a little of it.
+//
+// That is not a rare case. A build layer of 10,000 bytes that gzip takes to
+// 1,366 came out 10,023 -- BIGGER than it went in -- because one code-length
+// code wanted 8 bits. Nothing was wrong with the matcher; the whole block was
+// being discarded for a few bits of one table.
+//
+// The fix is zlib's: clamp the overlong codes, then pay for them by pushing
+// leaves down one level each, which keeps the code complete (the Kraft sum
+// stays exactly 1). Then hand the SHORTEST codes to the MOST FREQUENT symbols,
+// which is what makes the result close to optimal rather than merely legal.
+let limit_lengths = fn (len) -> fn (freq) -> fn (nsym: int) -> fn (maxbits: int) ->
+  let cnt = vec_new () in
+  let rec zc = fn (i: int) -> if i > 64 then () else let _ = vec_push cnt 0 in zc (i + 1) in
+  let _ = zc 0 in
+  // Clamp first, the way zlib counts it: every overlong code becomes maxbits
+  // and is remembered as an overflow to be paid for below.
+  let ovf = vec_new () in
+  let _ = vec_push ovf 0 in
+  let rec clamp = fn (i: int) ->
+    if i >= nsym then ()
+    else
+      let _ = if (vec_get freq i : int) > 0 then
+                (let b = (vec_get len i : int) in
+                 let b2 = if b > maxbits then
+                            (let _ = vec_set ovf 0 ((vec_get ovf 0 : int) + 1) in maxbits)
+                          else b in
+                 let _ = vec_set len i b2 in
+                 let _ = vec_set cnt b2 ((vec_get cnt b2 : int) + 1) in ())
+              else () in
+      clamp (i + 1) in
+  let _ = clamp 0 in
+  if (vec_get ovf 0 : int) == 0 then len
+  else
+    // One leaf moves down a level and takes an overflow item as its brother;
+    // two overflow items are accounted for each time round.
+    let rec fix = fn (ov: int) ->
+      if ov <= 0 then ()
+      else
+        let rec findb = fn (b: int) ->
+          if b < 1 then 1 else if (vec_get cnt b : int) > 0 then b else findb (b - 1) in
+        let b = findb (maxbits - 1) in
+        let _ = vec_set cnt b ((vec_get cnt b : int) - 1) in
+        let _ = vec_set cnt (b + 1) ((vec_get cnt (b + 1) : int) + 2) in
+        let _ = vec_set cnt maxbits ((vec_get cnt maxbits : int) - 1) in
+        fix (ov - 2) in
+    let _ = fix (vec_get ovf 0 : int) in
+    // The symbols that have a code, most frequent first. Insertion sort: the
+    // biggest alphabet here is 286 and the comparison has to be stable in the
+    // symbol as well, or two runs of the same data produce two encodings.
+    let order = vec_new () in
+    let rec collect = fn (i: int) ->
+      if i >= nsym then ()
+      else let _ = if (vec_get freq i : int) > 0 then (let _ = vec_push order i in ()) else () in
+           collect (i + 1) in
+    let _ = collect 0 in
+    let rec sort = fn (i: int) ->
+      if i >= vec_len order then ()
+      else
+        let rec back = fn (j: int) ->
+          if j <= 0 then ()
+          else
+            let a = (vec_get order (j - 1) : int) in
+            let b = (vec_get order j : int) in
+            let fa = (vec_get freq a : int) in
+            let fb = (vec_get freq b : int) in
+            if fa > fb || (fa == fb && a < b) then ()
+            else
+              let _ = vec_set order (j - 1) b in
+              let _ = vec_set order j a in
+              back (j - 1) in
+        let _ = back i in
+        sort (i + 1) in
+    let _ = sort 0 in
+    // Shortest codes to the most frequent symbols.
+    let pos = vec_new () in
+    let _ = vec_push pos 0 in
+    let rec give = fn (b: int) ->
+      if b > maxbits then ()
+      else
+        let rec take = fn (k: int) ->
+          if k >= (vec_get cnt b : int) then ()
+          else
+            let i = (vec_get pos 0 : int) in
+            let _ = if i < vec_len order then
+                      (let _ = vec_set len (vec_get order i : int) b in
+                       let _ = vec_set pos 0 (i + 1) in ()) else () in
+            take (k + 1) in
+        let _ = take 0 in
+        give (b + 1) in
+    let _ = give 1 in
+    len;
+
+// canonical codes (values) from a lengths vec, per RFC 1951 §3.2.2.
+let canon_codes = fn lengths -> fn (n: int) -> fn (maxbits: int) ->
+  let bl_count = vec_new () in
+  let rec z = fn i -> if i > maxbits then () else let _ = vec_push bl_count 0 in z (i + 1) in
+  let _ = z 0 in
+  let rec cnt = fn i -> if i == n then () else
+    let l = (vec_get lengths i : int) in
+    let _ = if l > 0 then vec_set bl_count l ((vec_get bl_count l : int) + 1) else () in
+    cnt (i + 1) in
+  let _ = cnt 0 in
+  let next_code = vec_new () in
+  let rec z2 = fn i -> if i > maxbits then () else let _ = vec_push next_code 0 in z2 (i + 1) in
+  let _ = z2 0 in
+  let rec fill = fn (bits: int) -> fn (code: int) ->
+    if bits > maxbits then ()
+    else
+      let c = bit_shl (code + (vec_get bl_count (bits - 1) : int)) 1 in
+      let _ = vec_set next_code bits c in
+      fill (bits + 1) c in
+  let _ = fill 1 0 in
+  let codes = vec_new () in
+  let rec z3 = fn i -> if i == n then () else let _ = vec_push codes 0 in z3 (i + 1) in
+  let _ = z3 0 in
+  let rec asg = fn i -> if i == n then () else
+    let l = (vec_get lengths i : int) in
+    let _ = if l > 0 then
+        let c = (vec_get next_code l : int) in
+        let _ = vec_set codes i c in
+        vec_set next_code l (c + 1)
+      else () in
+    asg (i + 1) in
+  let _ = asg 0 in
+  codes;
+
+// max of a lengths vec
+let vmax = fn v -> fn (n: int) ->
+  let rec go = fn i -> fn (m: int) -> if i == n then m else
+    go (i + 1) (if (vec_get v i : int) > m then vec_get v i else m) in
+  go 0 0;
+
+// code-length code order (RFC 1951 §3.2.7)
+let cl_order = vec_of (Cons (16, Cons (17, Cons (18, Cons (0, Cons (8, Cons (7, Cons (9, Cons (6, Cons (10, Cons (5, Cons (11, Cons (4, Cons (12, Cons (3, Cons (13, Cons (2, Cons (14, Cons (1, Cons (15, Nil))))))))))))))))))));
+
+// tokenize `data` into an int vec of triples [kind, x, y] where
+// kind 0 = literal (x = byte), kind 1 = match (x = length, y = distance).
+//
+// Every position is INSERTED into the chain, including the ones covered by a
+// match and never emitted. They are still somewhere a later match can point
+// at, and leaving them out costs ratio for nothing.
+// Tokens for one BLOCK, starting at `from` and stopping once `budget` tokens
+// have been produced. The chain (`head`/`prev`) belongs to the caller and
+// survives across blocks, so a match may still point back into an earlier one
+// -- the window is the output stream, not the block.
+//
+// Blocks exist because the whole input was tokenised at once, twice: peak
+// memory on an 8.9 MB layer was 489 MB, for a daemon that is expected to run
+// inside a 1 GiB machine. A block bounds what is held at any moment.
+let tokenize_from = fn data -> fn (from: int) -> fn (budget: int) -> fn head -> fn prev ->
+  let n = vec_len data in
+  let insert = fn (i: int) ->
+    if i + 2 >= n then ()
+    else
+      let h = dfl_hash data i n in
+      let _ = vec_set prev (bit_and i dfl_hmask) (vec_get head h) in
+      let _ = vec_set head h i in () in
+  let toks = vec_new () in
+  // LAZY MATCHING. A match found here may be worth giving up: if the position
+  // one byte later has a LONGER one, emitting this byte as a literal and
+  // taking that match encodes more in the same space. zlib does it at every
+  // level above 3, and without it the output was 6.2% larger than gzip's on a
+  // real layer -- with it, 1.7%.
+  //
+  // Only for short matches: past `nice_len` the search stopped early anyway,
+  // and looking again costs more than it can win.
+  let emit_lit = fn (i: int) ->
+    let _ = vec_push toks 0 in let _ = vec_push toks (vec_get data i) in vec_push toks 0 in
+  let rec go = fn (i: int) ->
+    if i >= n || vec_len toks >= budget then i
+    else
+      let (mlen, mdist) = find_match data i n head prev in
+      let _ = insert i in
+      if mlen < 3 then (let _ = emit_lit i in go (i + 1))
+      else
+        let (m2, d2) = if mlen < dfl_nice_len && i + 1 < n
+                       then find_match data (i + 1) n head prev else (0, 0) in
+        if m2 > mlen then (let _ = emit_lit i in go (i + 1))
+        else
+          let _ = vec_push toks 1 in let _ = vec_push toks mlen in let _ = vec_push toks mdist in
+          let rec ins = fn (k: int) -> if k >= mlen then () else let _ = insert (i + k) in ins (k + 1) in
+          let _ = ins 1 in
+          go (i + mlen) in
+  let next = go from in
+  (toks, next);
+
+// One dynamic-Huffman BLOCK, written into the caller's bit writer.
+//
+// The writer is the caller's because deflate blocks are not byte-aligned: two
+// blocks packed separately and then concatenated would put the second one's
+// header wherever the first one's last byte ended, and every decoder would
+// read rubbish. One writer, many blocks.
+//
+// Returns 1 if it wrote the block and 0 if it could not -- and it decides that
+// BEFORE writing a single bit, so a 0 leaves the stream untouched and the
+// caller can put a stored block there instead.
+let deflate_dynamic = fn data -> fn toks -> fn s -> fn out -> fn (bfinal: int) ->
+  let nt = vec_len toks in
+  // frequencies
+  let lfreq = vec_new () in
+  let rec zl = fn i -> if i == 286 then () else let _ = vec_push lfreq 0 in zl (i + 1) in
+  let _ = zl 0 in
+  let dfreq = vec_new () in
+  let rec zd = fn i -> if i == 30 then () else let _ = vec_push dfreq 0 in zd (i + 1) in
+  let _ = zd 0 in
+  let rec count = fn i ->
+    if i >= nt then ()
+    else
+      let kind = (vec_get toks i : int) in
+      let _ = if kind == 0 then
+          let sym = (vec_get toks (i + 1) : int) in
+          vec_set lfreq sym ((vec_get lfreq sym : int) + 1)
+        else
+          let (lsym, a, b) = len_encode (vec_get toks (i + 1)) in
+          let _ = a in let _ = b in
+          let _ = vec_set lfreq lsym ((vec_get lfreq lsym : int) + 1) in
+          let (dsym, c, e) = dist_encode (vec_get toks (i + 2)) in
+          let _ = c in let _ = e in
+          vec_set dfreq dsym ((vec_get dfreq dsym : int) + 1) in
+      count (i + 3) in
+  let _ = count 0 in
+  let _ = vec_set lfreq 256 ((vec_get lfreq 256 : int) + 1) in  // EOB
+  // Huffman lengths + canonical codes
+  let llen = limit_lengths (build_lengths lfreq 286 15) lfreq 286 15 in
+  let dlen = limit_lengths (build_lengths dfreq 30 15) dfreq 30 15 in
+  // dist: DEFLATE needs at least one dist code; if none, force symbol 0 len 1
+  let _ = if vmax dlen 30 == 0 then vec_set dlen 0 1 else () in
+  let lcode = canon_codes llen 286 15 in
+  let dcode = canon_codes dlen 30 15 in
+  // HLIT / HDIST
+  let rec last_nz = fn v -> fn (i: int) -> fn (floor: int) ->
+    if i < floor then floor else if (vec_get v i : int) > 0 then i else last_nz v (i - 1) floor in
+  let hlit = last_nz llen 285 256 + 1 in    // >= 257
+  let hdist = last_nz dlen 29 0 + 1 in       // >= 1
+  // combined code-length sequence -> RLE symbols (0-18) with extra
+  let cl_syms = vec_new () in   // each: [sym, extra_nbits, extra_val] triples
+  let combined = vec_new () in
+  let rec cc1 = fn i -> if i == hlit then () else let _ = vec_push combined (vec_get llen i) in cc1 (i + 1) in
+  let _ = cc1 0 in
+  let rec cc2 = fn i -> if i == hdist then () else let _ = vec_push combined (vec_get dlen i) in cc2 (i + 1) in
+  let _ = cc2 0 in
+  let cn = vec_len combined in
+  let rec rle = fn i ->
+    if i >= cn then ()
+    else
+      let v = (vec_get combined i : int) in
+      let rec runlen = fn j -> if j < cn && (vec_get combined j : int) == v then runlen (j + 1) else j - i in
+      let run = runlen i in
+      if v == 0 then
+        // repeat of zeros: 17 (3-10, 3 extra) or 18 (11-138, 7 extra)
+        if run >= 11 then
+          let r = if run > 138 then 138 else run in
+          let _ = vec_push cl_syms 18 in let _ = vec_push cl_syms 7 in let _ = vec_push cl_syms (r - 11) in
+          rle (i + r)
+        else if run >= 3 then
+          let r = if run > 10 then 10 else run in
+          let _ = vec_push cl_syms 17 in let _ = vec_push cl_syms 3 in let _ = vec_push cl_syms (r - 3) in
+          rle (i + r)
+        else
+          let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in
+          rle (i + 1)
+      else
+        // emit the value once, then 16 (repeat prev 3-6, 2 extra) for extras
+        let _ = vec_push cl_syms v in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in
+        let rem = run - 1 in
+        let rec reps = fn k ->
+          if k >= 3 then
+            let r = if k > 6 then 6 else k in
+            let _ = vec_push cl_syms 16 in let _ = vec_push cl_syms 2 in let _ = vec_push cl_syms (r - 3) in
+            reps (k - r)
+          else if k > 0 then
+            let rec ones = fn m -> if m == 0 then () else
+              let _ = vec_push cl_syms v in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in ones (m - 1) in
+            ones k
+          else () in
+        let _ = reps rem in
+        rle (i + run) in
+  let _ = rle 0 in
+  // cl frequencies -> cl lengths (max 7) -> cl codes
+  let clfreq = vec_new () in
+  let rec zc = fn i -> if i == 19 then () else let _ = vec_push clfreq 0 in zc (i + 1) in
+  let _ = zc 0 in
+  let cs_n = vec_len cl_syms in
+  let rec ccount = fn i -> if i >= cs_n then () else
+    let sym = (vec_get cl_syms i : int) in
+    let _ = vec_set clfreq sym ((vec_get clfreq sym : int) + 1) in ccount (i + 3) in
+  let _ = ccount 0 in
+  let cllen = limit_lengths (build_lengths clfreq 19 7) clfreq 19 7 in
+  // THE CODE-LENGTH TREE HAS ITS OWN LIMIT AND IT WAS NOT CHECKED. RFC 1951
+  // gives the code-length alphabet at most 7 bits, where the literal and
+  // distance trees get 15. `build_lengths` deliberately does not limit anything
+  // -- its comment says the caller checks -- and `deflate_body` does check the
+  // other two and never checked this one, so a frequency distribution that
+  // needs an 8-bit code-length code walked `canon_codes`'s bl_count array (8
+  // entries, indices 0..7) at index 8 and aborted.
+  //
+  // Found by a renderer: a 32x32 image of random pixels is enough. It is data
+  // dependent -- 16, 64 and 128 square all encode fine -- which is why nothing
+  // met it before.
+  //
+  // An EMPTY RESULT means "this block cannot be written dynamically", and
+  // `deflate_body` falls back to a stored block, which is what it already does
+  // for the other two trees. Returning the empty vec rather than calling
+  // `deflate_stored` here because that function is defined below this one and
+  // there is no forward reference; an empty output is unambiguous, since a real
+  // deflate block is never zero bytes.
+  if vmax cllen 19 > 7 then 0
+  else
+  let clcode = canon_codes cllen 19 7 in
+  // HCLEN: number of cl code lengths present, in cl_order, min 4
+  let rec last_cl = fn (i: int) -> if i < 4 then 4 else
+    if (vec_get cllen (vec_get cl_order i) : int) > 0 then i + 1 else last_cl (i - 1) in
+  let hclen = last_cl 18 in
+  // ---- emit ----
+  let _ = bw_bits s out bfinal 1 in   // BFINAL
+  let _ = bw_bits s out 2 2 in   // BTYPE = 10 (dynamic)
+  let _ = bw_bits s out (hlit - 257) 5 in
+  let _ = bw_bits s out (hdist - 1) 5 in
+  let _ = bw_bits s out (hclen - 4) 4 in
+  // cl code lengths, 3 bits each, in cl_order
+  let rec emit_cl = fn i -> if i == hclen then () else
+    let _ = bw_bits s out (vec_get cllen (vec_get cl_order i)) 3 in emit_cl (i + 1) in
+  let _ = emit_cl 0 in
+  // the RLE'd combined lengths, using cl codes
+  let rec emit_rle = fn i -> if i >= cs_n then () else
+    let sym = (vec_get cl_syms i : int) in
+    let enb = (vec_get cl_syms (i + 1) : int) in
+    let eval = (vec_get cl_syms (i + 2) : int) in
+    let _ = bw_bits s out (rev_bits (vec_get clcode sym) (vec_get cllen sym)) (vec_get cllen sym) in
+    let _ = if enb > 0 then bw_bits s out eval enb else () in
+    emit_rle (i + 3) in
+  let _ = emit_rle 0 in
+  // data
+  let rec emit_data = fn i -> if i >= nt then () else
+    let kind = (vec_get toks i : int) in
+    let _ = if kind == 0 then
+        let sym = (vec_get toks (i + 1) : int) in
+        bw_bits s out (rev_bits (vec_get lcode sym) (vec_get llen sym)) (vec_get llen sym)
+      else
+        let (lsym, lnb, lval) = len_encode (vec_get toks (i + 1)) in
+        let _ = bw_bits s out (rev_bits (vec_get lcode lsym) (vec_get llen lsym)) (vec_get llen lsym) in
+        let _ = if lnb > 0 then bw_bits s out lval lnb else () in
+        let (dsym, dnb, dval) = dist_encode (vec_get toks (i + 2)) in
+        let _ = bw_bits s out (rev_bits (vec_get dcode dsym) (vec_get dlen dsym)) (vec_get dlen dsym) in
+        let _ = if dnb > 0 then bw_bits s out dval dnb else () in
+        () in
+    emit_data (i + 3) in
+  let _ = emit_data 0 in
+  // EOB
+  let _ = bw_bits s out (rev_bits (vec_get lcode 256) (vec_get llen 256)) (vec_get llen 256) in
+  1;
+
+// One stored (uncompressed) block, for a range, into the caller's writer. The
+// safe answer when a dynamic tree cannot be written (rare; very skewed
+// alphabets) -- and the only one that is always available.
+//
+// A stored block starts on a byte boundary, so the writer is flushed first.
+// Those padding bits are inside the block header's own byte and no decoder
+// ever looks at them.
+let deflate_stored_block = fn data -> fn (from: int) -> fn (to: int) -> fn s -> fn out -> fn (bfinal: int) ->
+  let rec blocks = fn (off: int) ->
+    let remain = to - off in
+    let len = if remain > 65535 then 65535 else remain in
+    let final = if off + len >= to then bfinal else 0 in
+    let _ = bw_bits s out final 1 in
+    let _ = bw_bits s out 0 2 in
+    let _ = bw_flush s out in
+    let _ = vec_push out (bit_and len 0xFF) in
+    let _ = vec_push out (bit_and (bit_shr len 8) 0xFF) in
+    let nlen = bit_and (bit_not len) 0xFFFF in
+    let _ = vec_push out (bit_and nlen 0xFF) in
+    let _ = vec_push out (bit_and (bit_shr nlen 8) 0xFF) in
+    let rec cp = fn (i: int) ->
+      if i == len then () else let _ = vec_push out (vec_get data (off + i)) in cp (i + 1) in
+    let _ = cp 0 in
+    if off + len >= to then () else blocks (off + len) in
+  let _ = if to <= from then
+            (let _ = bw_bits s out bfinal 1 in
+             let _ = bw_bits s out 0 2 in
+             let _ = bw_flush s out in
+             let _ = vec_push out 0 in let _ = vec_push out 0 in
+             let _ = vec_push out 0xFF in let _ = vec_push out 0xFF in ())
+          else blocks from in
+  1;
+
+// The whole input as stored blocks, in its own writer. Kept because mgzip has
+// a caller that wants a body it can measure against the compressed one.
+let deflate_stored = fn data ->
+  let out = vec_new () in
+  let n = vec_len data in
+  let rec blocks = fn off ->
+    let remain = n - off in
+    let len = if remain > 65535 then 65535 else remain in
+    let final = off + len >= n in
+    let _ = vec_push out (if final then 1 else 0) in
+    let _ = vec_push out (bit_and len 0xFF) in let _ = vec_push out (bit_and (bit_shr len 8) 0xFF) in
+    let nlen = bit_and (bit_not len) 0xFFFF in
+    let _ = vec_push out (bit_and nlen 0xFF) in let _ = vec_push out (bit_and (bit_shr nlen 8) 0xFF) in
+    let rec cp = fn i -> if i == len then () else let _ = vec_push out (vec_get data (off + i)) in cp (i + 1) in
+    let _ = cp 0 in
+    if final then () else blocks (off + len) in
+  let _ = if n == 0 then
+      let _ = vec_push out 1 in let _ = vec_push out 0 in let _ = vec_push out 0 in
+      let _ = vec_push out 0xFF in let _ = vec_push out 0xFF in ()
+    else blocks 0 in
+  out;
+
+// The deflate body: one bit writer, one block at a time.
+//
+// A block is bounded by a TOKEN BUDGET rather than by input size, because it
+// is the tokens that are held in memory: the whole input used to be tokenised
+// at once -- and then tokenised AGAIN by the writer -- which cost 489 MB of
+// peak memory on an 8.9 MB layer, in a daemon meant to run in a 1 GiB machine.
+//
+// The match chain outlives the blocks, so a reference may point back into an
+// earlier one. That is what the format means: the window is the output stream,
+// not the block.
+let dfl_block_toks = 150000;
+
+let deflate_body = fn data ->
+  let n = vec_len data in
+  let out = vec_new () in
+  let s = bw_new () in
+  let head = vec_new () in
+  let prev = vec_new () in
+  let rec fillh = fn (i: int) ->
+    if i >= dfl_hsize then () else let _ = vec_push head (0 - 1) in fillh (i + 1) in
+  let _ = fillh 0 in
+  let rec fillp = fn (i: int) ->
+    if i >= dfl_hsize then () else let _ = vec_push prev (0 - 1) in fillp (i + 1) in
+  let _ = fillp 0 in
+  let rec blocks = fn (from: int) ->
+    let (toks, next) = tokenize_from data from dfl_block_toks head prev in
+    let last = if next >= n then 1 else 0 in
+    let wrote = deflate_dynamic data toks s out last in
+    let _ = if wrote == 0 then
+              (let _ = deflate_stored_block data from next s out last in ()) else () in
+    if last == 1 then () else blocks next in
+  let _ = if n == 0 then (let _ = deflate_stored_block data 0 0 s out 1 in ()) else blocks 0 in
+  let _ = bw_flush s out in
+  out;
+
+let deflate_gzip = fn data ->
+  let out = vec_new () in
+  // gzip header
+  let _ = vec_push out 0x1F in let _ = vec_push out 0x8B in let _ = vec_push out 8 in let _ = vec_push out 0 in
+  let _ = vec_push out 0 in let _ = vec_push out 0 in let _ = vec_push out 0 in let _ = vec_push out 0 in
+  let _ = vec_push out 0 in let _ = vec_push out 3 in
+  let body = deflate_body data in
+  let bn = vec_len body in
+  let rec cp = fn i -> if i == bn then () else let _ = vec_push out (vec_get body i) in cp (i + 1) in
+  let _ = cp 0 in
+  // trailer: CRC-32 then ISIZE, both little-endian
+  let push_u32 = fn (v: int) ->
+    let _ = vec_push out (bit_and v 0xFF) in let _ = vec_push out (bit_and (bit_shr v 8) 0xFF) in
+    let _ = vec_push out (bit_and (bit_shr v 16) 0xFF) in vec_push out (bit_and (bit_shr v 24) 0xFF) in
+  let _ = push_u32 (crc32_vec data) in
+  let _ = push_u32 (bit_and (vec_len data) mask32) in
+  out;

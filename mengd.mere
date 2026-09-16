@@ -12,6 +12,7 @@
 import "vendor_json.mere";
 import "vendor_tar.mere";
 import "rootfs.mere";
+import "vendor_deflate.mere";
 
 extern fn unix_listen: str -> int;
 extern fn vsock_listen: int -> int;
@@ -3021,14 +3022,41 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                 if entries < 0 then
                   (let _ = vec_set err 0 ("mengd: cannot write the layer: " ++ fs_last_error ()) in ())
                 else
+                  // TWO DIGESTS, and they are not the same thing. diff_ids
+                  // name the UNCOMPRESSED layer -- that is what a rootfs is
+                  // built from and what two images share when they share a
+                  // layer -- and the blob is named by what is actually stored.
+                  // Using one digest for both was correct only as long as
+                  // nothing was compressed.
                   let lhex = st_sha256_file ltar in
                   if str_len lhex == 0 then
                     (let _ = vec_set err 0 "mengd: cannot digest the layer" in ())
                   else
-                    let _ = st_rename ltar (dir ++ "/blobs/sha256/" ++ lhex) in
-                    let _ = vec_push lp ("blobs/sha256/" ++ lhex) in
-                    let _ = vec_push ld ("sha256:" ++ lhex) in
-                    each (i + 1) in
+                    let raw = file_size ltar in
+                    // Compressing costs about 27 times the layer's size in
+                    // memory while it runs, so a big layer is stored as it is
+                    // -- an uncompressed layer is a legal one. Measured, not
+                    // guessed, and said out loud rather than discovered as a
+                    // daemon that died in a small machine.
+                    let gzp = ltar ++ ".gz" in
+                    let done = if raw > 16777216 then
+                                 (let _ = bstream fd ("mengd: layer " ++ show (raw / 1048576)
+                                                   ++ " MB, stored uncompressed") in false)
+                               else
+                                 (let _ = region R {
+                                            let g = deflate_gzip (read_file_bytes ltar) in
+                                            let _ = write_file_bytes gzp g in 0
+                                          } in file_exists gzp) in
+                    let blob = if done then gzp else ltar in
+                    let bhex = if done then st_sha256_file gzp else lhex in
+                    if str_len bhex == 0 then
+                      (let _ = vec_set err 0 "mengd: cannot digest the layer" in ())
+                    else
+                      let _ = if done then (let _ = st_rmtree ltar in ()) else () in
+                      let _ = st_rename blob (dir ++ "/blobs/sha256/" ++ bhex) in
+                      let _ = vec_push lp ("blobs/sha256/" ++ bhex) in
+                      let _ = vec_push ld ("sha256:" ++ lhex) in
+                      each (i + 1) in
             each 0 in
         if str_len (vec_get err 0 : str) > 0 then bail (vec_get err 0 : str)
         else if vec_len lp == 0 then bail "mengd: the build produced no layers"

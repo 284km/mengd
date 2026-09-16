@@ -237,8 +237,11 @@ e=\$(timeout 60 docker run --rm --network host mine:v1 sh -c 'echo \$GREETING' 2
 # image was correct, ran, and shared nothing with the image it was built FROM.
 grep -q "Writing 2 layers" /var/tmp/build.log
 say \$? "the two RUN steps wrote two layers (\$(grep -o 'Writing [0-9]* layers' /var/tmp/build.log))"
-img=\$(ls -d /var/lib/mengd/images/* 2>/dev/null | while read -r i; do \
-        grep -ql "built-by-mengd" "\$i"/blobs/sha256/* 2>/dev/null && echo "\$i"; done | head -1)
+# From the store's own index, by tag. The first version of this found the
+# image by GREPPING ITS LAYERS for a string the build wrote -- which stopped
+# working the moment layers were compressed, and reported the image as having
+# no layers at all. The instrument broke, not the subject.
+img=\$(awk -F'\t' '\$2=="mine:v1"{print \$3}' /var/lib/mengd/images.index | tail -1)
 nl=\$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))[0]['Layers']))" "\$img/manifest.json" 2>/dev/null)
 [ "\$nl" = 3 ]; say \$? "the image has the base's layer plus one per step (\$nl)"
 nd=\$(python3 -c "
@@ -251,8 +254,7 @@ print(len(c['rootfs']['diff_ids']))" "\$img" 2>/dev/null)
 # blob as in the image it was built FROM -- same digest, byte for byte. A layer
 # re-tarred from an unpacked tree has different bytes for the same content, and
 # then the two images share nothing however much they have in common.
-base=\$(ls -d /var/lib/mengd/images/* 2>/dev/null | while read -r i; do \
-        grep -q '"alpine:latest"' "\$i"/manifest.json 2>/dev/null && echo "\$i"; done | head -1)
+base=\$(awk -F'\t' '\$2=="alpine:latest"{print \$3}' /var/lib/mengd/images.index | tail -1)
 b0=\$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/manifest.json'))[0]['Layers'][0])" "\$base" 2>/dev/null)
 m0=\$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/manifest.json'))[0]['Layers'][0])" "\$img" 2>/dev/null)
 [ -n "\$b0" ] && [ "\$b0" = "\$m0" ]
@@ -298,6 +300,28 @@ VOLUME /data
 DF
 DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v2 /var/tmp/bctx > /var/tmp/build3.log 2>&1
 grep -q "VOLUME is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+
+# COMPRESSED LAYERS. A built layer is stored gzipped, and that splits one
+# digest into two: diff_ids name the UNCOMPRESSED layer -- what a rootfs is
+# built from, and what two images share when they share a layer -- while the
+# blob is named by what is on disk. Using one for both was correct exactly as
+# long as nothing was compressed.
+lay=\$(python3 -c "
+import json,sys
+m=json.load(open(sys.argv[1]+'/manifest.json'))[0]
+c=json.load(open(sys.argv[1]+'/'+m['Config']))
+print(m['Layers'][-1].split('/')[-1], c['rootfs']['diff_ids'][-1].split(':')[-1])" "\$img" 2>/dev/null)
+set -- \$lay
+[ -n "\$1" ] && [ "\$1" != "\$2" ]
+say \$? "the blob digest and the diff id differ, because one is compressed"
+head -c2 "\$img/blobs/sha256/\$1" | od -An -tx1 | tr -d ' \n' | grep -q "1f8b"
+say \$? "and the blob is a gzip member"
+# Correct AND smaller: a compressor that silently emitted stored blocks would
+# pass the first two checks.
+z=\$(stat -c%s "\$img/blobs/sha256/\$1")
+o=\$(timeout 60 docker run --rm mine:v1 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "built-by-mengd second-step " ]
+say \$? "a container from the compressed image still runs (\$o)"
 
 # THE BUILD CACHE. A step's layer is the upper directory of an overlay mount,
 # so the cache can BE that directory: a step that has run before is one whose

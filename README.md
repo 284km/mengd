@@ -813,3 +813,25 @@ Measured on a build with two two-second steps:
 
 The sleeps are the instrument: a cache that is not working still produces the
 right image, so the only thing that can tell them apart is time.
+
+## Compressed layers
+
+A built layer is stored as a gzip member, which splits one digest into **two**:
+`diff_ids` name the *uncompressed* layer — what a rootfs is built from, and
+what two images share when they share a layer — while the blob is named by what
+is actually on disk. One digest for both was correct exactly as long as nothing
+was compressed.
+
+The compressor is [mgz](https://github.com/284km/mgz), vendored. Pointing it at
+a real layer is what found that it was emitting **stored blocks** on real input
+while passing every correctness check it had; that story is in its README.
+
+**A big layer is stored uncompressed.** Compressing costs about 27 times the
+layer's size in memory while it runs, and this daemon is expected to fit inside
+a small machine — an uncompressed layer is a legal one, and the build output
+says which happened. Measured, not guessed.
+
+The gate's first version found the built image by **grepping its layers** for a
+string the build had written. That stopped working the moment layers were
+compressed, and reported the image as having no layers at all: the instrument
+broke, not the subject. It reads the store's index by tag now.

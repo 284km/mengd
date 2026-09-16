@@ -1,6 +1,7 @@
 #!/bin/sh
 # tools/vendor-mgz.sh — copy the vendored packages in, rather than editing them
-# here. mgz's decompressor, and mtar's reader if MTAR_SRC is given too.
+# here. mgz's decompressor AND compressor, and mtar's reader if MTAR_SRC is
+# given too.
 #
 #   MGZ_SRC=<a 284km/mgz checkout> [MTAR_SRC=<a 284km/mtar checkout>] sh tools/vendor-mgz.sh
 #
@@ -23,6 +24,14 @@ MGZ_SRC="${MGZ_SRC:-}"
 } > "$here/vendor_inflate.mere"
 grep -q 'import "./vendor_crc32.mere";' "$here/vendor_inflate.mere" \
   || { echo "vendor-mgz.sh: the import was not rewritten" >&2; exit 1; }
+{
+  echo "// Vendored from 284km/mgz deflate.mere by tools/vendor-mgz.sh. Do not edit here."
+  echo "// The only change is the import path: the vendored files sit beside each"
+  echo "// other here under different names."
+  sed 's|import "./crc32.mere";|import "./vendor_crc32.mere";|' "$MGZ_SRC/deflate.mere"
+} > "$here/vendor_deflate.mere"
+grep -q 'import "./vendor_crc32.mere";' "$here/vendor_deflate.mere" \
+  || { echo "vendor-mgz.sh: the deflate import was not rewritten" >&2; exit 1; }
 MTAR_SRC="${MTAR_SRC:-}"
 if [ -n "$MTAR_SRC" ]; then
   [ -f "$MTAR_SRC/tar.mere" ] || { echo "MTAR_SRC has no tar.mere" >&2; exit 2; }
