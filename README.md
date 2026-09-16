@@ -917,3 +917,37 @@ the registry, the pull fails and the container never runs.
 The image name has slashes in it, so on this route the **verb is the last
 segment** and the name is everything before it — the other way round from the
 container routes, where the id has none.
+
+## What an application found
+
+Every check in this repository asks whether one thing works. `mvm/test/app.sh`
+asks the question the project exists to answer: can somebody put a small
+application on this and use it? One story, in the order a person would — build
+a service from a Dockerfile, two services talking by name, a named volume, a
+published port reached from macOS, `exec` to look inside, `cp` to take
+something out, `down` and nothing left behind.
+
+Nothing in it was new. It found four defects anyway, and every one of them is
+a feature that works alone and breaks in company:
+
+**A key is not a substring.** `query_param q "t"` found the `t=` inside
+`target=`, which `docker compose build` also sends — so the image came out
+untagged, the build said "Successfully built" with no "Successfully tagged"
+after it, and compose failed with "No such image" about the image it had just
+built. Nothing in the build was wrong.
+
+**The build context can arrive compressed.** `docker build` sends a plain tar
+and `docker compose build` sends a gzipped one — the same route, the same
+headers, a different body. The reader said "a partial final block (214 bytes,
+expected 512)" about a context that was perfectly good.
+
+**`docker cp` read the mount point.** A bind mount or a volume covers a
+directory of the rootfs, and the rootfs copy of it is empty. Copying out of a
+volume found nothing, for a file the container could see.
+
+**A list that ignores the filter hands the client everything.** `docker compose
+down` lists volumes and networks and removes what comes back. Containers were
+filtered from the start; networks and volumes were not — so `down` deleted
+another project's volume and then tried to delete the default bridge. It is
+refused now, the way docker refuses to remove a pre-defined network, and the
+lists honour the label filter.

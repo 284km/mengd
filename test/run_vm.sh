@@ -475,8 +475,14 @@ grep -q "exited with code 3" /var/tmp/compose.out; say \$? "and the second, whic
 timeout 90 docker compose -p mengdtest down >> /var/tmp/compose.out 2>&1
 say \$? "docker compose down"
 grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down removed the network it created"
-n=\$(timeout 20 docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
-[ "\$n" = 0 ]; say \$? "no networks left (\$n)"
+# The project's network is gone and the DEFAULT BRIDGE is not. This asked for
+# zero networks before there was a default one; now a container that names no
+# network goes on the bridge, and `compose down` tries to remove it and is
+# refused -- which is what docker does with a pre-defined network.
+n=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^mengdtest_default\$" || true)
+[ "\$n" = 0 ]; say \$? "down removed its own network (\$n left)"
+b=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^bridge\$" || true)
+[ "\$b" = 1 ]; say \$? "and not the default bridge (\$b)"
 
 # docker exec. A second process inside a container that is already running,
 # which is three requests: one to say what to run, one to run it, one to ask

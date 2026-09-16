@@ -873,14 +873,28 @@ let url_decode = fn (v: str) ->
 // Values arrive percent-encoded. `docker pull localhost:5000/lib/alpine:v1`
 // sends fromImage=localhost%3A5000%2Flib%2Falpine, and a reader that does not
 // decode sees no registry host at all.
+// A KEY IS NOT A SUBSTRING. Looking for "t=" anywhere in the query finds it
+// inside `target=`, and `docker compose build` sends both -- so the image came
+// out untagged, the build said "Successfully built" with no "Successfully
+// tagged" after it, and compose then failed with "No such image". Nothing in
+// the build was wrong.
+//
+// A parameter starts at the beginning of the query or just after an `&`, and
+// its name ends at the `=`. Compared whole.
 let query_param = fn (q: str) -> fn (k: str) ->
-  let key = k ++ "=" in
-  let i = str_index_of q key in
-  if i < 0 then ""
-  else
-    let rest = substring q (i + str_len key) (str_len q) in
-    let e = str_index_of rest "&" in
-    url_decode (if e < 0 then rest else substring rest 0 e);
+  let n = str_len q in
+  let rec go = fn (i: int) ->
+    if i >= n then ""
+    else
+      let amp = str_index_of (substring q i n) "&" in
+      let stop = if amp < 0 then n else i + amp in
+      let pair = substring q i stop in
+      let eq = str_index_of pair "=" in
+      if eq >= 0 && substring pair 0 eq == k then
+        url_decode (substring pair (eq + 1) (str_len pair))
+      else if amp < 0 then ""
+      else go (stop + 1) in
+  go 0;
 
 // ---- percent decoding + label filters ------------------------------------
 //
@@ -1681,7 +1695,8 @@ let c_net_create = fn (fd: int) -> fn (store: str) -> fn (body: str) ->
     respond fd "201 Created" "application/json"
       (obj [("Id", s id), ("Warning", s "")]);
 
-let c_net_list = fn (fd: int) -> fn (store: str) ->
+let c_net_list = fn (fd: int) -> fn (store: str) -> fn (q: str) ->
+  let wants = filter_labels q in
   let d = store ++ "/networks" in
   if not (file_exists d) then respond fd "200 OK" "application/json" "[]"
   else
@@ -1689,6 +1704,8 @@ let c_net_list = fn (fd: int) -> fn (store: str) ->
       match xs with
       | [] -> acc
       | [h, ...t] ->
+          if not (matches_all (read_file_or (ndir store h ++ "/labels") "") wants) then go t acc
+          else
           let e = net_body store h false in
           go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
     respond fd "200 OK" "application/json" ("[" ++ go (list_dir d) "" ++ "]");
@@ -1700,7 +1717,14 @@ let c_net_inspect = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
   else respond fd "200 OK" "application/json" (net_body store name true);
 
 let c_net_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
-  if not (file_exists (ndir store name ++ "/id")) then
+  // A PRE-DEFINED NETWORK CANNOT BE REMOVED, which is what docker says and
+  // what stops a client from taking the default bridge away: `compose down`
+  // removed it, and every container started afterwards was on a network whose
+  // record had gone.
+  if name == "bridge" || name == "host" || name == "none" then
+    respond fd "403 Forbidden" "application/json"
+      (obj [("message", s (name ++ " is a pre-defined network and cannot be removed"))])
+  else if not (file_exists (ndir store name ++ "/id")) then
     respond fd "404 Not Found" "application/json"
       (obj [("message", s ("network " ++ name ++ " not found"))])
   else
@@ -1728,7 +1752,13 @@ let vol_body = fn (store: str) -> fn (name: str) ->
        ("Labels", raw (let l = read_file_or (vdir store name ++ "/labels") "" in
                        if str_len l == 0 then "\{}" else l))];
 
-let c_vol_list = fn (fd: int) -> fn (store: str) ->
+// THE CLIENT FILTERS BY LABEL AND SO MUST THE DAEMON. `docker compose down`
+// lists volumes and networks and removes what comes back, so a list that
+// ignores the filter hands it everything on the machine -- it deleted a volume
+// another project had made and then tried to delete the default bridge.
+// Containers were filtered from the start; these two were not.
+let c_vol_list = fn (fd: int) -> fn (store: str) -> fn (q: str) ->
+  let wants = filter_labels q in
   let d = store ++ "/volumes" in
   let items =
     if not (file_exists d) then ""
@@ -1737,6 +1767,8 @@ let c_vol_list = fn (fd: int) -> fn (store: str) ->
         match xs with
         | [] -> acc
         | [h, ...t] ->
+            if not (matches_all (read_file_or (vdir store h ++ "/labels") "") wants) then go t acc
+            else
             let e = vol_body store h in
             go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
       go (list_dir d) "" in
@@ -2382,6 +2414,27 @@ let cp_escapes = fn (p: str) ->
 
 let cp_rootfs = fn (store: str) -> fn (id: str) -> cdir store id ++ "/bundle/rootfs";
 
+// Where a path inside the container actually LIVES on this machine.
+//
+// A bind mount or a volume covers a directory of the rootfs, and the rootfs
+// copy of it is an empty mount point: `docker cp c:/data/x` read that and
+// found nothing, for a file the container can see perfectly well. The mounts
+// this daemon recorded say where to look instead.
+let cp_host_path = fn (store: str) -> fn (id: str) -> fn (want: str) ->
+  let rootfs = cp_rootfs store id in
+  let plain = rootfs ++ (if substring want 0 1 == "/" then want else "/" ++ want) in
+  let rec go = fn (xs: Json.json list) ->
+    match xs with
+    | [] -> plain
+    | [h, ...t] ->
+        let dst = jstr (jget h "Destination") in
+        let src = jstr (jget h "Source") in
+        if str_len dst > 0 && str_len src > 0 && str_index_of want dst == 0
+           && (str_len want == str_len dst || char_at want (str_len dst) == "/")
+        then src ++ substring want (str_len dst) (str_len want)
+        else go t in
+  go (jarr (jparse ("[" ++ cread store id "mounts" ++ "]")));
+
 let c_archive_out = fn (fd: int) -> fn (buf: int) -> fn (cap: int) ->
                     fn (store: str) -> fn (id: str) -> fn (q: str) -> fn (head_only: bool) ->
   let want = url_decode (query_param q "path") in
@@ -2389,7 +2442,7 @@ let c_archive_out = fn (fd: int) -> fn (buf: int) -> fn (cap: int) ->
     respond fd "400 Bad Request" "application/json"
       (obj [("message", s ("mengd: cannot copy from " ++ want))])
   else
-    let full = cp_rootfs store id ++ (if substring want 0 1 == "/" then want else "/" ++ want) in
+    let full = cp_host_path store id want in
     if not (file_exists full) then
       respond fd "404 Not Found" "application/json"
         (obj [("message", s ("Could not find the file " ++ want ++ " in container " ++ substring id 0 12))])
@@ -2449,7 +2502,7 @@ let c_archive_in = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     respond fd "400 Bad Request" "application/json"
       (obj [("message", s "mengd: the archive was empty")])
   else
-    let into = cp_rootfs store id ++ (if substring want 0 1 == "/" then want else "/" ++ want) in
+    let into = cp_host_path store id want in
     let _ = mkdir_p into in
     let r = walk tmp into true in
     let _ = st_rmtree tmp in
@@ -3527,8 +3580,23 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
       respond fd "400 Bad Request" "application/json"
         (obj [("message", s "mengd: empty or unreadable build context")])
     else
-      let _ = c_build fd store ctx q runtime in
+      // COMPRESSED, when the client feels like it. `docker build` sends a
+      // plain tar and `docker compose build` sends a gzipped one -- the same
+      // route, the same header, a different body -- and a reader that assumes
+      // the plain one says "a partial final block (214 bytes, expected 512)"
+      // about a context that is perfectly good.
+      //
+      // Decided by looking at it, because nothing else says: the request
+      // carries no Content-Encoding for this.
+      let ctx2 = (let gz = region R {
+                             let b = bytebuf_of_bytes (read_bytes ctx) in
+                             if is_gzip b then (let (l, c) = gunzip_to b (ctx ++ ".tar") in 1)
+                             else 0
+                           } in
+                  if gz == 1 then ctx ++ ".tar" else ctx) in
+      let _ = c_build fd store ctx2 q runtime in
       let _ = st_rmtree ctx in
+      let _ = if ctx2 != ctx then (let _ = st_rmtree ctx2 in ()) else () in
       ()
   else if path == "/images/load" then
     // Per-request paths. One shared staging directory meant four concurrent
@@ -3591,7 +3659,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     else
       respond fd "200 OK" "application/json"
         (obj [("status", s ("Downloaded newer image for " ++ got))])
-  else if path == "/volumes" then c_vol_list fd store
+  else if path == "/volumes" then c_vol_list fd store q
   else if path == "/volumes/create" then
     let clen = header_int req "Content-Length: " in
     let body = read_body fd buf cap st clen in
@@ -3612,7 +3680,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
      else if verb == "json" then c_exec_json fd store xid
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
-  else if path == "/networks" then c_net_list fd store
+  else if path == "/networks" then c_net_list fd store q
   else if path == "/networks/create" then
     let clen = header_int req "Content-Length: " in
     let body = read_body fd buf cap st clen in
