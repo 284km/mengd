@@ -605,7 +605,8 @@ let header_int = fn (req: str) -> fn (name: str) ->
 
 // The OCI bundle mrun is handed. Same shape `runc spec` writes, with this
 // container's command, environment and working directory in it.
-let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) -> fn (hostname: str) ->
+let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
+                 fn (hostname: str) -> fn (host_net: bool) ->
   let ns = fn (t: str) -> obj [("type", s t)] in
   let m = fn (dest: str) -> fn (ty: str) -> fn (src: str) -> fn (opts: str) ->
     obj [("destination", s dest), ("type", s ty), ("source", s src), ("options", raw opts)] in
@@ -631,7 +632,14 @@ let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) -> f
         m "/sys" "sysfs" "sysfs" "[\"nosuid\",\"noexec\",\"nodev\",\"ro\"]" ++
       "]")),
     ("linux", obj [
-        ("namespaces", raw ("[" ++ ns "pid" ++ "," ++ ns "network" ++ "," ++ ns "ipc"
+        // --network host means share the machine's network namespace, which is
+        // expressed by leaving it out of the list rather than by a flag. mrun
+        // reads the list, so this is all it takes -- and it is the only way a
+        // container here can be reached on a port, because nothing builds a
+        // veth pair yet.
+        ("namespaces", raw ("[" ++ ns "pid"
+                             ++ (if host_net then "" else "," ++ ns "network")
+                             ++ "," ++ ns "ipc"
                              ++ "," ++ ns "uts" ++ "," ++ ns "mount" ++ "]")),
         ("maskedPaths", raw "[\"/proc/acpi\",\"/proc/kcore\",\"/proc/keys\",\"/proc/timer_list\",\"/sys/firmware\"]"),
         ("readonlyPaths", raw "[\"/proc/bus\",\"/proc/fs\",\"/proc/irq\",\"/proc/sys\",\"/proc/sysrq-trigger\"]")])];
@@ -1273,13 +1281,17 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let env = match jget spec "Env" with | Json.JArr xs -> jstrs (Json.JArr xs)
                 | _ -> "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]" in
       let _ = tc "oci_config" in
+      let netmode = jstr (jget (jget spec "HostConfig") "NetworkMode") in
+      let host_net = netmode == "host" in
       let cfg = oci_config (jstrs (jget spec "Cmd")) env
-                           (jstr (jget spec "WorkingDir")) (jstr (jget spec "Hostname")) in
+                           (jstr (jget spec "WorkingDir")) (jstr (jget spec "Hostname"))
+                           host_net in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
+      let _ = cwrite store id "netmode" (if str_len netmode == 0 then "default" else netmode) in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
       let _ = tc "created" in

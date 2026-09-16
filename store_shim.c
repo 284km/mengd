@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -157,3 +158,43 @@ const char *st_rfc3339(int secs) {
     strftime(ts_buf, sizeof ts_buf, "%Y-%m-%dT%H:%M:%SZ", &g);
     return ts_buf;
 }
+
+/* ---- the host-side proxy ----------------------------------------------- */
+/*
+ * A connection is handed to a child process by making it the child's stdin and
+ * stdout, and the child is `ssh ... socat`. Nothing copies bytes in user space
+ * on this side: the kernel already moves them between the socket and the pipe,
+ * and a proxy that read and re-wrote every byte would be a second place for
+ * the framing to be wrong.
+ */
+// Per-thread, because the agent forwards a socket and several ports at once
+// and a single shared argv would have two threads building one command.
+#define PX_MAXV 64
+static _Thread_local char *PXV[PX_MAXV + 1];
+static _Thread_local int PXn = 0;
+
+int st_px_reset(void) { for (int i = 0; i < PXn; i++) free(PXV[i]); PXn = 0; PXV[0] = NULL; return 0; }
+int st_px_push(const char *s) {
+    if (PXn >= PX_MAXV) return -1;
+    PXV[PXn] = strdup(s);
+    if (!PXV[PXn]) return -1;
+    PXV[++PXn] = NULL;
+    return 0;
+}
+
+/* Fork, make `fd` the child's stdin and stdout, exec the pushed argv.
+ * Returns the child's pid. */
+int st_px_spawn(int fd) {
+    if (PXn == 0) return -1;
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p > 0) return (int)p;
+    dup2(fd, 0); dup2(fd, 1);
+    if (fd > 2) close(fd);
+    execvp(PXV[0], PXV);
+    _exit(127);
+}
+
+/* Reap anything that has finished, without blocking. A proxy that never reaps
+ * accumulates zombies at one per connection. */
+int st_reap(void) { int n = 0; while (waitpid(-1, NULL, WNOHANG) > 0) n++; return n; }

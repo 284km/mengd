@@ -113,6 +113,38 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## The host side
+
+```sh
+magent ~/.mengd/docker.sock ~/.colima/_lima/colima/ssh.config lima-colima \
+       /var/run/mengd.sock 18099:8099
+
+DOCKER_HOST=unix://~/.mengd/docker.sock docker run alpine echo hello
+curl http://127.0.0.1:18099/          # a container's port, from this machine
+```
+
+`magent` listens on this machine and hands each connection to the daemon in the
+VM. **It does not copy bytes.** The connection becomes a child process's stdin
+and stdout and the child is `ssh <host> socat`, so the kernel moves them. A
+proxy that read and re-wrote every byte would be a second place for the framing
+to be wrong — and the framing here includes a hijacked attach stream, which
+does survive the trip: a foreground `docker run` from the host prints its output
+and returns its exit status.
+
+`--network host` shares the VM's network namespace, which is how a container can
+be reached on a port at all: nothing builds a veth pair yet.
+
+### The test was measuring lima
+
+The first port-forward check published 8099 in the VM and curled 8099 here, and
+it passed before the agent could even take the port — **lima forwards the VM's
+listening ports to the host by itself**, and the agent had logged `cannot listen
+on port 8099` while the curl went through lima's pipe.
+
+The check uses a host port lima does not claim, requires the agent to have
+actually taken it, and then **stops the agent and requires the port to go
+dead**. That last step is the only one that says whose pipe carried the bytes.
+
 ## `docker pull`, from a registry that is also Mere
 
 ```

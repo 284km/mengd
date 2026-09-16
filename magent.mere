@@ -1,0 +1,97 @@
+// magent.mere — the host side.
+//
+//   magent <local-socket> <ssh-config> <ssh-host> <remote-socket>
+//
+// Listens on a socket on this machine and hands each connection to the daemon
+// inside the VM. It does not copy bytes: the connection becomes a child
+// process's stdin and stdout and the child is `ssh <host> socat - UNIX-CONNECT
+// <remote>`, so the kernel moves them. A proxy that read and re-wrote every
+// byte would be a second place for the framing to be wrong -- and the framing
+// here includes a hijacked attach stream.
+
+extern fn unix_listen: str -> int;
+extern fn unix_accept: int -> int;
+extern fn tcp_close: int -> int;
+extern fn st_ignore_sigpipe: unit -> int;
+extern fn st_px_reset: unit -> int;
+extern fn st_px_push: str -> int;
+extern fn st_px_spawn: int -> int;
+extern fn st_reap: unit -> int;
+extern fn tcp_listen: int -> int;
+extern fn tcp_accept: int -> int;
+
+// One connection, handed to ssh. `what` is the socat address on the far side:
+// a unix socket for the daemon, a TCP port for a published one.
+let hand_off = fn (c: int) -> fn (cfg: str) -> fn (host: str) -> fn (what: str) ->
+  let _ = st_px_reset () in
+  let _ = st_px_push "ssh" in
+  let _ = st_px_push "-F" in
+  let _ = st_px_push cfg in
+  let _ = st_px_push "-o" in let _ = st_px_push "BatchMode=yes" in
+  let _ = st_px_push "-o" in let _ = st_px_push "LogLevel=ERROR" in
+  let _ = st_px_push "-T" in
+  let _ = st_px_push host in
+  let _ = st_px_push what in
+  let pid = st_px_spawn c in
+  let _ = if pid < 0 then print_err "magent: cannot fork ssh" else () in
+  let _ = tcp_close c in
+  ();
+
+// hostport:vmport
+let split_ports = fn (m: str) ->
+  let i = str_index_of m ":" in
+  if i < 0 then (0, 0)
+  else (int_of_str (substring m 0 i), int_of_str (substring m (i + 1) (str_len m)));
+
+let forward_port = fn (m: str) -> fn (cfg: str) -> fn (host: str) ->
+  let pair = split_ports m in
+  let (hp, vp) = pair in
+  if hp == 0 then let _ = print_err ("magent: cannot read the port mapping " ++ m) in ()
+  else
+    let srv = tcp_listen hp in
+    if srv < 0 then
+      let _ = print_err ("magent: cannot listen on port " ++ show hp) in ()
+    else
+      let _ = print_err ("magent: :" ++ show hp ++ " -> " ++ host ++ ":" ++ show vp) in
+      let rec loop = fn (u: unit) ->
+        let c = tcp_accept srv in
+        if c < 0 then loop ()
+        else
+          let _ = st_reap () in
+          let _ = hand_off c cfg host ("socat - TCP:127.0.0.1:" ++ show vp) in
+          loop () in
+      loop ();
+
+let serve = fn (local: str) -> fn (cfg: str) -> fn (host: str) -> fn (remote: str) ->
+  let _ = st_ignore_sigpipe () in
+  let srv = unix_listen local in
+  let _ = if srv < 0 then
+            let _ = print_err ("magent: cannot listen on " ++ local) in exit 1
+          else () in
+  let _ = print_err ("magent: " ++ local ++ " -> " ++ host ++ ":" ++ remote) in
+  let rec loop = fn (u: unit) ->
+    let c = unix_accept srv in
+    if c < 0 then loop ()
+    else
+      let _ = st_reap () in
+      // The child owns the connection once it is spawned; hand_off closes this
+      // side, because keeping a copy open would stop the client ever seeing
+      // end-of-stream.
+      let _ = hand_off c cfg host ("sudo socat - UNIX-CONNECT:" ++ remote) in
+      loop () in
+  loop ();
+
+let rec start_ports = fn (ms: str list) -> fn (cfg: str) -> fn (host: str) ->
+  match ms with
+  | [] -> ()
+  | [m, ...t] ->
+      let _ = spawn (fn (u: unit) -> forward_port m cfg host) in
+      start_ports t cfg host;
+
+match args () with
+| [local, cfg, host, remote] -> serve local cfg host remote
+| [local, cfg, host, remote, ...ports] ->
+    let _ = start_ports ports cfg host in
+    serve local cfg host remote
+| _ -> let _ = print_err "usage: magent <local-socket> <ssh-config> <ssh-host> <remote-socket> [hostport:vmport ...]" in
+       exit 2
