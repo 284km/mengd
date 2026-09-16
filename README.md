@@ -417,3 +417,25 @@ which is **attacker-controlled bytes** — a junk archive reflected raw control
 characters into whatever terminal read the error — and the path it was reading,
 which is the daemon's own storage layout. The reason is now printable-only,
 length-capped, and says "the uploaded archive" where the path was.
+
+
+## Where it listens
+
+A path is an `AF_UNIX` socket, which is what `docker.sock` is:
+
+```sh
+mengd /var/run/mengd.sock /var/lib/mengd /usr/local/bin/mrun
+```
+
+`vsock://<port>` is `AF_VSOCK`, which is how a daemon **inside a virtual
+machine** is reached — there is no path on the host's filesystem that leads
+there, so the VMM carries the stream to a port instead:
+
+```sh
+mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun
+```
+
+The accept loop does not change: `accept(2)` does not care which family the
+listening fd came from, so this is one call rather than a second socket layer.
+[mvm](https://github.com/284km/mvm) is the VMM on the other end of it, and its
+`test/stack.sh` runs a real `docker` client against a mengd started this way.

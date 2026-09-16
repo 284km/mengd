@@ -14,6 +14,7 @@ import "vendor_tar.mere";
 import "rootfs.mere";
 
 extern fn unix_listen: str -> int;
+extern fn vsock_listen: int -> int;
 extern fn unix_accept: int -> int;
 extern fn tcp_read: int -> int -> int -> int;
 extern fn tcp_write: int -> int -> int -> int;
@@ -1371,6 +1372,13 @@ let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
 // than the client asks for gets an answer to a different question.
 let c_attach = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (req: str) ->
   let wants_upgrade = str_index_of req "Upgrade: tcp" >= 0 in
+  // Whether the client asked to hijack the connection, and how much of the
+  // request this end actually saw. A request split across two reads would
+  // leave the header out of `req` and answer 200 to a client that asked for
+  // 101, which is a different failure wearing the same silence.
+  let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+            print_err ("attach: " ++ show (str_len req) ++ " bytes of request, upgrade "
+                    ++ (if wants_upgrade then "yes" else "NO")) else () in
   let _ = write_str fd
       (if wants_upgrade then
          "HTTP/1.1 101 UPGRADED\r\n"
@@ -1384,6 +1392,8 @@ let c_attach = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (req: str) 
     let n = str_len body in
     if n <= sent then sent
     else
+      let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                print_err ("attach: framing " ++ show (n - sent) ++ " bytes of " ++ f) else () in
       let _ = write_str fd (frame_of stream (substring body sent n)) in
       n in
   let rec pump = fn (o: int) -> fn (e: int) -> fn (n: int) ->
@@ -1394,6 +1404,8 @@ let c_attach = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (req: str) 
       // between the poll and the state file being updated.
       let _ = tail "log.out" 1 o2 in
       let _ = tail "log.err" 2 e2 in
+      let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                print_err ("attach: done after " ++ show n ++ " polls") else () in
       ()
     else if n > 3000 then ()
     else let _ = sleep_ms 50 in pump o2 e2 (n + 1) in
@@ -1592,9 +1604,21 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
 
 // ---- accept loop ---------------------------------------------------------
 
+// Where to listen. A path is AF_UNIX; "vsock://<port>" is AF_VSOCK, which is
+// how a daemon inside a VM is reached -- there is no path on the host's
+// filesystem that leads here, so the VMM carries the stream to a port instead.
+// The scheme is spelt the way docker spells its own addresses.
+let listen_on = fn (sock: str) ->
+  if str_len sock > 8 && substring sock 0 8 == "vsock://" then
+    let port = int_or (substring sock 8 (str_len sock)) 0 in
+    if port <= 0 then
+      let _ = print_err ("mengd: " ++ sock ++ " has no port in it") in 0 - 1
+    else vsock_listen port
+  else unix_listen sock;
+
 let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
   let _ = st_ignore_sigpipe () in
-  let srv = unix_listen sock in
+  let srv = listen_on sock in
   let _ = if srv < 0 then
             let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1
           else () in
