@@ -845,3 +845,45 @@ The gate's first version found the built image by **grepping its layers** for a
 string the build had written. That stopped working the moment layers were
 compressed, and reported the image as having no layers at all: the instrument
 broke, not the subject. It reads the store's index by tag now.
+
+## docker exec and docker cp
+
+Two things a person types all day, and the two that were missing.
+
+**`docker exec`** is a second process inside a container that is already
+running. The namespaces are named by the container's pid, and entering them is
+what makes the process *be* inside: the mount namespace gives it the
+container's filesystem, the pid namespace makes it a child of the container's
+init, the network one gives it the container's address. The check asks for all
+three — entering the mount namespace alone would pass "it printed the right
+thing" while leaving the process in the host's process table and on the host's
+network.
+
+Two ordering rules in the shim. The output files are opened **before** entering
+the mount namespace, because afterwards those paths mean something else
+entirely. And the pid namespace only takes effect for a **child**, so there is
+a second fork after `setns` — without it the process runs in the container's
+filesystem while still being outside its process table.
+
+The argv arrives in a **file**, one argument per line: the FFI boundary carries
+a string, not a list, and padding a command out to a fixed number of slots is
+how one with five arguments silently becomes one with four.
+
+Recording the container's pid only for containers with **published ports** —
+which is how it was — made exec answer "container is not running" about a
+container that was.
+
+**No TTY and no stdin**, said here rather than discovered. `docker exec -it`
+wants a pty in the container and a bidirectional stream; it is refused by name.
+
+**`docker cp`** is tar out and tar in, which this already had in both
+directions, plus the path checking that keeps the destination inside. It works
+on a stopped container, because the rootfs is still there — that is not a
+shortcut, it is what docker does.
+
+The archive is named relative to the **parent**: `docker cp c:/d /tmp/x`
+expects entries called `d/...`, because the client renames that one top-level
+name. An archive of the directory's *contents* unpacks into nothing the client
+can find — which is exactly what happened, with no error anywhere. The oracle
+is the real docker: the same directory, copied out of both, has to arrive in
+the same shape.

@@ -300,3 +300,123 @@ int st_umount(const char *target) { (void)target; return -1; }
  *
  * mkdir is atomic, so the directory IS the lease. */
 int st_mkdir_excl(const char *path) { return mkdir(path, 0755) == 0 ? 0 : -1; }
+
+/* base64, for the one header the archive routes have to send.
+ *
+ * `docker cp` decides whether it is copying a file or a directory from
+ * X-Docker-Container-Path-Stat, which is base64 of a small JSON object. It is
+ * 30 lines here and a dependency anywhere else. */
+int st_b64(const char *in, char *out, int outcap) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = strlen(in);
+    size_t need = 4 * ((n + 2) / 3) + 1;
+    if ((int)need > outcap) return -1;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned char)in[i] << 16;
+        if (i + 1 < n) v |= (unsigned char)in[i + 1] << 8;
+        if (i + 2 < n) v |= (unsigned char)in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? T[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? T[v & 63] : '=';
+    }
+    out[o] = 0;
+    return (int)o;
+}
+static _Thread_local char ST_B64[8192];
+const char *st_b64_of(const char *in) {
+    if (st_b64(in, ST_B64, (int)sizeof ST_B64) < 0) { ST_B64[0] = 0; }
+    return ST_B64;
+}
+
+/* ---- docker exec ----------------------------------------------------------
+ *
+ * A second process inside a container that is already running. The namespaces
+ * are named by the container's pid, and entering them is what makes the
+ * process BE inside: the mount namespace gives it the container's filesystem,
+ * the pid namespace makes it a child of the container's init, the network one
+ * gives it the container's address.
+ *
+ * The argv arrives in a FILE, one argument per line. The FFI boundary carries
+ * `int` and `const char *`, so a list of unknown length cannot cross it -- and
+ * padding it out to a fixed number of slots is how a command with five
+ * arguments silently becomes one with four.
+ *
+ * ORDER MATTERS TWICE. The output files are opened BEFORE entering the mount
+ * namespace, because afterwards those paths mean something else entirely. And
+ * the pid namespace only takes effect for a CHILD, so there is a second fork
+ * after setns -- without it the process runs in the container's filesystem
+ * while still being outside its process table.
+ */
+#ifdef __linux__
+#include <sched.h>
+static int ex_enter(int pid, const char *what) {
+    char p[256];
+    snprintf(p, sizeof p, "/proc/%d/ns/%s", pid, what);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = setns(fd, 0);
+    close(fd);
+    return rc;
+}
+#else
+static int ex_enter(int pid, const char *what) { (void)pid; (void)what; return -1; }
+#endif
+
+static char **ex_read_argv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char **v = calloc(64, sizeof *v);
+    if (!v) { fclose(f); return NULL; }
+    int n = 0;
+    char line[4096];
+    while (n < 62 && fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+        v[n++] = strdup(line);
+    }
+    fclose(f);
+    v[n] = NULL;
+    return n > 0 ? v : (free(v), NULL);
+}
+
+/* Returns the child's pid, or -1. The caller waits for it with st_wait. */
+int ex_spawn(int cpid, const char *argvfile, const char *envfile,
+             const char *cwd, const char *outfile, const char *errfile) {
+    char **argv = ex_read_argv(argvfile);
+    if (!argv) return -1;
+    char **envp = ex_read_argv(envfile);   /* may be NULL: then inherit */
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int o = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int e = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (o < 0 || e < 0) _exit(125);
+        /* ipc, uts and net first; mount and pid last, because after those two
+         * the paths and the process table are the container's. */
+        if (ex_enter(cpid, "ipc") != 0) _exit(126);
+        if (ex_enter(cpid, "uts") != 0) _exit(126);
+        if (ex_enter(cpid, "net") != 0) _exit(126);
+        if (ex_enter(cpid, "pid") != 0) _exit(126);
+        if (ex_enter(cpid, "mnt") != 0) _exit(126);
+        pid_t inner = fork();          /* the pid namespace needs a child */
+        if (inner < 0) _exit(125);
+        if (inner > 0) {
+            int st = 0;
+            if (waitpid(inner, &st, 0) < 0) _exit(125);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+        }
+        dup2(o, 1); dup2(e, 2); close(o); close(e);
+        if (cwd && cwd[0]) { if (chdir(cwd) != 0) chdir("/"); } else chdir("/");
+        /* execvpe is glibc's; everywhere else the environment is set first and
+         * execvp inherits it. Same result, and it compiles on both. */
+        if (envp) for (char **e = envp; *e; e++) {
+            char *eq = strchr(*e, '=');
+            if (eq) { *eq = 0; setenv(*e, eq + 1, 1); *eq = '='; }
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    return (int)pid;
+}

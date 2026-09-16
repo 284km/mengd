@@ -458,6 +458,75 @@ grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down
 n=\$(timeout 20 docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "no networks left (\$n)"
 
+# docker exec. A second process inside a container that is already running,
+# which is three requests: one to say what to run, one to run it, one to ask
+# how it went.
+timeout 60 docker run -d --name exc alpine:latest sh -c 'echo marker > /tmp/here; sleep 120' >/dev/null 2>&1
+sleep 2
+o=\$(timeout 30 docker exec exc echo from-exec 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "from-exec" ]; say \$? "docker exec runs a command and returns its output (\$o)"
+o=\$(timeout 30 docker exec exc cat /tmp/here 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "marker" ]; say \$? "it sees the container's filesystem (\$o)"
+timeout 30 docker exec exc sh -c 'exit 7' >/dev/null 2>&1
+[ \$? = 7 ]; say \$? "and its exit status comes back"
+e=\$(timeout 30 docker exec exc sh -c 'echo to-err 1>&2' 2>&1 | tr -d '\\r\\n')
+[ "\$e" = "to-err" ]; say \$? "stderr arrives on its own stream (\$e)"
+
+# INSIDE, not merely on the same machine. Entering the mount namespace alone
+# would pass the two checks above while leaving the process in the host's
+# process table and on the host's network.
+n=\$(timeout 30 docker exec exc sh -c 'ls /proc | grep -c "^[0-9]*\$"' 2>/dev/null | tr -d '\\r\\n')
+[ -n "\$n" ] && [ "\$n" -lt 20 ]; say \$? "it is in the container's process table (\$n processes)"
+a=\$(timeout 30 docker exec exc sh -c 'ip -o addr show eth0 | grep -c "10\\.88\\."' 2>/dev/null | tr -d '\\r\\n')
+[ "\$a" = 1 ]; say \$? "and on the container's network (\$a)"
+
+# A terminal is a pty in the container and a bidirectional stream. Refused by
+# name rather than half-answered.
+timeout 30 docker exec -t exc echo x >/var/tmp/tty.log 2>&1
+grep -q "terminal is not implemented" /var/tmp/tty.log
+say \$? "exec with a terminal is refused by name"
+timeout 20 docker rm -f exc >/dev/null 2>&1
+
+# docker cp, both ways. A container's filesystem is a directory on this
+# machine, so this is tar out and tar in -- which the daemon already had in
+# both directions.
+timeout 60 docker run -d --name cpc alpine:latest \
+  sh -c 'mkdir -p /d/sub; echo IN-CONTAINER > /d/f.txt; echo deep > /d/sub/g.txt; sleep 120' >/dev/null 2>&1
+sleep 2
+rm -f /var/tmp/got.txt
+timeout 30 docker cp cpc:/d/f.txt /var/tmp/got.txt >/dev/null 2>&1
+[ "\$(cat /var/tmp/got.txt 2>/dev/null)" = "IN-CONTAINER" ]
+say \$? "docker cp a file out (\$(cat /var/tmp/got.txt 2>/dev/null))"
+
+# THE ORACLE IS THE REAL DOCKER. A directory copied out has to arrive in the
+# same SHAPE -- the archive is named relative to the parent, because the client
+# renames that one top-level name. Getting it wrong produces an empty
+# destination and no error at all, which is exactly what the first version did.
+rm -rf /var/tmp/gotd; timeout 30 docker cp cpc:/d /var/tmp/gotd >/dev/null 2>&1
+DOCKER_HOST= docker run -d --name cporacle alpine:latest \
+  sh -c 'mkdir -p /d/sub; echo IN-CONTAINER > /d/f.txt; echo deep > /d/sub/g.txt; sleep 60' >/dev/null 2>&1
+rm -rf /var/tmp/oracd; DOCKER_HOST= docker cp cporacle:/d /var/tmp/oracd >/dev/null 2>&1
+DOCKER_HOST= docker rm -f cporacle >/dev/null 2>&1
+( cd /var/tmp/oracd 2>/dev/null && find . | sort ) > /var/tmp/o.txt
+( cd /var/tmp/gotd 2>/dev/null && find . | sort ) > /var/tmp/g.txt
+[ -s /var/tmp/o.txt ] && diff -q /var/tmp/o.txt /var/tmp/g.txt >/dev/null 2>&1
+say \$? "a directory arrives in the same shape as the real docker gives (\$(wc -l < /var/tmp/g.txt | tr -d ' ') entries)"
+
+echo FROM-THE-HOST > /var/tmp/put.txt
+timeout 30 docker cp /var/tmp/put.txt cpc:/d/put.txt >/dev/null 2>&1
+say \$? "docker cp a file in"
+rm -f /var/tmp/back.txt
+timeout 30 docker cp cpc:/d/put.txt /var/tmp/back.txt >/dev/null 2>&1
+[ "\$(cat /var/tmp/back.txt 2>/dev/null)" = "FROM-THE-HOST" ]
+say \$? "and it comes back out again (\$(cat /var/tmp/back.txt 2>/dev/null))"
+
+# A path that climbs out of the container is refused, not clamped: a copy that
+# silently lands somewhere else is worse than one that does not happen.
+timeout 30 docker cp cpc:/../../etc/passwd /var/tmp/escape.txt >/var/tmp/esc.log 2>&1
+[ \$? != 0 ] && [ ! -s /var/tmp/escape.txt ]
+say \$? "a source that climbs out of the container is refused"
+timeout 20 docker rm -f cpc >/dev/null 2>&1
+
 # THE DEFAULT BRIDGE. A container that names no network used to get a namespace
 # with a loopback in it and no way to reach anything -- docker puts it on the
 # default bridge, and so does this now. Names are NOT resolved there, which is

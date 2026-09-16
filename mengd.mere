@@ -24,10 +24,13 @@ extern fn mem_alloc: int -> int;
 extern fn mem_to_str: int -> int -> str;
 extern fn str_ptr: str -> int;
 extern fn mem_to_bytes: int -> int -> bytes;
+extern fn mem_copy_bytes: int -> int -> bytes -> int;
 extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
 extern fn st_mkdir_excl: str -> int;
+extern fn st_b64_of: str -> str;
+extern fn ex_spawn: int -> str -> str -> str -> str -> str -> int;
 extern fn st_mount_overlay: str -> str -> int;
 extern fn st_umount: str -> int;
 // The network a compose file describes: a bridge per network, a veth pair per
@@ -452,6 +455,7 @@ let jparse = fn (text: str) ->
 let jget = fn (o: Json.json) -> fn (k: str) ->
   match o with | Json.JObj kvs -> jassoc kvs k | _ -> Json.JNull;
 let jstr = fn (v: Json.json) -> match v with | Json.JStr x -> x | _ -> "";
+let jbool = fn (v: Json.json) -> match v with | Json.JBool b -> b | _ -> false;
 let jarr = fn (v: Json.json) -> match v with | Json.JArr xs -> xs | _ -> [];
 let jfirst = fn (v: Json.json) -> match jarr v with | [] -> Json.JNull | [h, ...t] -> h;
 
@@ -2190,6 +2194,124 @@ let net_down = fn (store: str) -> fn (id: str) ->
   // to unpick.
   let _ = nw_netns_del (netns_path id) in ();
 
+// The body of a response that is a FILE. The same shape mreg uses: one buffer,
+// refilled, so a layer-sized answer does not become a layer-sized string.
+let send_file = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (path: str) ->
+  let fh = file_openrw path in
+  let rec go = fn (off: int) -> fn (total: int) ->
+    let b = file_pread_bytes fh off cap in
+    let n = bytes_len b in
+    if n <= 0 then total
+    else
+      let _ = mem_copy_bytes buf 0 b in
+      let w = tcp_write fd buf n in
+      if w <= 0 then total else go (off + n) (total + w) in
+  let t = go 0 0 in
+  let _ = file_close fh in
+  t;
+
+// ---- docker cp -------------------------------------------------------------
+//
+// A container's filesystem is a directory on this machine, so copying in and
+// out of one is tar in and tar out -- which this already has in both
+// directions. `docker cp` is that, with the path checking that keeps the
+// destination inside the container.
+//
+// It works on a STOPPED container, because the rootfs is still there. That is
+// not a shortcut: docker cp works on stopped containers too, and a version
+// that needed a running process would be a different command.
+
+// The path a client asked for, inside the container, with the ways out
+// removed. Refused rather than clamped: a copy that silently lands somewhere
+// else is worse than one that does not happen.
+let cp_escapes = fn (p: str) ->
+  let n = str_len p in
+  let rec go = fn (i: int) ->
+    if i + 1 >= n then false
+    else if char_at p i == "." && char_at p (i + 1) == "."
+            && (i == 0 || char_at p (i - 1) == "/")
+            && (i + 2 >= n || char_at p (i + 2) == "/") then true
+    else go (i + 1) in
+  go 0;
+
+let cp_rootfs = fn (store: str) -> fn (id: str) -> cdir store id ++ "/bundle/rootfs";
+
+let c_archive_out = fn (fd: int) -> fn (buf: int) -> fn (cap: int) ->
+                    fn (store: str) -> fn (id: str) -> fn (q: str) -> fn (head_only: bool) ->
+  let want = url_decode (query_param q "path") in
+  if str_len want == 0 || cp_escapes want then
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s ("mengd: cannot copy from " ++ want))])
+  else
+    let full = cp_rootfs store id ++ (if substring want 0 1 == "/" then want else "/" ++ want) in
+    if not (file_exists full) then
+      respond fd "404 Not Found" "application/json"
+        (obj [("message", s ("Could not find the file " ++ want ++ " in container " ++ substring id 0 12))])
+    else
+      let _ = fs_lstat full in
+      let isdir = fs_st_kind () == 1 in
+      let mode = fs_st_mode () in
+      let sz = if isdir then 0 else fs_st_size () in
+      let base = (let i = last_index_of_str want "/" in
+                  if i < 0 then want else substring want (i + 1) (str_len want)) in
+      // The header the client reads to decide whether it is copying a file or
+      // a directory. It is base64 of JSON, which is how the API spells it.
+      let stat = st_b64_of (obj [("name", s base), ("size", raw (show sz)),
+                              ("mode", raw (show (if isdir then mode + 2147483648 else mode))),
+                              ("mtime", s (st_rfc3339 (fs_st_mtime ()))),
+                              ("linkTarget", s "")]) in
+      if head_only then
+        let _ = write_str fd ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                           ++ "X-Docker-Container-Path-Stat: " ++ stat ++ "\r\n"
+                           ++ "Content-Length: 0\r\nConnection: close\r\n\r\n") in ()
+      else
+        let tmp = store ++ "/cp-" ++ gen_request_id () ++ ".tar" in
+        // Named relative to the PARENT, both ways: `docker cp c:/d /tmp/x`
+        // expects an archive whose entries are `d/...`, because the client
+        // unpacks it and renames that one top-level name. An archive of the
+        // directory's contents unpacks into nothing the client can find --
+        // which is what happened: the file case worked and the directory case
+        // silently produced an empty destination.
+        let n = if want == "/" then tar_create tmp full
+                else tar_create_one tmp (dirname full) base in
+        if n < 0 then
+          let _ = st_rmtree tmp in
+          respond fd "500 Internal Server Error" "application/json"
+            (obj [("message", s ("mengd: cannot read " ++ want ++ ": " ++ fs_last_error ()))])
+        else
+          let _ = write_str fd ("HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n"
+                             ++ "X-Docker-Container-Path-Stat: " ++ stat ++ "\r\n"
+                             ++ "Content-Length: " ++ show (file_size tmp) ++ "\r\n"
+                             ++ "Connection: close\r\n\r\n") in
+          let _ = send_file fd buf cap tmp in
+          let _ = st_rmtree tmp in ();
+
+let c_archive_in = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+                   fn (store: str) -> fn (id: str) -> fn (q: str) -> fn (req: str) ->
+  let want = url_decode (query_param q "path") in
+  let tmp = store ++ "/cp-in-" ++ gen_request_id () ++ ".tar" in
+  // The body is READ FIRST, whatever happens next. A daemon that answers
+  // before the client has finished sending gets a broken pipe at the client,
+  // which is what an unimplemented PUT looked like from the outside.
+  let n = recv_body fd buf cap st req tmp in
+  if str_len want == 0 || cp_escapes want then
+    let _ = st_rmtree tmp in
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s ("mengd: cannot copy into " ++ want))])
+  else if n <= 0 then
+    let _ = st_rmtree tmp in
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s "mengd: the archive was empty")])
+  else
+    let into = cp_rootfs store id ++ (if substring want 0 1 == "/" then want else "/" ++ want) in
+    let _ = mkdir_p into in
+    let r = walk tmp into true in
+    let _ = st_rmtree tmp in
+    if r < 0 then
+      respond fd "400 Bad Request" "application/json"
+        (obj [("message", s ("mengd: " ++ fs_last_error ()))])
+    else respond fd "200 OK" "text/plain" "";
+
 let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
   let cd = cdir store id in
   let pidfile = cd ++ "/container.pid" in
@@ -2214,19 +2336,23 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
     // runtime has to fork first. Waiting for the FILE rather than guessing a
     // delay is the difference between a forwarder in the right namespace and
     // one in the guest's.
+    // The container's pid, always -- not only when something asked for a port.
+    // It is what `docker exec` needs to find the namespaces to enter, and
+    // recording it only for containers with published ports meant exec
+    // answered "container is not running" about a container that was.
+    let rec wait_pid = fn (n: int) ->
+      let t = read_file_or pidfile "" in
+      if str_len t > 0 then int_or t 0
+      else if n > 200 then 0
+      else let _ = sleep_ms 10 in wait_pid (n + 1) in
+    let cpid = wait_pid 0 in
+    let _ = if cpid > 0 then (let _ = cwrite store id "cpid" (show cpid) in ()) else () in
     let _ = if str_len (cread store id "ports") > 0 then
-              (let rec wait_pid = fn (n: int) ->
-                 let t = read_file pidfile in
-                 if str_len t > 0 then int_or t 0
-                 else if n > 200 then 0
-                 else let _ = sleep_ms 10 in wait_pid (n + 1) in
-               let cpid = wait_pid 0 in
-               if cpid <= 0 then
+              (if cpid <= 0 then
                  (let _ = print_err ("mengd: no container pid for " ++ substring id 0 12
                                   ++ "; its published ports are not forwarded") in ())
                else
-                 (let _ = cwrite store id "cpid" (show cpid) in
-                  let _ = cwrite store id "fwdpids" (fwd_start store id cpid (fwd_path ())) in ()))
+                 (let _ = cwrite store id "fwdpids" (fwd_start store id cpid (fwd_path ())) in ()))
             else () in
     // 204 goes out BEFORE the wait: docker's start returns when the container
     // has started, not when it has finished. The reaping happens on this
@@ -2279,6 +2405,101 @@ let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
   let body = frame_of 1 (cread store id "log.out")
           ++ frame_of 2 (cread store id "log.err") in
   respond fd "200 OK" "application/vnd.docker.multiplexed-stream" body;
+
+// ---- docker exec -----------------------------------------------------------
+//
+// A second process inside a container that is already running. The namespaces
+// are named by the container's pid, and entering them is what makes the
+// process BE inside: the mount namespace gives it the container's filesystem,
+// the pid namespace makes it a child of the container's init, the network one
+// gives it the container's address.
+//
+// The client does it in three requests, and they are three routes: one to say
+// what to run, one to run it, one to ask how it went. The id in between is
+// this daemon's, so it is stored the way everything else is -- a directory.
+//
+// WHAT THIS DOES NOT DO, said here rather than discovered: no TTY and no
+// stdin. `docker exec -it` asks for a terminal, which is a pty in the
+// container and a bidirectional stream; `docker exec <c> <cmd>` is the one
+// that works, and it is refused by name rather than half-answered.
+let xdir = fn (store: str) -> fn (xid: str) -> store ++ "/execs/" ++ xid;
+
+let c_exec_create = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (body: str) ->
+  let spec = jparse body in
+  let cmd = jarr (jget spec "Cmd") in
+  if list_len cmd == 0 then
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s "mengd: exec needs a command")])
+  else if jbool (jget spec "Tty") then
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s ("mengd: exec with a terminal is not implemented; "
+                        ++ "docker exec without -t works"))])
+  else
+    let xid = sha256_hex (gen_request_id ()) in
+    let d = xdir store xid in
+    let _ = mkdir_p d in
+    // One argument per line: the FFI boundary carries a string, not a list,
+    // and padding a command out to a fixed number of slots is how one with
+    // five arguments silently becomes one with four.
+    let rec lines = fn (xs: Json.json list) -> fn (acc: str) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] -> lines t (acc ++ jstr h ++ "\n") in
+    let _ = write_file (d ++ "/argv") (lines cmd "") in
+    let _ = write_file (d ++ "/env") (lines (jarr (jget spec "Env")) "") in
+    let _ = write_file (d ++ "/cwd") (jstr (jget spec "WorkingDir")) in
+    let _ = write_file (d ++ "/container") id in
+    let _ = write_file (d ++ "/exit") "" in
+    respond fd "201 Created" "application/json" (obj [("Id", s xid)]);
+
+let c_exec_start = fn (fd: int) -> fn (store: str) -> fn (xid: str) -> fn (req: str) ->
+  let d = xdir store xid in
+  if not (file_exists (d ++ "/argv")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such exec instance: " ++ xid))])
+  else
+    let id = read_file_or (d ++ "/container") "" in
+    let cpid = int_or (cread store id "cpid") 0 in
+    if cpid <= 0 then
+      respond fd "409 Conflict" "application/json"
+        (obj [("message", s "Container is not running")])
+    else
+      // The same two answers attach gives, for the same reason: a client that
+      // asked to upgrade gets 101 and one that did not gets 200.
+      let wants_upgrade = str_index_of req "Upgrade: tcp" >= 0 in
+      let _ = write_str fd
+          (if wants_upgrade then
+             "HTTP/1.1 101 UPGRADED\r\n"
+             ++ "Content-Type: application/vnd.docker.multiplexed-stream\r\n"
+             ++ "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+           else
+             "HTTP/1.1 200 OK\r\n"
+             ++ "Content-Type: application/vnd.docker.multiplexed-stream\r\n"
+             ++ "Connection: close\r\n\r\n") in
+      let pid = ex_spawn cpid (d ++ "/argv") (d ++ "/env") (read_file_or (d ++ "/cwd") "")
+                              (d ++ "/out") (d ++ "/err") in
+      if pid < 0 then
+        let _ = write_str fd (frame_of 2 "mengd: cannot enter the container\n") in ()
+      else
+        let code = st_wait pid in
+        let _ = write_file (d ++ "/exit") (show code) in
+        // The output goes out after it is all there. Live interleaving is what
+        // a terminal is for, and this says it does not do terminals.
+        let _ = write_str fd (frame_of 1 (read_file_or (d ++ "/out") "")) in
+        let _ = write_str fd (frame_of 2 (read_file_or (d ++ "/err") "")) in ();
+
+let c_exec_json = fn (fd: int) -> fn (store: str) -> fn (xid: str) ->
+  let d = xdir store xid in
+  if not (file_exists (d ++ "/argv")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such exec instance: " ++ xid))])
+  else
+    let e = read_file_or (d ++ "/exit") "" in
+    respond fd "200 OK" "application/json"
+      (obj [("ID", s xid), ("Running", raw (if str_len e == 0 then "true" else "false")),
+            ("ExitCode", raw (if str_len e == 0 then "null" else e)),
+            ("ContainerID", s (read_file_or (d ++ "/container") "")),
+            ("Pid", raw "0")]);
 
 // Attach is a hijacked connection: headers immediately -- the client sends
 // /start only after they arrive, exactly like /wait -- and then the framed
@@ -3232,6 +3453,19 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   else if str_index_of path "/volumes/" == 0 then
     let vn = seg_after path "/volumes/" in
     (if m == "DELETE" then c_vol_delete fd store vn else c_vol_inspect fd store vn)
+  else if str_index_of path "/exec/" == 0 then
+    (let rest = seg_after path "/exec/" in
+     let (xid, verb) = split_slash rest in
+     if verb == "start" then
+       // The body says Detach and Tty and this reads neither, but it has to
+       // be TAKEN OFF THE SOCKET: a daemon that answers before the client has
+       // finished sending gets a broken pipe at the client.
+       (let clen = header_int req "Content-Length: " in
+        let _ = read_body fd buf cap st clen in
+        c_exec_start fd store xid req)
+     else if verb == "json" then c_exec_json fd store xid
+     else respond fd "404 Not Found" "application/json"
+            (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/networks" then c_net_list fd store
   else if path == "/networks/create" then
     let clen = header_int req "Content-Length: " in
@@ -3270,6 +3504,13 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     else if verb == "restart" then c_stop fd store id 15
     else if verb == "json" then
       respond fd "200 OK" "application/json" (c_inspect_body store id)
+    else if verb == "exec" then
+      (let clen = header_int req "Content-Length: " in
+       let body = read_body fd buf cap st clen in
+       c_exec_create fd store id body)
+    else if verb == "archive" then
+      (if m == "PUT" then c_archive_in fd buf cap st store id q req
+       else c_archive_out fd buf cap store id q (m == "HEAD"))
     else if str_len verb == 0 then
       (if m == "DELETE" then
          // The namespace goes with the container. Left behind it would hold

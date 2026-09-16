@@ -557,5 +557,23 @@ let tar_create_opt = fn (dest: str) -> fn (root: str) -> fn (layer: bool) ->
 // A directory is a directory: a device node in it is refused, not translated.
 let tar_create = fn (dest: str) -> fn (root: str) -> tar_create_opt dest root false;
 
+// One entry of a directory, named relative to it -- a file, or a subtree.
+//
+// `docker cp` of a single file wants an archive with that one name in it, not
+// the whole directory it happens to live in. The walk already does exactly one
+// entry; what was missing was a way to start it somewhere other than "all of
+// them".
+let tar_create_one = fn (dest: str) -> fn (root: str) -> fn (rel: str) ->
+  let _ = fs_clear_error () in
+  let _ = write_bytes dest (bytes_of_bytebuf (bytebuf_new 0)) in
+  let fh = file_openrw dest in
+  let st = vec_new () in
+  let _ = vec_push st 0 in
+  let _ = vec_push st 0 in
+  let r = w_walk fh st false root rel in
+  let _ = w_put fh st (bytebuf_new (2 * w_block)) in
+  let _ = file_close fh in
+  if r < 0 || fs_has_error () == 1 then 0 - 1 else (vec_get st w_count : int);
+
 // The upper directory of an overlay mount, written as an image layer.
 let tar_create_layer = fn (dest: str) -> fn (root: str) -> tar_create_opt dest root true;
