@@ -1,4 +1,4 @@
-// Vendored from 284km/mgz crc32.mere, unmodified.
+// Vendored from 284km/mgz crc32.mere by tools/vendor-mgz.sh. Do not edit here.
 // crc32.mere — the CRC-32 arithmetic, on its own.
 //
 // It is here rather than inside the two files that use it for two reasons.

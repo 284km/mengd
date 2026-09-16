@@ -1,8 +1,6 @@
-// Vendored from 284km/mgz inflate.mere, unmodified except for the import path.
-// Mere has no package manager yet; re-vendor rather than edit in place.
-// Image layers arrive gzipped, so mengd unpacks them with mgz -- checked
-// against the system gunzip byte for byte in its own repository, and again
-// here on a real 4 MB layer: 8,939,520 bytes out, same sha256, crc OK.
+// Vendored from 284km/mgz inflate.mere by tools/vendor-mgz.sh. Do not edit here.
+// The only change is the import path: the vendored files sit beside each
+// other here under different names.
 // inflate (RFC 1951) and the gzip container (RFC 1952), in pure Mere.
 // One canonical Huffman decoder serves stored / fixed / dynamic blocks
 // (fixed tables are just a particular set of code lengths).
@@ -15,21 +13,12 @@
 // about read_file_bytes ("prefer read_bytes") and nothing here had read it.
 //
 // Exports used by other packages:
-//   inflate     data start   -> ByteBuf   raw DEFLATE from a bit offset
-//   gunzip      data         -> vec   gzip container, header skipped
-//   gunzip_ok   data out     -> bool  verify the CRC-32 / ISIZE trailer
-//   crc32_buf   buf          -> int
+//   inflate_to  data start path -> (len, crc)   raw DEFLATE, straight to a file
+//   gunzip_to   data path      -> (len, crc)   the same, gzip header skipped
+//   gzip_trailer_ok data len crc -> bool   the trailer, against what came out
+//   is_gzip     data           -> bool
 
-// The iteration; the arithmetic is in crc32.mere, which both this and
-// deflate.mere import so that there is one of it.
 import "./vendor_crc32.mere";
-
-let crc32_buf = fn buf ->
-  let n = bytebuf_len buf in
-  let rec go = fn i -> fn (crc: int) ->
-    if i == n then crc
-    else go (i + 1) (crc_byte crc (bytebuf_get buf i)) in
-  bit_xor (go 0 mask32) mask32;
 
 // ---- bit reader (LSB-first): state vec [pos, bitbuf, bitcnt] -------------
 let br_new = fn (pos: int) ->
@@ -126,24 +115,101 @@ let fixed_dist_lengths = fn () ->
     if i == 30 then v else let _ = vec_push v 5 in go (i + 1) in
   go 0;
 
-// decode one huffman-coded block body into out; returns () at end-of-block
-let inflate_codes = fn s -> fn data -> fn out ->
+// ---- the sink -------------------------------------------------------------
+//
+// The output is not kept. DEFLATE looks back at most 32768 bytes, so that much
+// is all a decompressor needs in hand; everything older goes to the file it
+// was headed for. What is held is a window and one chunk -- constant, whatever
+// the member's size.
+//
+// The chunk is written inside a `region` block, and that block is why this is
+// constant rather than merely smaller. Mere gives memory back at a region
+// boundary and nowhere else, and only for what the BLOCK ITSELF allocated: the
+// `bytes` that file_pwrite_bytes wants is made in there, used, and the block
+// returns a count, so there is nothing to copy out. Without it every chunk
+// ever written would still be held and this would have bought the difference
+// between eight bytes per byte and one, not between linear and flat.
+
+let win_size = 65536;         // twice the furthest a distance can reach
+let chunk_size = 65536;
+
+// [total bytes out, crc accumulator, file offset, bytes in the chunk]
+let snk_total = 0; let snk_crc = 1; let snk_off = 2; let snk_fill = 3;
+let snk_new = fn (u: unit) ->
+  let v = vec_new () in
+  let _ = vec_push v 0 in
+  let _ = vec_push v mask32 in
+  let _ = vec_push v 0 in
+  let _ = vec_push v 0 in
+  v;
+
+// A full chunk, straight out of the buffer it was filled in.
+let snk_full = fn (f) -> fn (chunk) -> fn (st) ->
+  let off = (vec_get st snk_off : int) in
+  let _ = region R { file_pwrite_bytes f off (bytes_of_bytebuf chunk) } in
+  let _ = vec_set st snk_off (off + chunk_size) in
+  let _ = vec_set st snk_fill 0 in
+  0;
+
+// The last, partial one. A byte buffer has no way to be shortened, so the
+// remainder is copied into a right-sized one -- inside the block, so it goes
+// back with everything else the block made.
+let snk_tail = fn (f) -> fn (chunk) -> fn (st) ->
+  let n = (vec_get st snk_fill : int) in
+  if n == 0 then 0
+  else
+    let off = (vec_get st snk_off : int) in
+    let _ = region R {
+              let b = bytebuf_new 0 in
+              let rec go = fn (i: int) ->
+                if i == n then () else let _ = bytebuf_push b (bytebuf_get chunk i) in go (i + 1) in
+              let _ = go 0 in
+              file_pwrite_bytes f off (bytes_of_bytebuf b)
+            } in
+    let _ = vec_set st snk_off (off + n) in
+    let _ = vec_set st snk_fill 0 in
+    n;
+
+// One byte: into the window, into the chunk, into the checksum, counted.
+let snk_put = fn (f) -> fn (win) -> fn (chunk) -> fn (st) -> fn (b: int) ->
+  let t = (vec_get st snk_total : int) in
+  let _ = bytebuf_set win (t % win_size) b in
+  let fill = (vec_get st snk_fill : int) in
+  let _ = bytebuf_set chunk fill b in
+  let _ = vec_set st snk_crc (crc_byte (vec_get st snk_crc : int) b) in
+  let _ = vec_set st snk_total (t + 1) in
+  let _ = vec_set st snk_fill (fill + 1) in
+  if fill + 1 == chunk_size then (let _ = snk_full f chunk st in ()) else ();
+
+// A byte from `dist` back. Read through the window at the CURRENT position,
+// which is what makes an overlapping copy mean what DEFLATE says it means: a
+// run of length 5 at distance 1 repeats one byte five times.
+let snk_back = fn (win) -> fn (st) -> fn (dist: int) ->
+  bytebuf_get win (((vec_get st snk_total : int) - dist) % win_size);
+
+// decode one huffman-coded block body into the sink; returns () at end-of-block
+let inflate_codes = fn s -> fn data -> fn f -> fn win -> fn chunk -> fn sst ->
                     fn lcount -> fn lsyms -> fn dcount -> fn dsyms ->
+  // `copy` is here rather than inside the loop, where it reads better. A
+  // function defined inside a loop body is a CLOSURE BUILT ON EVERY ITERATION,
+  // and its environment is allocated in the default region -- which is given
+  // back when the program ends and not before. At one per length/distance pair
+  // that is millions of them, and it was most of what this decompressor still
+  // held after it stopped holding its output.
+  let rec copy = fn (i: int) -> fn (len: int) -> fn (dist: int) ->
+    if i == len then () else
+    let _ = snk_put f win chunk sst (snk_back win sst dist) in copy (i + 1) len dist in
   let rec loop = fn () ->
     let sym = huff_decode s data lcount lsyms in
     if sym < 256 then
-      let _ = bytebuf_push out sym in loop ()
+      let _ = snk_put f win chunk sst sym in loop ()
     else if sym == 256 then ()
     else
       let li = sym - 257 in
       let len = (vec_get len_base li : int) + br_bits s data (vec_get len_extra li) in
       let dsym = huff_decode s data dcount dsyms in
       let dist = (vec_get dist_base dsym : int) + br_bits s data (vec_get dist_extra dsym) in
-      let from = bytebuf_len out - dist in
-      let rec copy = fn i ->
-        if i == len then () else
-        let _ = bytebuf_push out (bytebuf_get out (from + i)) in copy (i + 1) in
-      let _ = copy 0 in
+      let _ = copy 0 len dist in
       loop () in
   loop ();
 
@@ -196,8 +262,18 @@ let read_dynamic = fn s -> fn data ->
   let _ = split 0 in
   (llen, dlen);
 
-let inflate = fn data -> fn (start: int) ->
-  let out = bytebuf_new 0 in
+// Inflate into a file. Returns (bytes written, CRC-32 of them) -- the two
+// numbers the gzip trailer carries, computed as the bytes go past rather than
+// over a copy that had to be kept for the purpose.
+let inflate_to = fn data -> fn (start: int) -> fn (path: str) ->
+  // file_openrw does not truncate, so a longer file already there would keep
+  // its tail past whatever is written now. Emptying it first is the whole fix
+  // and it is one line.
+  let _ = write_bytes path (bytes_of_bytebuf (bytebuf_new 0)) in
+  let f = file_openrw path in
+  let win = bytebuf_new win_size in
+  let chunk = bytebuf_new chunk_size in
+  let sst = snk_new () in
   let s = br_new start in
   let rec block = fn () ->
     let final = br_bit s data in
@@ -209,20 +285,23 @@ let inflate = fn data -> fn (start: int) ->
         let len = bytebuf_get data (p) + bit_shl (bytebuf_get data (p + 1)) 8 in
         let rec copy = fn i ->
           if i == len then () else
-          let _ = bytebuf_push out (bytebuf_get data (p + 4 + i)) in copy (i + 1) in
+          let _ = snk_put f win chunk sst (bytebuf_get data (p + 4 + i)) in copy (i + 1) in
         let _ = copy 0 in
         vec_set s 0 (p + 4 + len)
       else if btype == 1 then
         let (lc, ls) = huff_build (fixed_lit_lengths ()) in
         let (dc, ds) = huff_build (fixed_dist_lengths ()) in
-        inflate_codes s data out lc ls dc ds
+        inflate_codes s data f win chunk sst lc ls dc ds
       else
         let (llen, dlen) = read_dynamic s data in
         let (lc, ls) = huff_build llen in
         let (dc, ds) = huff_build dlen in
-        inflate_codes s data out lc ls dc ds in
-    if final == 1 then out else block () in
-  block ();
+        inflate_codes s data f win chunk sst lc ls dc ds in
+    if final == 1 then () else block () in
+  let _ = block () in
+  let _ = snk_tail f chunk sst in
+  let _ = file_close f in
+  ((vec_get sst snk_total : int), bit_xor (vec_get sst snk_crc : int) mask32);
 
 // ---- gzip container -------------------------------------------------------
 // Offset of the DEFLATE stream inside a gzip member: past the 10-byte header
@@ -247,14 +326,16 @@ let is_gzip = fn data ->
   && bytebuf_get data (1) == 0x8B
   && bytebuf_get data (2) == 8;
 
-let gunzip = fn data -> inflate data (gzip_body_start data);
+let gunzip_to = fn data -> fn (path: str) -> inflate_to data (gzip_body_start data) path;
 
 // trailer: the last 8 bytes are CRC-32 then ISIZE, both little-endian.
 let gzip_trailer_u32 = fn data -> fn (o: int) ->
   bytebuf_get data (o) + bit_shl (bytebuf_get data (o + 1)) 8
   + bit_shl (bytebuf_get data (o + 2)) 16 + bit_shl (bytebuf_get data (o + 3)) 24;
 
-let gunzip_ok = fn data -> fn out ->
+// The trailer, against what came out. The caller has the two numbers already:
+// they were counted on the way past, so nothing is re-read to check them.
+let gzip_trailer_ok = fn data -> fn (len: int) -> fn (crc: int) ->
   let n = bytebuf_len data in
-  crc32_buf out == gzip_trailer_u32 data (n - 8)
-  && bit_and (bytebuf_len out) mask32 == gzip_trailer_u32 data (n - 4);
+  crc == gzip_trailer_u32 data (n - 8)
+  && bit_and len mask32 == gzip_trailer_u32 data (n - 4);

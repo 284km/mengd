@@ -41,9 +41,12 @@ let apply_layer = fn (imgdir: str) -> fn (dest: str) -> fn (rel: str) -> fn (tmp
       // ints: the latter costs EIGHT bytes per byte, so a 4 MB layer was
       // 32 MB of input and 71 MB of output before anything was written. The
       // measurement that found it is in this repository's README.
+      // The layer goes STRAIGHT to the file. Holding it was the largest
+      // allocation this daemon made, and holding it was never necessary: a
+      // decompressor needs 32 KiB of history and nothing else.
       let data = bytebuf_of_bytes (read_bytes blob) in
-      let plain = if is_gzip data then gunzip data else data in
-      let _ = write_bytes tmp (bytes_of_bytebuf plain) in
+      let _ = if is_gzip data then (let (len, crc) = gunzip_to data tmp in ())
+              else (let _ = write_bytes tmp (bytes_of_bytebuf data) in ()) in
       let n = walk tmp dest true in
       n
     };

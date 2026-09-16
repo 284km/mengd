@@ -1,11 +1,4 @@
-// Vendored from 284km/mtar tar.mere, unmodified.
-// Mere has no package manager yet; re-vendor rather than edit in place.
-// mengd uses mtar to unpack what `docker load` sends -- the same reader that
-// is checked against bsdtar and GNU tar in its own repository.
-//
-// `walk` returns -1 on a refused archive rather than exiting, which is what
-// makes it usable here: a client that uploads a malformed tar must not be
-// able to stop the daemon. fs_last_error () has the reason.
+// Vendored from 284km/mtar tar.mere by tools/vendor-mgz.sh. Do not edit here.
 // tar.mere — a POSIX USTAR reader, scoped to what real container images use.
 //
 // THE SCOPE IS MEASURED, NOT GUESSED. test/CORPUS records the sweep: 7 layers
@@ -224,8 +217,18 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
                     let _ = mkdir_p (dirname out) in
                     let _ = fs_unlink out in
                     if kind == "file" then
-                      let data = file_pread_bytes fh (off + block) size in
-                      let _ = write_bytes out data in
+                      // In a region: the entry's contents are read whole and
+                      // are wanted only for as long as it takes to write them.
+                      // Mere gives memory back at a region boundary and
+                      // nowhere else, so without the block every byte of every
+                      // file in the archive is still held when it finishes --
+                      // which for a container image layer is the whole layer,
+                      // measured at about 9 MB a time in mengd.
+                      let _ = region R {
+                                let data = file_pread_bytes fh (off + block) size in
+                                let _ = write_bytes out data in
+                                0
+                              } in
                       let _ = fs_chmod out mode in ()
                     else if kind == "symlink" then
                       let rc = fs_symlink link out in

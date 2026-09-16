@@ -501,16 +501,26 @@ function called from inside it allocates somewhere else. Every real program is
 functions, which is why wrapping `apply_layer` in a region took the cost from
 246 MB to about 204 MB and no further: the inflate is a helper.
 
-It is still linear: 34 MB per container, never returned, because the region
-gives back only what its own block allocated and the inflate is a helper. The
-remaining fix is to stop holding the whole layer at all — inflate straight into
-the file behind a 32 KiB window — which is a change to the decompressor rather
-than to this daemon.
+Then the decompressor stopped holding the layer at all — it writes to the file
+as it goes, behind a 32 KiB window — and mtar's extractor started reading each
+entry inside a region. **246 MB per container becomes 9.4 MB**, twenty-six
+times less:
 
 ```
-after load:        17788 kB
-after container 1: 42660 kB
-after container 2: 77348 kB
+after load:         9816 kB
+after container 1: 23636 kB
 ...
-after container 6: 212660 kB
+after container 6: 76612 kB     (7.6 MB a container, steady)
 ```
+
+It is still linear, and what is left is measured rather than guessed. Per
+layer, roughly: **one copy of the compressed input**, which survives the region
+it is read inside — not every builtin allocates in the current one — and
+**the Huffman tables of each DEFLATE block**, which `huff_build` makes and
+which are therefore a helper's allocations, where a lexical region cannot reach
+them.
+
+Both are the same shape as the ones already fixed and neither is reachable from
+this daemon: they are the decompressor's, and the next step for them is either
+a region inside `huff_build` or a language that carries the current region
+through a call.
