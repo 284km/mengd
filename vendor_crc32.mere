@@ -1,0 +1,42 @@
+// Vendored from 284km/mgz crc32.mere, unmodified.
+// crc32.mere — the CRC-32 arithmetic, on its own.
+//
+// It is here rather than inside the two files that use it for two reasons.
+//
+// It was written out TWICE, identically, in inflate.mere and deflate.mere. A
+// rule in two places is a rule that can become two rules, and a program that
+// imports both got two definitions of it with the later one quietly winning.
+//
+// And it is the part of this package that a 32-bit backend actually broke.
+// `bit_shr` propagates the sign on every backend, and a CRC accumulator starts
+// as all ones -- so where an int is exactly 32 bits wide it is negative from
+// the first step and the top bit never leaves. This file uses no ByteBuf and
+// no arena, so it still compiles for RV32I and `test/crc32_check.sh` still
+// asks it the question there. The rest of inflate.mere cannot: a byte buffer
+// has no RV32I lowering, and one byte per byte is what a decompressor needs.
+
+// 0xFFFFFFFF does not fit a signed 32-bit int, and one backend has one. Written
+// this way it is the all-ones mask on every width: 2^32 - 1 where an int is
+// wider than 32 bits, and -1 where it is exactly 32, since the shift produces 0
+// there. Both are the right mask for their width.
+let mask32 = bit_shl 1 32 - 1;
+// The sign bit, cleared, which turns the arithmetic right shift into the
+// logical one CRC-32 needs.
+let mask31 = bit_shl 1 31 - 1;
+let shr1 = fn (c: int) -> bit_and (bit_shr c 1) mask31;
+// The reversed CRC-32 polynomial. Its top bit is set, so as one literal it does
+// not fit a signed 32-bit int either; assembled from halves it is the same 32
+// bits on every width.
+let crc_poly = bit_or (bit_shl 0xEDB8 16) 0x8320;
+
+// One byte into an accumulator. Start from mask32 and finish by xor-ing with
+// it again -- which is what both callers do, in their own loop over their own
+// kind of byte sequence.
+let crc_byte = fn (crc: int) -> fn (b: int) ->
+  let x = bit_xor crc b in
+  let rec go = fn i -> fn (c: int) ->
+    if i == 8 then c
+    else go (i + 1) (if bit_and c 1 == 1
+                     then bit_xor (shr1 c) crc_poly
+                     else shr1 c) in
+  go 0 x;

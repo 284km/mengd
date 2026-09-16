@@ -1,4 +1,4 @@
-// Vendored from 284km/mgz inflate.mere, unmodified.
+// Vendored from 284km/mgz inflate.mere, unmodified except for the import path.
 // Mere has no package manager yet; re-vendor rather than edit in place.
 // Image layers arrive gzipped, so mengd unpacks them with mgz -- checked
 // against the system gunzip byte for byte in its own repository, and again
@@ -8,44 +8,27 @@
 // (fixed tables are just a particular set of code lengths).
 //
 // A module: definitions only, no program. `mgunzip.mere` is the CLI.
+// Bytes are held in a ByteBuf -- one byte per byte, with random access, which
+// is what a sliding window needs. A Vec of ints costs EIGHT bytes per byte on
+// a 64-bit backend: a 4 MB gzip member became 32 MB of input and 71 MB of
+// output before a single byte was written anywhere. The stdlib says as much
+// about read_file_bytes ("prefer read_bytes") and nothing here had read it.
+//
 // Exports used by other packages:
-//   inflate     data start   -> vec   raw DEFLATE from a bit offset
+//   inflate     data start   -> ByteBuf   raw DEFLATE from a bit offset
 //   gunzip      data         -> vec   gzip container, header skipped
 //   gunzip_ok   data out     -> bool  verify the CRC-32 / ISIZE trailer
-//   crc32_vec   bytes        -> int
+//   crc32_buf   buf          -> int
 
-// 0xFFFFFFFF does not fit a signed 32-bit int, and one backend has one. Written
-// this way it is the all-ones mask on every width: 2^32 - 1 where an int is
-// wider than 32 bits, and -1 where it is exactly 32, since the shift produces 0
-// there. Both are the right mask for their width.
-let mask32 = bit_shl 1 32 - 1;
-// The sign bit, cleared, which turns the arithmetic right shift into the
-// logical one CRC-32 needs. `bit_shr` propagates the sign on every backend
-// (`bit_shr (0 - 1) 1` is -1), and a CRC accumulator STARTS as all ones -- so
-// where an int is 32 bits wide it is negative from the first step and the top
-// bit never leaves. Masking after the shift removes it. Above 32 bits the
-// accumulator is positive and the mask is a no-op.
-let mask31 = bit_shl 1 31 - 1;
-let shr1 = fn (c: int) -> bit_and (bit_shr c 1) mask31;
-// The reversed CRC-32 polynomial. Its top bit is set, so as one literal it does
-// not fit a signed 32-bit int either; assembled from halves it is the same 32
-// bits on every width (negative where the int is exactly 32 wide, which is
-// what those bits mean there).
-let crc_poly = bit_or (bit_shl 0xEDB8 16) 0x8320;
+// The iteration; the arithmetic is in crc32.mere, which both this and
+// deflate.mere import so that there is one of it.
+import "./vendor_crc32.mere";
 
-let crc_byte = fn (crc: int) -> fn (b: int) ->
-  let x = bit_xor crc b in
-  let rec go = fn i -> fn (c: int) ->
-    if i == 8 then c
-    else go (i + 1) (if bit_and c 1 == 1
-                     then bit_xor (shr1 c) crc_poly
-                     else shr1 c) in
-  go 0 x;
-let crc32_vec = fn bytes ->
-  let n = vec_len bytes in
+let crc32_buf = fn buf ->
+  let n = bytebuf_len buf in
   let rec go = fn i -> fn (crc: int) ->
     if i == n then crc
-    else go (i + 1) (crc_byte crc (vec_get bytes i)) in
+    else go (i + 1) (crc_byte crc (bytebuf_get buf i)) in
   bit_xor (go 0 mask32) mask32;
 
 // ---- bit reader (LSB-first): state vec [pos, bitbuf, bitcnt] -------------
@@ -59,7 +42,7 @@ let br_bit = fn s -> fn data ->
   let cnt = (vec_get s 2 : int) in
   let _ = if cnt == 0 then
       let p = (vec_get s 0 : int) in
-      let _ = vec_set s 1 (vec_get data p) in
+      let _ = vec_set s 1 (bytebuf_get data p) in
       let _ = vec_set s 0 (p + 1) in
       vec_set s 2 8
     else () in
@@ -149,17 +132,17 @@ let inflate_codes = fn s -> fn data -> fn out ->
   let rec loop = fn () ->
     let sym = huff_decode s data lcount lsyms in
     if sym < 256 then
-      let _ = vec_push out sym in loop ()
+      let _ = bytebuf_push out sym in loop ()
     else if sym == 256 then ()
     else
       let li = sym - 257 in
       let len = (vec_get len_base li : int) + br_bits s data (vec_get len_extra li) in
       let dsym = huff_decode s data dcount dsyms in
       let dist = (vec_get dist_base dsym : int) + br_bits s data (vec_get dist_extra dsym) in
-      let from = vec_len out - dist in
+      let from = bytebuf_len out - dist in
       let rec copy = fn i ->
         if i == len then () else
-        let _ = vec_push out (vec_get out (from + i)) in copy (i + 1) in
+        let _ = bytebuf_push out (bytebuf_get out (from + i)) in copy (i + 1) in
       let _ = copy 0 in
       loop () in
   loop ();
@@ -214,7 +197,7 @@ let read_dynamic = fn s -> fn data ->
   (llen, dlen);
 
 let inflate = fn data -> fn (start: int) ->
-  let out = vec_new () in
+  let out = bytebuf_new 0 in
   let s = br_new start in
   let rec block = fn () ->
     let final = br_bit s data in
@@ -223,10 +206,10 @@ let inflate = fn data -> fn (start: int) ->
       if btype == 0 then
         let _ = br_align s in
         let p = (vec_get s 0 : int) in
-        let len = (vec_get data p : int) + bit_shl (vec_get data (p + 1)) 8 in
+        let len = bytebuf_get data (p) + bit_shl (bytebuf_get data (p + 1)) 8 in
         let rec copy = fn i ->
           if i == len then () else
-          let _ = vec_push out (vec_get data (p + 4 + i)) in copy (i + 1) in
+          let _ = bytebuf_push out (bytebuf_get data (p + 4 + i)) in copy (i + 1) in
         let _ = copy 0 in
         vec_set s 0 (p + 4 + len)
       else if btype == 1 then
@@ -245,33 +228,33 @@ let inflate = fn data -> fn (start: int) ->
 // Offset of the DEFLATE stream inside a gzip member: past the 10-byte header
 // and whatever optional EXTRA / NAME / COMMENT / HCRC fields FLG announces.
 let gzip_body_start = fn data ->
-  let flg = (vec_get data 3 : int) in
+  let flg = bytebuf_get data (3) in
   let off10 = 10 in
   let off_extra =
     if bit_and flg 4 != 0 then
-      let xlen = (vec_get data off10 : int) + bit_shl (vec_get data (off10 + 1)) 8 in
+      let xlen = bytebuf_get data (off10) + bit_shl (bytebuf_get data (off10 + 1)) 8 in
       off10 + 2 + xlen
     else off10 in
   let rec skip_z = fn (o: int) ->
-    if (vec_get data o : int) == 0 then o + 1 else skip_z (o + 1) in
+    if bytebuf_get data (o) == 0 then o + 1 else skip_z (o + 1) in
   let off_name = if bit_and flg 8 != 0 then skip_z off_extra else off_extra in
   let off_comm = if bit_and flg 16 != 0 then skip_z off_name else off_name in
   if bit_and flg 2 != 0 then off_comm + 2 else off_comm;
 
 let is_gzip = fn data ->
-  vec_len data >= 18
-  && (vec_get data 0 : int) == 0x1F
-  && (vec_get data 1 : int) == 0x8B
-  && (vec_get data 2 : int) == 8;
+  bytebuf_len data >= 18
+  && bytebuf_get data (0) == 0x1F
+  && bytebuf_get data (1) == 0x8B
+  && bytebuf_get data (2) == 8;
 
 let gunzip = fn data -> inflate data (gzip_body_start data);
 
 // trailer: the last 8 bytes are CRC-32 then ISIZE, both little-endian.
 let gzip_trailer_u32 = fn data -> fn (o: int) ->
-  (vec_get data o : int) + bit_shl (vec_get data (o + 1)) 8
-  + bit_shl (vec_get data (o + 2)) 16 + bit_shl (vec_get data (o + 3)) 24;
+  bytebuf_get data (o) + bit_shl (bytebuf_get data (o + 1)) 8
+  + bit_shl (bytebuf_get data (o + 2)) 16 + bit_shl (bytebuf_get data (o + 3)) 24;
 
 let gunzip_ok = fn data -> fn out ->
-  let n = vec_len data in
-  crc32_vec out == gzip_trailer_u32 data (n - 8)
-  && bit_and (vec_len out) mask32 == gzip_trailer_u32 data (n - 4);
+  let n = bytebuf_len data in
+  crc32_buf out == gzip_trailer_u32 data (n - 8)
+  && bit_and (bytebuf_len out) mask32 == gzip_trailer_u32 data (n - 4);

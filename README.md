@@ -480,9 +480,11 @@ shown it: nothing was wrong that a few more gigabytes did not hide.
 
 Two things cause it, and only one is fixable here.
 
-The size is the vendored inflate's doing: it decompresses into a vector of
-ints, one per byte, so a 4 MB layer becomes about 71 MB of vector — plus the
-doubling as it grows — before a single file is written.
+The size was the vendored inflate's doing: it decompressed into a vector of
+ints, one per byte, so a 4 MB layer became about 71 MB of vector — plus the
+doubling as it grows — before a single file was written. It holds bytes one per
+byte now (`284km/mgz`, and this repository re-vendored it), which took the cost
+from **246 MB per container to 34 MB**.
 
 The lifetime is the language's model, used wrongly. Mere gives memory back at a
 `region R { }` boundary and nowhere else, and `probe/region_reclaim.sh`
@@ -499,6 +501,16 @@ function called from inside it allocates somewhere else. Every real program is
 functions, which is why wrapping `apply_layer` in a region took the cost from
 246 MB to about 204 MB and no further: the inflate is a helper.
 
-The remaining fix is to stop building the vector at all — inflate straight into
-the file — and that is a change to the vendored decompressor rather than to
-this daemon.
+It is still linear: 34 MB per container, never returned, because the region
+gives back only what its own block allocated and the inflate is a helper. The
+remaining fix is to stop holding the whole layer at all — inflate straight into
+the file behind a 32 KiB window — which is a change to the decompressor rather
+than to this daemon.
+
+```
+after load:        17788 kB
+after container 1: 42660 kB
+after container 2: 77348 kB
+...
+after container 6: 212660 kB
+```

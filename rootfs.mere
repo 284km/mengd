@@ -37,9 +37,13 @@ let apply_layer = fn (imgdir: str) -> fn (dest: str) -> fn (rel: str) -> fn (tmp
     // per container, linear, and a daemon in a 1 GiB guest died on the fourth
     // one. The result is a count, so there is nothing to copy out.
     region R {
-      let data = read_file_bytes blob in
+      // read_bytes and a byte buffer, not read_file_bytes and a vector of
+      // ints: the latter costs EIGHT bytes per byte, so a 4 MB layer was
+      // 32 MB of input and 71 MB of output before anything was written. The
+      // measurement that found it is in this repository's README.
+      let data = bytebuf_of_bytes (read_bytes blob) in
       let plain = if is_gzip data then gunzip data else data in
-      let _ = write_file_bytes tmp plain in
+      let _ = write_bytes tmp (bytes_of_bytebuf plain) in
       let n = walk tmp dest true in
       n
     };

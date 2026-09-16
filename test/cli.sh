@@ -75,10 +75,14 @@ say $? "docker info exits 0"
 grep -q "Server Version: 0.1.0" "$out/info.txt"; say $? "it renders the server version"
 
 echo "== refusals name themselves =="
-DOCKER_HOST="unix://$sock" docker ps > "$out/ps.txt" 2>&1
-if [ $? = 0 ]; then echo "  FAIL  docker ps should not have succeeded"; fail=1
-else grep -q "GET /containers/json is not implemented" "$out/ps.txt"
-     say $? "an unimplemented route names the method and path"; fi
+# This used to ask `docker ps`, from when /containers/json was not implemented.
+# It is, and has been for a long time, so the check was asserting the absence
+# of a feature that arrived -- red on every run and telling nobody anything.
+# A route that really is absent is asked instead, and the answer still has to
+# name the method and the path rather than being a bare 404.
+curl -s --unix-socket "$sock" -X POST "http://localhost/v1.43/build" > "$out/refuse.txt" 2>&1
+grep -q "POST /build is not implemented" "$out/refuse.txt"
+say $? "an unimplemented route names the method and path"
 
 echo "== images: load, list, and load the same thing again =="
 fix="$out/fixture.tar"
@@ -121,11 +125,18 @@ if [ -n "$fix" ]; then
     fail=1   # a check that cannot run is not a check that passed
   else
     DOCKER_HOST="unix://$sock" docker load -i "$big" >/dev/null 2>&1
-    DOCKER_HOST="unix://$sock" docker load -i "$fix" >/dev/null 2>&1
-    ins=$(ls -l "$store_dir/incoming.tar" 2>/dev/null | awk '{print $5}')
-    fs=$(ls -l "$fix" | awk '{print $5}')
-    [ "$ins" = "$fs" ]
-    say $? "after a larger archive, the next one is exactly its own size ($ins vs $fs)"
+    DOCKER_HOST="unix://$sock" docker load -i "$fix" > "$out/small.txt" 2>&1
+    # The defect this guards: file_openrw does not truncate, so a smaller
+    # archive written over a larger one kept the larger one's tail and the
+    # manifest at the end was the WRONG one. Staging is per-request now, so the
+    # file cannot be reused -- and this asks the two things that would show it
+    # if it were: the small archive's own tag comes back, and nothing is left
+    # in the store pretending to be an upload.
+    grep -q "Loaded image: alpine:latest" "$out/small.txt"
+    say $? "a smaller archive after a larger one reports its OWN manifest"
+    left=$(ls "$store_dir" 2>/dev/null | grep -c "^incoming" || true)
+    [ "$left" = 0 ]
+    say $? "and no staging file is left behind ($left)"
   fi
 
   curl -s --unix-socket "$sock" "http://localhost/v1.54/images/json" > "$out/images.mine.json"
