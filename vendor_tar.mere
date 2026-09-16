@@ -35,6 +35,8 @@ extern fn fs_clear_error: unit -> int;
 extern fn fs_has_error: unit -> int;
 extern fn fs_rmtree: str -> int;
 extern fn fs_empty_dir: str -> int;
+extern fn fs_is_whiteout: str -> int;
+extern fn fs_opaque_dir: str -> int;
 
 let block = 512;
 
@@ -461,7 +463,13 @@ let w_body = fn (fh) -> fn (st) -> fn (path: str) -> fn (size: int) ->
   let pad = round_up size - size in
   if pad == 0 then 0 else w_put fh st (bytebuf_new pad);
 
-let rec w_walk = fn (fh) -> fn (st) -> fn (root: str) -> fn (rel: str) ->
+// `layer` says the tree being read is the UPPER DIRECTORY of an overlay mount
+// and is to be written as an image layer. It changes two answers and nothing
+// else: a character device 0:0 becomes a `.wh.` file, and a directory carrying
+// trusted.overlay.opaque gets a `.wh..wh..opq` entry. Without it this is a
+// plain directory and a device node is refused, which is what `mtar create`
+// wants and what a layer writer must not do.
+let rec w_walk = fn (fh) -> fn (st) -> fn (layer: bool) -> fn (root: str) -> fn (rel: str) ->
   let full = if str_len rel == 0 then root else join2 root rel in
   if fs_lstat full != 0 then let _ = refuse "cannot stat" full in 0 - 1
   else
@@ -471,7 +479,19 @@ let rec w_walk = fn (fh) -> fn (st) -> fn (root: str) -> fn (rel: str) ->
     let gid = fs_st_gid () in
     let mtime = fs_st_mtime () in
     let size = fs_st_size () in
-    if kind == 3 then
+    if kind == 3 && layer && fs_is_whiteout full == 1 then
+      // A deletion. Written as the image format spells one: an empty file
+      // named .wh.<name> beside where the name was.
+      let d = dirname rel in
+      let bn = basename rel in
+      let wname = if d == "." then wh_prefix ++ bn else d ++ "/" ++ wh_prefix ++ bn in
+      let (wn, wp) = split_name wname in
+      if str_len wn == 0 then let _ = refuse "name too long for a ustar header" wname in 0 - 1
+      else
+        let _ = w_put fh st (w_header wname "0" 0 0 uid gid mtime "") in
+        let _ = vec_set st w_count ((vec_get st w_count : int) + 1) in
+        0
+    else if kind == 3 then
       // Not a file, a directory or a symlink. Refused by name: a device node
       // or a socket written as a regular file is an archive that is wrong in a
       // way no reader can see.
@@ -492,19 +512,27 @@ let rec w_walk = fn (fh) -> fn (st) -> fn (root: str) -> fn (rel: str) ->
         let _ = if kind == 0 then (let _ = w_body fh st full size in ()) else () in
         if kind != 1 then 0
         else
+          // The directory replaces the one below it rather than merging with
+          // it. The marker goes in before the children, so a reader that
+          // applies entries in order clears the old contents first.
+          let _ = if layer && fs_opaque_dir full == 1 then
+                    (let on = rel ++ "/" ++ wh_opaque in
+                     let _ = w_put fh st (w_header on "0" 0 0 uid gid mtime "") in
+                     let _ = vec_set st w_count ((vec_get st w_count : int) + 1) in ())
+                  else () in
           let names = dir_names full in
           let rec each = fn (i: int) ->
             if i >= vec_len names then 0
             else
               let child = if str_len rel == 0 then (vec_get names i : str)
                           else rel ++ "/" ++ (vec_get names i : str) in
-              let r = w_walk fh st root child in
+              let r = w_walk fh st layer root child in
               if r < 0 then r else each (i + 1) in
           each 0;
 
 // Build an archive from a directory. Returns the number of entries, or -1 with
 // the reason in fs_last_error.
-let tar_create = fn (dest: str) -> fn (root: str) ->
+let tar_create_opt = fn (dest: str) -> fn (root: str) -> fn (layer: bool) ->
   let _ = fs_clear_error () in
   // file_openrw does not truncate, so a longer archive already there would
   // keep its tail past the end of this one -- and a tar reader stops at the
@@ -518,10 +546,16 @@ let tar_create = fn (dest: str) -> fn (root: str) ->
   let rec each = fn (i: int) ->
     if i >= vec_len names then 0
     else
-      let r = w_walk fh st root (vec_get names i : str) in
+      let r = w_walk fh st layer root (vec_get names i : str) in
       if r < 0 then r else each (i + 1) in
   let r = each 0 in
   // Two zero blocks end an archive.
   let _ = w_put fh st (bytebuf_new (2 * w_block)) in
   let _ = file_close fh in
   if r < 0 || fs_has_error () == 1 then 0 - 1 else (vec_get st w_count : int);
+
+// A directory is a directory: a device node in it is refused, not translated.
+let tar_create = fn (dest: str) -> fn (root: str) -> tar_create_opt dest root false;
+
+// The upper directory of an overlay mount, written as an image layer.
+let tar_create_layer = fn (dest: str) -> fn (root: str) -> tar_create_opt dest root true;

@@ -634,12 +634,36 @@ into an image somebody else gets to run.
 `DOCKER_BUILDKIT=0` because buildx does not use `POST /build` at all — it wants
 a BuildKit container, which is a different daemon feature and not this one.
 
-**One layer.** A real build writes a layer per step, by taking the difference
-between the filesystem before and after. That wants the runtime to hand back
-the difference — overlayfs, whose upper directory *is* the layer — and this
-does not do that yet, so the whole root filesystem is written as a single
-uncompressed layer. Correct, runnable, and larger than it needs to be. That is
-the next thing to fix, and writing it here is cheaper than finding it later.
+### One layer per step
+
+A layer is the **difference** a step made, and this daemon cannot compute a
+difference. The kernel can: the step runs on an overlay mount, and the upper
+directory holds what changed and nothing else. So every step that can change
+the filesystem — `RUN` and `COPY` — gets its own upper directory, and that
+directory *is* its layer.
+
+The base image's layers are **carried across**, not rebuilt. A layer re-tarred
+from an unpacked tree has different bytes for the same content, and then an
+image and the image it was built `FROM` share nothing however much they have in
+common. The check for it compares the first layer's blob path in both.
+
+Measured on the gate's own Dockerfile (`FROM alpine` + two `RUN` steps writing
+one line each):
+
+| | before | now |
+|---|---|---|
+| layers | 1 | 3 (the base's, then one per step) |
+| the last step's layer | 8,940,544 B | 2,048 B |
+
+Both numbers come from the same check, one of them with the overlay disabled —
+which is also how the fallback stays honest: a machine that cannot mount an
+overlay still builds a correct image, one flat layer, and **says so in the
+build output**. A different shape arrived at silently is the thing to avoid.
+
+Deletions survive the trip because the kernel and the image format are made to
+agree: overlayfs marks a deleted file as a character device `0:0` and a
+replaced directory with `trusted.overlay.opaque`, and mtar translates both into
+the `.wh.` names a layer uses. Applying a layer translates them back.
 
 ### A step that needs the network
 

@@ -220,3 +220,36 @@ int fs_empty_dir(const char *path) {
     closedir(d);
     return rc;
 }
+
+/* ---- reading an overlayfs upper directory --------------------------------
+ *
+ * The upper directory of an overlay mount IS the layer: what the container
+ * changed, and nothing else. But it says "deleted" and "this directory
+ * replaces the one below" in the kernel's spelling, not the image format's,
+ * and the two are not the same alphabet:
+ *
+ *   overlayfs                          image layer
+ *   a character device 0:0             a file called .wh.<name>
+ *   xattr trusted.overlay.opaque=y     a file called .wh..wh..opq inside
+ *
+ * Nothing else in the upper needs translating. A reader that does not
+ * translate writes a device node into the archive -- which mtar refuses, so
+ * the failure is at least loud.
+ */
+int fs_is_whiteout(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    return (S_ISCHR(st.st_mode) && st.st_rdev == 0) ? 1 : 0;
+}
+
+#ifdef __linux__
+#include <sys/xattr.h>
+int fs_opaque_dir(const char *path) {
+    char v[8];
+    ssize_t n = lgetxattr(path, "trusted.overlay.opaque", v, sizeof v);
+    return (n == 1 && v[0] == 'y') ? 1 : 0;
+}
+#else
+/* No overlayfs here, so no upper directory to read and nothing to answer. */
+int fs_opaque_dir(const char *path) { (void)path; return 0; }
+#endif

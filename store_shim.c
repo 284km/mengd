@@ -254,3 +254,38 @@ const char *st_sha256_file(const char *path) {
     hex[64] = 0;
     return hex;
 }
+
+/* ---- overlay mounts ------------------------------------------------------
+ *
+ * A build step's layer is the difference between the filesystem before and
+ * after it ran, and the kernel will compute that difference exactly if the
+ * step runs on an overlay: the upper directory holds what changed and nothing
+ * else. Without it the only honest thing a build can write is the whole root
+ * filesystem as one layer, which is what this daemon did.
+ *
+ * redirect_dir=off and metacopy=off because both of them let the upper
+ * directory describe a change by REFERENCE to the lower one -- a renamed
+ * directory as an xattr pointing at its old path, a chmod as a header with no
+ * data. Neither survives being written out as a tar: the layer would be
+ * correct only while the overlay it came from still existed.
+ */
+#ifdef __linux__
+#include <sys/mount.h>
+int st_mount_overlay(const char *target, const char *opts) {
+    char full[8192];
+    if (snprintf(full, sizeof full, "%s,redirect_dir=off,metacopy=off", opts) >= (int)sizeof full) return -1;
+    return mount("overlay", target, "overlay", 0, full) == 0 ? 0 : -1;
+}
+/* MNT_DETACH as the second try: a step that left a process behind holds the
+ * mount, and a layer read through a mount that is still live is a layer of
+ * whatever that process does next. */
+int st_umount(const char *target) {
+    if (umount(target) == 0) return 0;
+    return umount2(target, MNT_DETACH) == 0 ? 0 : -1;
+}
+#else
+/* No overlayfs. The caller says so in the build output and writes one layer;
+ * it does not pretend the mount happened. */
+int st_mount_overlay(const char *target, const char *opts) { (void)target; (void)opts; return -1; }
+int st_umount(const char *target) { (void)target; return -1; }
+#endif

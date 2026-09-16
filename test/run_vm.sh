@@ -231,6 +231,55 @@ o=\$(timeout 60 docker run --rm --network host mine:v1 2>/dev/null | tr '\\n' ' 
 e=\$(timeout 60 docker run --rm --network host mine:v1 sh -c 'echo \$GREETING' 2>/dev/null)
 [ "\$e" = "hello" ]; say \$? "and the image's ENV is in the container (\$e)"
 
+# ONE LAYER PER STEP. The difference a step made is the upper directory of an
+# overlay mount, and the base image's layers are carried rather than rebuilt.
+# Before this, a build wrote the whole root filesystem as a single layer: the
+# image was correct, ran, and shared nothing with the image it was built FROM.
+grep -q "Writing 2 layers" /var/tmp/build.log
+say \$? "the two RUN steps wrote two layers (\$(grep -o 'Writing [0-9]* layers' /var/tmp/build.log))"
+img=\$(ls -d /var/lib/mengd/images/* 2>/dev/null | while read -r i; do \
+        grep -ql "built-by-mengd" "\$i"/blobs/sha256/* 2>/dev/null && echo "\$i"; done | head -1)
+nl=\$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))[0]['Layers']))" "\$img/manifest.json" 2>/dev/null)
+[ "\$nl" = 3 ]; say \$? "the image has the base's layer plus one per step (\$nl)"
+nd=\$(python3 -c "
+import json,sys,glob
+m=json.load(open(sys.argv[1]+'/manifest.json'))[0]
+c=json.load(open(sys.argv[1]+'/'+m['Config']))
+print(len(c['rootfs']['diff_ids']))" "\$img" 2>/dev/null)
+[ "\$nd" = "\$nl" ]; say \$? "and a diff id for each of them (\$nd)"
+# CARRIED, not rebuilt. The base layer in the built image must be the SAME
+# blob as in the image it was built FROM -- same digest, byte for byte. A layer
+# re-tarred from an unpacked tree has different bytes for the same content, and
+# then the two images share nothing however much they have in common.
+base=\$(ls -d /var/lib/mengd/images/* 2>/dev/null | while read -r i; do \
+        grep -q '"alpine:latest"' "\$i"/manifest.json 2>/dev/null && echo "\$i"; done | head -1)
+b0=\$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/manifest.json'))[0]['Layers'][0])" "\$base" 2>/dev/null)
+m0=\$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/manifest.json'))[0]['Layers'][0])" "\$img" 2>/dev/null)
+[ -n "\$b0" ] && [ "\$b0" = "\$m0" ]
+say \$? "its first layer is the base image's own blob, not a copy with a new digest"
+
+# The point of all of it: a step that writes one line costs one line, not 8 MB.
+top=\$(python3 -c "
+import json,os,sys
+m=json.load(open(sys.argv[1]+'/manifest.json'))[0]
+print(os.path.getsize(sys.argv[1]+'/'+m['Layers'][-1]))" "\$img" 2>/dev/null)
+[ -n "\$top" ] && [ "\$top" -lt 20480 ]
+say \$? "the last step's layer is \$top bytes, not the whole root filesystem"
+
+# A step that DELETES. The layer has to carry the deletion, and it can only say
+# so with a name -- there is no other way to write it down in a tar.
+rm -rf /var/tmp/dctx && mkdir -p /var/tmp/dctx
+cat > /var/tmp/dctx/Dockerfile <<'DF'
+FROM alpine:latest
+RUN echo here > /gone.txt && echo stays > /stays.txt
+RUN rm /gone.txt /etc/motd
+CMD ["sh", "-c", "ls /gone.txt /etc/motd 2>/dev/null; cat /stays.txt"]
+DF
+DOCKER_BUILDKIT=0 timeout 180 docker build -t deleted:v1 /var/tmp/dctx > /var/tmp/build6.log 2>&1
+say \$? "a build whose last step deletes files"
+o=\$(timeout 60 docker run --rm --network host deleted:v1 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "stays " ]; say \$? "the deleted files are gone in a container from it (\$o)"
+
 # A step that fails must fail the build, and say which step.
 cat > /var/tmp/bctx/Dockerfile <<'DF'
 FROM alpine:latest

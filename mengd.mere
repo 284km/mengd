@@ -26,6 +26,8 @@ extern fn mem_to_bytes: int -> int -> bytes;
 extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
+extern fn st_mount_overlay: str -> str -> int;
+extern fn st_umount: str -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_spawn_logged: str -> str -> str -> str -> str -> str -> str -> int;
 extern fn st_px_reset: unit -> int;
@@ -2129,14 +2131,20 @@ let split_slash = fn (p: str) ->
 
 // ---- building ---------------------------------------------------------------
 //
-// FROM and RUN, and the result is ONE layer.
+// FROM, RUN, COPY, ENV, WORKDIR, CMD -- and a layer per step that can change
+// the filesystem.
 //
-// A real build writes a layer per step, by taking the difference between the
-// filesystem before and after. That wants the runtime to hand back the
-// difference -- overlayfs, whose upper directory IS the layer -- and this does
-// not do that yet, so the whole root filesystem is written as a single layer.
-// Correct, runnable, and larger than it needs to be. The limit is written here
-// rather than left to be discovered, and it is the next thing to fix.
+// A layer is the DIFFERENCE a step made, and this daemon cannot compute a
+// difference. The kernel can: the step runs on an overlay mount and the upper
+// directory holds what changed and nothing else. The base image's layers are
+// carried across unchanged, so an image built FROM another one shares its
+// bytes instead of containing a second copy under a different digest.
+//
+// A machine that cannot mount an overlay still builds a correct image -- the
+// whole root filesystem as one layer, which is what this did for every build
+// until now. It says so in the build output. A different shape arrived at
+// silently is the thing worth avoiding; a different shape announced is a
+// smaller machine.
 
 
 
@@ -2274,6 +2282,47 @@ let proxy_env = fn (u: unit) ->
 // A shell form becomes the same argv the runtime is given everywhere else.
 let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
 
+// ---- one layer per step ----------------------------------------------------
+//
+// A layer is the DIFFERENCE a step made, and this daemon has no way to compute
+// a difference. The kernel does: run the step on an overlay mount and the
+// upper directory holds what changed and nothing else.
+//
+// So each step that can change the filesystem gets its own upper directory,
+// and that directory IS its layer. The lower stack is everything decided
+// before it -- the earlier steps newest-first, then the base image.
+
+let ovl_lowers = fn (work: str) -> fn (n: int) ->
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i < 1 then acc
+    else go (i - 1) (acc ++ work ++ "/diff/" ++ show i ++ ":") in
+  go (n - 1) "" ++ work ++ "/lower";
+
+let ovl_mount = fn (work: str) -> fn (n: int) -> fn (merged: str) ->
+  let up = work ++ "/diff/" ++ show n in
+  let wd = work ++ "/ovl/" ++ show n in
+  let _ = mkdir_p up in
+  let _ = mkdir_p wd in
+  let _ = mkdir_p merged in
+  st_mount_overlay merged ("lowerdir=" ++ ovl_lowers work n
+                        ++ ",upperdir=" ++ up ++ ",workdir=" ++ wd);
+
+// Asked once, before the first step, and answered out loud. The machine that
+// cannot mount an overlay can still build a correct image -- one flat layer,
+// which is what this did for every build until now -- but it is a different
+// shape, and a different shape arrived at silently is the thing to avoid.
+let ovl_usable = fn (work: str) ->
+  let m = work ++ "/probe/m" in
+  let _ = mkdir_p (work ++ "/probe/l") in
+  let _ = mkdir_p (work ++ "/probe/u") in
+  let _ = mkdir_p (work ++ "/probe/w") in
+  let _ = mkdir_p m in
+  let rc = st_mount_overlay m ("lowerdir=" ++ work ++ "/probe/l"
+                            ++ ",upperdir=" ++ work ++ "/probe/u"
+                            ++ ",workdir=" ++ work ++ "/probe/w") in
+  let _ = if rc == 0 then (let _ = st_umount m in ()) else () in
+  rc == 0;
+
 let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
               fn (runtime: str) ->
   let tag0 = url_decode (query_param q "t") in
@@ -2307,7 +2356,33 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
       let _ = vec_push st2 "" in       // 2: workdir
       let _ = vec_push st2 "" in       // 3: cmd, as JSON
       let _ = vec_push st2 "" in       // 4: error
+      // The merged view. Its path does not change, because it is what the
+      // runtime is handed and what COPY writes into.
       let rootfs = work ++ "/bundle/rootfs" in
+      // 0: how many layers have been started, 1: is one mounted right now,
+      // 2: can this machine do it at all.
+      let ov = vec_new () in
+      let _ = vec_push ov 0 in
+      let _ = vec_push ov 0 in
+      let _ = vec_push ov (if ovl_usable work then 1 else 0) in
+      let _ = if (vec_get ov 2 : int) == 0 then
+                (let _ = bstream fd ("mengd: no overlay mount here -- "
+                                  ++ "writing the whole root filesystem as one layer") in ())
+              else () in
+      // A step that can change the filesystem runs on its own upper directory.
+      // Begin and end are a pair: a mount left behind would put the NEXT
+      // step's changes in this step's layer.
+      let layer_begin = fn (u: unit) ->
+        if (vec_get ov 2 : int) == 0 then 0
+        else
+          let n = (vec_get ov 0 : int) + 1 in
+          let rc = ovl_mount work n rootfs in
+          if rc != 0 then 0
+          else let _ = vec_set ov 0 n in
+               let _ = vec_set ov 1 1 in n in
+      let layer_end = fn (u: unit) ->
+        if (vec_get ov 1 : int) == 0 then 0
+        else let _ = vec_set ov 1 0 in st_umount rootfs in
       let stepno = vec_new () in
       let _ = vec_push stepno 0 in
       let rec run_steps = fn (i: int) ->
@@ -2327,8 +2402,12 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                if str_len d == 0 then
                  (let _ = vec_set st2 4 ("mengd: no such image: " ++ arg) in ())
                else
-                 let _ = mkdir_p rootfs in
-                 let m = build_rootfs d rootfs in
+                 // With an overlay the base is the LOWER directory and stays
+                 // untouched -- which is what lets the diffs be diffs. Without
+                 // one it is the tree the steps run in, as before.
+                 let into = if (vec_get ov 2 : int) == 1 then work ++ "/lower" else rootfs in
+                 let _ = mkdir_p into in
+                 let m = build_rootfs d into in
                  if m < 0 then (let _ = vec_set st2 4 ("mengd: cannot build a rootfs from " ++ arg) in ())
                  else
                    // What the base image says about the environment it wants.
@@ -2346,6 +2425,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
               (if str_len (vec_get st2 0 : str) == 0 then
                  (let _ = vec_set st2 4 "mengd: RUN before FROM" in ())
                else
+                 let _ = layer_begin () in
                  let bundle = work ++ "/bundle" in
                  // The step's environment: the proxy first, the image's and
                  // the Dockerfile's after, so an ENV in the file overrides it.
@@ -2361,17 +2441,22 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                  let _ = write_file pidf "" in
                  let pid = st_spawn_logged runtime "run" ("build-" ++ uniq) pidf bundle
                                            (work ++ "/step.out") (work ++ "/step.err") in
-                 if pid < 0 then (let _ = vec_set st2 4 "mengd: cannot fork the runtime" in ())
+                 if pid < 0 then (let _ = vec_set st2 4 "mengd: cannot fork the runtime" in
+                                  let _ = layer_end () in ())
                  else
                    let code = st_wait pid in
                    let o = read_file_or (work ++ "/step.out") "" in
                    let e = read_file_or (work ++ "/step.err") "" in
                    let _ = if str_len o > 0 then (let _ = bstream fd (str_trim o) in ()) else () in
                    let _ = if str_len e > 0 then (let _ = bstream fd (str_trim e) in ()) else () in
-                   if code != 0 then
-                     (let _ = vec_set st2 4 ("mengd: the command returned " ++ show code
-                                          ++ ": " ++ arg) in ())
-                   else ())
+                   let _ = if code != 0 then
+                             (let _ = vec_set st2 4 ("mengd: the command returned " ++ show code
+                                                  ++ ": " ++ arg) in ())
+                           else () in
+                   // Unmounted whether the step succeeded or not: a mount left
+                   // behind would put the next step's changes in this layer,
+                   // and on a failure it would be read by the cleanup.
+                   let _ = layer_end () in ())
             else if ins == "ENV" then
               (let eq = str_index_of arg "=" in
                if eq < 0 then
@@ -2453,7 +2538,12 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                              if r < 0 then
                                (let _ = vec_set st2 4 ("mengd: COPY failed: " ++ fs_last_error ()) in r)
                              else each (i + 1) in
-                     let _ = each 0 in ())
+                     // COPY changes the filesystem, so it is a layer too --
+                     // written by this daemon rather than by the runtime, but
+                     // the same difference and the same upper directory.
+                     let _ = layer_begin () in
+                     let _ = each 0 in
+                     let _ = layer_end () in ())
             else if ins == "LABEL" || ins == "MAINTAINER" then ()
             else
               // Refused by name. A Dockerfile whose COPY was ignored builds an
@@ -2465,18 +2555,87 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
         bail (let w = (vec_get st2 4 : str) in if str_len w == 0 then "mengd: the build failed" else w)
       else if str_len (vec_get st2 0 : str) == 0 then bail "mengd: no FROM in the Dockerfile"
       else
-        // One layer: the whole root filesystem.
-        let _ = bstream fd "Writing the layer" in
-        let ltar = work ++ "/layer.tar" in
-        let entries = tar_create ltar rootfs in
-        if entries < 0 then bail ("mengd: cannot write the layer: " ++ fs_last_error ())
-        else
-          let lhex = st_sha256_file ltar in
-          if str_len lhex == 0 then bail "mengd: cannot digest the layer"
+        let dir = work ++ "/img" in
+        let _ = mkdir_p (dir ++ "/blobs/sha256") in
+        // The layers, in order: what the base image already had, then one per
+        // step. Two lists that have to stay in step -- where the blob is, and
+        // what the uncompressed layer hashes to -- so they are built together.
+        let lp = vec_new () in
+        let ld = vec_new () in
+        let err = vec_new () in
+        let _ = vec_push err "" in
+        let _ =
+          if (vec_get ov 2 : int) == 0 then ()
           else
-            let dir = work ++ "/img" in
-            let _ = mkdir_p (dir ++ "/blobs/sha256") in
-            let _ = st_rename ltar (dir ++ "/blobs/sha256/" ++ lhex) in
+            // The base image's layers are CARRIED, not rebuilt. Re-tarring
+            // them would produce different bytes for the same content and the
+            // image would share nothing with the one it was built from.
+            let d = (vec_get st2 0 : str) in
+            let m0 = match jarr (jparse (read_file_or (d ++ "/manifest.json") "")) with
+                     | [] -> Json.JNull
+                     | [h, ...t] -> h in
+            let bl = jarr (jget m0 "Layers") in
+            let bc = jparse (read_file_or (base_config_path d) "") in
+            let bd = jarr (jget (jget bc "rootfs") "diff_ids") in
+            let rec each = fn (xs: Json.json list) -> fn (ys: Json.json list) ->
+              match (xs, ys) with
+              | ([], []) -> ()
+              | ([x, ...xt], [y, ...yt]) ->
+                  let rel = jstr x in
+                  let _ = mkdir_p (dirname (dir ++ "/" ++ rel)) in
+                  let r = copy_file (d ++ "/" ++ rel) (dir ++ "/" ++ rel) in
+                  if r < 0 then
+                    (let _ = vec_set err 0 ("mengd: cannot carry the base layer " ++ rel) in ())
+                  else
+                    let _ = vec_push lp rel in
+                    let _ = vec_push ld (jstr y) in
+                    each xt yt
+              // A base image whose layer list and diff_id list are different
+              // lengths cannot be described: pairing them by position would
+              // give some layer somebody else's digest.
+              | _ -> (let _ = vec_set err 0 ("mengd: the base image lists "
+                                          ++ show (list_len bl) ++ " layers and "
+                                          ++ show (list_len bd) ++ " diff ids") in ()) in
+            each bl bd in
+        let nl = (vec_get ov 0 : int) in
+        let _ =
+          if str_len (vec_get err 0 : str) > 0 then ()
+          else
+            let _ = bstream fd (if (vec_get ov 2 : int) == 1
+                                then "Writing " ++ show nl ++ " layers"
+                                else "Writing the layer") in
+            let rec each = fn (i: int) ->
+              if i > nl then ()
+              else
+                let src = if (vec_get ov 2 : int) == 1 then work ++ "/diff/" ++ show i else rootfs in
+                let ltar = work ++ "/layer-" ++ show i ++ ".tar" in
+                // tar_create_layer, not tar_create: the upper directory of an
+                // overlay says "deleted" with a device node, and this is where
+                // that becomes the .wh. name an image layer uses.
+                let entries = if (vec_get ov 2 : int) == 1 then tar_create_layer ltar src
+                              else tar_create ltar src in
+                if entries < 0 then
+                  (let _ = vec_set err 0 ("mengd: cannot write the layer: " ++ fs_last_error ()) in ())
+                else
+                  let lhex = st_sha256_file ltar in
+                  if str_len lhex == 0 then
+                    (let _ = vec_set err 0 "mengd: cannot digest the layer" in ())
+                  else
+                    let _ = st_rename ltar (dir ++ "/blobs/sha256/" ++ lhex) in
+                    let _ = vec_push lp ("blobs/sha256/" ++ lhex) in
+                    let _ = vec_push ld ("sha256:" ++ lhex) in
+                    each (i + 1) in
+            each (if (vec_get ov 2 : int) == 1 then 1 else 0) in
+        if str_len (vec_get err 0 : str) > 0 then bail (vec_get err 0 : str)
+        else if vec_len lp == 0 then bail "mengd: the build produced no layers"
+        else
+          let jarr_of = fn (v) ->
+            let rec go = fn (i: int) -> fn (acc: str) ->
+              if i >= vec_len v then acc
+              else go (i + 1) (if str_len acc == 0 then s (vec_get v i : str)
+                               else acc ++ "," ++ s (vec_get v i : str)) in
+            "[" ++ go 0 "" ++ "]" in
+          (let _ = 0 in
             let cfgjson =
               obj [("architecture", s "arm64"), ("os", s "linux"),
                    ("config", obj [("Env", raw (vec_get st2 1 : str)),
@@ -2484,7 +2643,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                                 if str_len c == 0 then "[]" else c)),
                                    ("WorkingDir", s (vec_get st2 2 : str))]),
                    ("rootfs", obj [("type", s "layers"),
-                                   ("diff_ids", raw ("[" ++ s ("sha256:" ++ lhex) ++ "]"))])] in
+                                   ("diff_ids", raw (jarr_of ld))])] in
             let cfgp = dir ++ "/blobs/sha256/tmp-config" in
             let _ = write_file cfgp cfgjson in
             let chex = st_sha256_file cfgp in
@@ -2492,21 +2651,28 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
             let full_tag = if str_len tag == 0 then chex else tag in
             let mj = "[\{\"Config\":\"blobs/sha256/" ++ chex ++ "\","
                   ++ "\"RepoTags\":[" ++ s full_tag ++ "],"
-                  ++ "\"Layers\":[" ++ s ("blobs/sha256/" ++ lhex) ++ "]}]" in
+                  ++ "\"Layers\":" ++ jarr_of lp ++ "}]" in
             let _ = write_file (dir ++ "/manifest.json") mj in
             let final = store ++ "/images/" ++ substring chex 0 12 in
             let _ = st_rmtree final in
             let _ = mkdir_p (store ++ "/images") in
             let _ = st_rename dir final in
-            let sz = if file_exists (final ++ "/blobs/sha256/" ++ lhex)
-                     then file_size (final ++ "/blobs/sha256/" ++ lhex) else 0 in
+            // What `docker images` prints. With one layer it was that layer;
+            // with a base image plus a layer per step it is all of them, or
+            // the number shrinks every time the build gets better at sharing.
+            let sz = (let rec go = fn (i: int) -> fn (acc: int) ->
+                        if i >= vec_len lp then acc
+                        else
+                          let f = final ++ "/" ++ (vec_get lp i : str) in
+                          go (i + 1) (acc + (if file_exists f then file_size f else 0)) in
+                      go 0 0) in
             let _ = write_file (index_path store)
                       (read_index store ++ "sha256:" ++ chex ++ "\t" ++ full_tag
                        ++ "\t" ++ final ++ "\t" ++ show sz ++ "\n") in
             let _ = st_rmtree work in
             let _ = bstream fd ("Successfully built " ++ substring chex 0 12) in
             let _ = if str_len tag > 0 then (let _ = bstream fd ("Successfully tagged " ++ tag) in ()) else () in
-            0;
+            0);
 
 let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
              fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
