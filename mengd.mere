@@ -44,6 +44,9 @@ extern fn fs_clear_error: unit -> int;
 extern fn io_set_nonblocking: int -> int;
 extern fn st_rfc3339: int -> str;
 extern fn tcp_connect: str -> int -> int;
+// Declaring this is what makes the C backend link OpenSSL; a build that never
+// mentions TLS does not need it installed.
+extern fn tcp_starttls_verified: int -> str -> str -> int;
 extern fn gen_request_id: unit -> str;
 extern fn sha256_hex: str -> str;
 
@@ -836,7 +839,10 @@ let split_host = fn (ref: str) ->
   let tag = if colon < 0 then "latest" else substring name_ref (colon + 1) (str_len name_ref) in
   let hc = str_index_of host0 ":" in
   let h = if hc < 0 then host0 else substring host0 0 hc in
-  let pt = if hc < 0 then 5000 else int_or (substring host0 (hc + 1) (str_len host0)) 5000 in
+  // 443 when a host is named without a port -- which cannot happen while a
+  // first segment counts as a registry only if it has a colon in it, and is
+  // the right answer for the day that changes.
+  let pt = if hc < 0 then 443 else int_or (substring host0 (hc + 1) (str_len host0)) 443 in
   (h, pt, name, tag);
 
 let accept_types =
@@ -844,6 +850,27 @@ let accept_types =
   ++ "application/vnd.oci.image.manifest.v1+json,"
   ++ "application/vnd.docker.distribution.manifest.list.v2+json,"
   ++ "application/vnd.docker.distribution.manifest.v2+json";
+
+let rec split_on = fn (text: str) -> fn (sep: str) ->
+  if str_len text == 0 then []
+  else
+    let i = str_index_of text sep in
+    if i < 0 then [text]
+    else substring text 0 i :: split_on (substring text (i + str_len sep) (str_len text)) sep;
+
+// Which registries may be spoken to in the clear.
+//
+// HTTPS is the default and plaintext is opt-in, by host and port, the way
+// docker does it -- because the wrong default here is not a slower pull, it is
+// a manifest anyone on the path can replace. MENGD_INSECURE is a list of
+// "host:port"; anything not in it gets a verified TLS handshake.
+let insecure_registry = fn (host: str) -> fn (port: int) ->
+  let want = host ++ ":" ++ show port in
+  let rec go = fn (xs: str list) ->
+    match xs with
+    | [] -> false
+    | [h, ...t] -> if h == want then true else go t in
+  go (split_on (env_or "MENGD_INSECURE") ",");
 
 // One GET, body straight to a file. Returns the Content-Type, or "" on failure.
 let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
@@ -858,25 +885,45 @@ let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
     let _ = fs_fail ("mengd: cannot reach a registry at " ++ host ++ ":" ++ show port
                   ++ " (nothing listening, or this machine cannot resolve that name)") "" in
     ""
+  else if insecure_registry host port == false
+          && tcp_starttls_verified fd host (env_or "MENGD_CA") != 0 then
+    // A refusal, not a fallback. Falling back to plaintext when the
+    // certificate does not check out is the same as not checking it: whoever
+    // can break the handshake can make it fail.
+    let _ = tcp_close fd in
+    let _ = fs_fail ("mengd: cannot verify " ++ host ++ ":" ++ show port
+                  ++ " over TLS. Set MENGD_CA to the certificate authority that"
+                  ++ " signed it, or MENGD_INSECURE to " ++ host ++ ":" ++ show port
+                  ++ " to speak to it in the clear") "" in
+    ""
   else
     let req = "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
            ++ "\r\nAccept: " ++ accept_types ++ "\r\nConnection: close\r\n\r\n" in
     let _ = write_str fd req in
     let buf = mem_alloc 65536 in
     let n0 = tcp_read fd buf 65535 in
-    if n0 <= 0 then let _ = tcp_close fd in ""
+    let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+              print_err ("reg: GET " ++ path ++ " -> first read " ++ show n0 ++ " bytes") else () in
+    if n0 <= 0 then
+      let _ = fs_fail ("mengd: no answer from " ++ host ++ ":" ++ show port
+                    ++ " for " ++ path) "" in
+      let _ = tcp_close fd in ""
     else
       let head = mem_to_str buf n0 in
       let hend = str_index_of head "\r\n\r\n" in
       if hend < 0 then let _ = tcp_close fd in ""
       else
         let status = substring head 9 12 in
+        let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                  print_err ("reg: status " ++ status ++ " type " ++ header_str_of head "Content-Type:") else () in
         let ctype = header_str_of head "Content-Type:" in
         let clen = int_or (header_str_of head "Content-Length:") 0 in
         let st = rd_new n0 (hend + 4) in
         let _ = st_rmtree dest in
         let fh = file_openrw dest in
         let missing = rd_copy fd buf 65535 st fh clen in
+        let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                  print_err ("reg: body " ++ show clen ++ " bytes, " ++ show missing ++ " missing") else () in
         let _ = file_close fh in
         let _ = tcp_close fd in
         if status != "200" then "" else if missing > 0 then "" else ctype;
@@ -1331,13 +1378,6 @@ let port_refusals = fn (spec: Json.json) ->
                    else if str_len acc == 0 then why else acc ++ "; " ++ why) in
        go kvs "")
   | _ -> "";
-
-let rec split_on = fn (text: str) -> fn (sep: str) ->
-  if str_len text == 0 then []
-  else
-    let i = str_index_of text sep in
-    if i < 0 then [text]
-    else substring text 0 i :: split_on (substring text (i + str_len sep) (str_len text)) sep;
 
 // One forwarder per published port, inside the container's own network
 // namespace -- which is why it needs the CONTAINER's pid and not the

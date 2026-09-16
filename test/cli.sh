@@ -23,7 +23,9 @@ echo "== build =="
 "$M" -c "$here/mengd.mere" > "$out/mengd.c" 2> "$out/emit.err" || {
   echo "FAIL: mere -c refused" >&2; sed -n '1,20p' "$out/emit.err" >&2; exit 1; }
 [ -s "$out/mengd.c" ] || { echo "FAIL: emitted C is empty" >&2; exit 1; }
-cc -O1 -o "$out/mengd" "$out/mengd.c" "$here/unix_shim.c" "$here/fs_shim.c" "$here/store_shim.c" 2> "$out/cc.err" || {
+SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
+cc -O1 -o "$out/mengd" "$out/mengd.c" "$here/unix_shim.c" "$here/fs_shim.c" "$here/store_shim.c" \
+   -I"$SSLPREFIX/include" -L"$SSLPREFIX/lib" -lssl -lcrypto 2> "$out/cc.err" || {
   echo "FAIL: cc" >&2; sed -n '1,20p' "$out/cc.err" >&2; exit 1; }
 
 rm -f "$sock"

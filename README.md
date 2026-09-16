@@ -524,3 +524,28 @@ Both are the same shape as the ones already fixed and neither is reachable from
 this daemon: they are the decompressor's, and the next step for them is either
 a region inside `huff_build` or a language that carries the current region
 through a call.
+
+
+## Registries are HTTPS
+
+The default is a verified TLS handshake — certificate chain and hostname — and
+plaintext is opt-in by host and port, the way docker does it:
+
+```sh
+MENGD_INSECURE=127.0.0.1:5000,localhost:5001 mengd /var/run/mengd.sock ...
+MENGD_CA=/etc/ssl/my-ca.pem                  # empty means the system store
+```
+
+The wrong default here is not a slower pull. It is a manifest anyone on the
+path can replace, and the image that comes out of it runs as root.
+
+**A certificate that does not check out is a refusal, not a fallback.** Falling
+back to plaintext when verification fails is the same as not verifying:
+whoever can break the handshake can make it fail. The message names both ways
+out — the authority to trust, or the host and port to speak to in the clear —
+because a daemon that says "cannot fetch the manifest" has told nobody
+anything.
+
+Declaring the TLS primitives is what makes the C backend link OpenSSL. A static
+build wants zlib and zstd with it, which the linker only mentions once it is
+looking for `inflate` and `ZSTD_decompressStream`.

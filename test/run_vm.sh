@@ -20,13 +20,25 @@ MRUN_SRC="${MRUN_SRC:-$here/../mrun}"
 RUNNER="${RUNNER:-colima ssh --}"
 SRC="${SRC:-$here}"
 IMG="${IMG:-gcc:14}"
+# A toolchain image with OpenSSL, built once and cached. mengd links it because
+# it declares the TLS primitives -- a registry may only be spoken to in the
+# clear when it is named in MENGD_INSECURE -- and a static link wants zlib and
+# zstd as well, which the linker only mentions once it is looking for
+# `inflate` and `ZSTD_decompressStream`.
+BUILD_IMG="mengd-build:1"
+docker image inspect "$BUILD_IMG" >/dev/null 2>&1 || docker build -q -t "$BUILD_IMG" - >/dev/null 2>&1 <<DOCKERFILE
+FROM $IMG
+RUN apt-get -qq update && apt-get -qq install -y libssl-dev zlib1g-dev libzstd-dev \
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
 out="$here/.build"; mkdir -p "$out" "$MRUN_SRC/.build"
 
 echo "== build both for linux, static =="
 "$M" -c "$here/mengd.mere" > "$out/mengd.c" 2> "$out/e1" || { echo "FAIL: mengd emit"; sed -n 1,10p "$out/e1"; exit 1; }
 "$M" -c "$MRUN_SRC/mrun.mere" > "$MRUN_SRC/.build/mrun.c" 2> "$out/e2" || { echo "FAIL: mrun emit"; sed -n 1,10p "$out/e2"; exit 1; }
-docker run --rm -v "$here:/w" -w /w "$IMG" \
-  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c || { echo "FAIL: cc mengd"; exit 1; }
+docker run --rm -v "$here:/w" -w /w "$BUILD_IMG" \
+  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c \
+     -lssl -lcrypto -lz -lzstd -ldl -lpthread || { echo "FAIL: cc mengd"; exit 1; }
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" \
   cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c || { echo "FAIL: cc mrun"; exit 1; }
 
@@ -37,7 +49,11 @@ pkill mengd 2>/dev/null; sleep 1
 install -m755 $SRC/.build/mengd-linux /usr/local/bin/mengd
 install -m755 $(cd "$MRUN_SRC" && pwd)/.build/mrun-linux /usr/local/bin/mrun
 rm -rf /var/lib/mengd /var/run/mengd.sock; mkdir -p /var/lib/mengd
-(setsid /usr/local/bin/mengd /var/run/mengd.sock /var/lib/mengd /usr/local/bin/mrun >/var/log/mengd.log 2>&1 &)
+# The registry in this check serves plaintext, and plaintext is opt-in now:
+# HTTPS is the default, by host and port, the way docker does it. Naming it
+# here is the whole of the opt-in, and the default refusing is what makes it
+# worth having.
+(setsid env MENGD_INSECURE=localhost:5000 /usr/local/bin/mengd /var/run/mengd.sock /var/lib/mengd /usr/local/bin/mrun >/var/log/mengd.log 2>&1 &)
 sleep 1
 DOCKER_HOST= docker save alpine:latest -o /var/tmp/mengd-test.tar 2>/dev/null
 export DOCKER_HOST=unix:///var/run/mengd.sock

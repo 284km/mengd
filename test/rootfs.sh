@@ -22,6 +22,7 @@ echo "== build =="
 "$M" -c "$here/mkrootfs.mere" > "$out/mkrootfs.c" 2> "$out/emit.err" || {
   echo "FAIL: mere -c refused" >&2; sed -n 1,20p "$out/emit.err" >&2; exit 1; }
 [ -s "$out/mkrootfs.c" ] || { echo "FAIL: emitted C is empty" >&2; exit 1; }
+SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
 cc -O2 -o "$out/mkrootfs" "$out/mkrootfs.c" "$here/fs_shim.c" "$here/store_shim.c" \
   2> "$out/cc.err" || { echo "FAIL: cc" >&2; sed -n 1,20p "$out/cc.err" >&2; exit 1; }
 
