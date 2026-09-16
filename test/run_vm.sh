@@ -294,10 +294,89 @@ grep -q "returned 3" /var/tmp/build2.log; say \$? "and says what the command ret
 # something and says so nowhere.
 cat > /var/tmp/bctx/Dockerfile <<'DF'
 FROM alpine:latest
-ADD x.tar /app
+VOLUME /data
 DF
 DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v2 /var/tmp/bctx > /var/tmp/build3.log 2>&1
-grep -q "ADD is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+grep -q "VOLUME is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+
+# THE BUILD CACHE. A step's layer is the upper directory of an overlay mount,
+# so the cache can BE that directory: a step that has run before is one whose
+# upper directory is already sitting there, and using it copies and unpacks
+# nothing at all.
+#
+# The sleeps are the instrument. A cache that is not working still produces the
+# right image, so the only thing that can tell them apart is TIME -- and two
+# seconds a step is enough to be unmistakable without making the gate slow.
+rm -rf /var/tmp/kctx && mkdir -p /var/tmp/kctx
+printf 'first\n' > /var/tmp/kctx/data.txt
+cat > /var/tmp/kctx/Dockerfile <<'DF'
+FROM alpine:latest
+RUN sleep 2; echo one > /1
+COPY data.txt /data.txt
+RUN sleep 2; echo two > /2
+CMD ["sh","-c","cat /1 /2 /data.txt"]
+DF
+t0=\$(date +%s)
+DOCKER_BUILDKIT=0 timeout 300 docker build -t k:v1 /var/tmp/kctx > /var/tmp/k1.log 2>&1
+t1=\$(date +%s); cold=\$((t1-t0))
+say \$? "a build with two slow steps (\${cold}s)"
+DOCKER_BUILDKIT=0 timeout 300 docker build -t k:v2 /var/tmp/kctx > /var/tmp/k2.log 2>&1
+t2=\$(date +%s); warm=\$((t2-t1))
+c=\$(grep -c "Using cache" /var/tmp/k2.log)
+[ "\$c" = 3 ]; say \$? "building it again uses the cache for every step (\$c of 3)"
+[ "\$warm" -lt "\$cold" ] && [ "\$warm" -le 2 ]
+say \$? "and takes \${warm}s instead of \${cold}s"
+
+# A changed step invalidates itself and everything after it, and NOTHING
+# before it. That is what a chained key buys.
+sed -i 's/echo two/echo TWO/' /var/tmp/kctx/Dockerfile
+DOCKER_BUILDKIT=0 timeout 300 docker build -t k:v3 /var/tmp/kctx > /var/tmp/k3.log 2>&1
+c=\$(grep -c "Using cache" /var/tmp/k3.log)
+[ "\$c" = 2 ]; say \$? "changing the last step keeps the two before it (\$c of 3)"
+o=\$(timeout 60 docker run --rm k:v3 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "one TWO first " ]; say \$? "and the image has the new answer (\$o)"
+
+# THE CACHE BUG EVERYBODY HAS MET. The COPY line does not change when the file
+# does. Keyed on the line alone, the build hands back the old file forever --
+# it says "Using cache", it is fast, and it is wrong.
+printf 'second\n' > /var/tmp/kctx/data.txt
+DOCKER_BUILDKIT=0 timeout 300 docker build -t k:v4 /var/tmp/kctx > /var/tmp/k4.log 2>&1
+o=\$(timeout 60 docker run --rm k:v4 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "one TWO second " ]; say \$? "a changed FILE with an unchanged COPY line busts the cache (\$o)"
+c=\$(grep -c "Using cache" /var/tmp/k4.log)
+[ "\$c" = 1 ]; say \$? "and only the step before it stayed cached (\$c of 3)"
+
+# ADD. It is COPY plus one thing: a local ARCHIVE is unpacked into the
+# destination. Docker decides that by content and not by the name, so the check
+# gives it an archive whose name says nothing.
+rm -rf /var/tmp/actx && mkdir -p /var/tmp/actx/src/inner
+printf 'plain\n' > /var/tmp/actx/plain.txt
+printf 'from-the-archive\n' > /var/tmp/actx/src/inner/deep.txt
+( cd /var/tmp/actx/src && tar czf ../payload.bin . ) 2>/dev/null
+( cd /var/tmp/actx/src && tar cf ../payload.notar . ) 2>/dev/null
+printf 'BZh9fake\n' > /var/tmp/actx/fake.bz2
+cat > /var/tmp/actx/Dockerfile <<'DF'
+FROM alpine:latest
+ADD plain.txt /plain.txt
+ADD payload.bin /unpacked
+ADD payload.notar /also
+CMD ["sh","-c","cat /plain.txt; cat /unpacked/inner/deep.txt; cat /also/inner/deep.txt"]
+DF
+DOCKER_BUILDKIT=0 timeout 180 docker build -t added:v1 /var/tmp/actx > /var/tmp/build7.log 2>&1
+say \$? "docker build with ADD"
+o=\$(timeout 60 docker run --rm added:v1 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "plain from-the-archive from-the-archive " ]
+say \$? "a file was copied and both archives were unpacked (\$o)"
+
+# What it CANNOT unpack is refused by name. Docker unpacks bzip2, so copying it
+# would be a different Dockerfile with the same text: the image would hold an
+# archive where the build said a tree.
+printf 'FROM alpine:latest\nADD fake.bz2 /x\n' > /var/tmp/actx/Dockerfile
+DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v4 /var/tmp/actx > /var/tmp/build8.log 2>&1
+grep -q "ADD cannot unpack bzip2" /var/tmp/build8.log; say \$? "a compression it cannot unpack is refused by name"
+printf 'FROM alpine:latest\nADD https://example.com/x /x\n' > /var/tmp/actx/Dockerfile
+DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v5 /var/tmp/actx > /var/tmp/build9.log 2>&1
+grep -q "ADD does not fetch a URL" /var/tmp/build9.log; say \$? "and a URL says it is a URL, not a missing file"
 
 # COPY. A directory's CONTENTS go to the destination; a single file may be
 # renamed; the mode comes with it.

@@ -768,3 +768,48 @@ target namespace by fd, because at that moment there is no process in it to name
 Still outside: a container on the default bridge (plain `docker run` keeps an
 isolated namespace), outbound NAT (a guest with no interface reaches the world
 through the proxy instead), and IPv6.
+
+## ADD
+
+`ADD` is `COPY` plus one thing: a local **archive** is unpacked into the
+destination. Docker decides that by **content**, not by the name — a file
+called `x.tar` that is not one is copied, and a file called `blob` that is a
+gzipped tar is unpacked — so this reads the first bytes.
+
+`bzip2` and `xz` are **refused by name**. Docker unpacks them, so copying them
+would be a different Dockerfile with the same text: the image would contain an
+archive where the build said a tree. A URL says it is a URL, rather than
+arriving as "no such file in the build context", which sends the reader looking
+for a file that was never meant to be there.
+
+## The build cache
+
+A step's layer is the upper directory of an overlay mount, so the cache **is**
+that directory. A step that has run before is one whose upper directory is
+already sitting there: using it copies nothing, unpacks nothing and re-runs
+nothing — the next step simply mounts on top of it.
+
+The key **chains**. Each step's key is a digest of the key before it and what
+this step says, so changing a line invalidates it and everything after it and
+nothing before it. `FROM` starts the chain at the base image, because the same
+`RUN` on a different base is a different answer, and instructions that write no
+layer (`ENV`, `WORKDIR`) still go in it — an `ENV` before a `RUN` is part of
+that `RUN`'s answer.
+
+**`COPY` and `ADD` are keyed on the bytes they copy.** The line does not change
+when the file does, and a cache keyed on the line alone hands back the old file
+forever: it says "Using cache", it is fast, and it is wrong. The gate poisons
+exactly that and watches the image come back with the previous file in it.
+
+`done` is written **last**. A directory without it is a step that was
+interrupted, and the next build throws it away rather than believing it — a
+half-finished layer reused is an image with a plausible, wrong filesystem.
+
+Measured on a build with two two-second steps:
+
+| | cold | warm |
+|---|---|---|
+| `docker build` | 4 s | 0 s, 3 of 3 steps cached |
+
+The sleeps are the instrument: a cache that is not working still produces the
+right image, so the only thing that can tell them apart is time.

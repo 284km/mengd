@@ -2528,6 +2528,28 @@ let proxy_env = fn (u: unit) ->
     s ("HTTP_PROXY=" ++ url) ++ "," ++ s ("HTTPS_PROXY=" ++ url) ++ ","
     ++ s ("http_proxy=" ++ url) ++ "," ++ s ("https_proxy=" ++ url);
 
+// What an ADD source is. Docker decides by CONTENT, not by the name: a file
+// called x.tar that is not one is copied, and a file called `blob` that is a
+// gzipped tar is unpacked. So this reads the first bytes.
+//
+// The two compressions this cannot do are REFUSED BY NAME rather than copied.
+// Docker unpacks them, so copying would be a different Dockerfile with the
+// same text -- the image would contain an archive where the build said a tree.
+let add_kind = fn (path: str) ->
+  if not (file_exists path) then "missing"
+  else
+    region R {
+      let b = bytebuf_of_bytes (read_bytes path) in
+      let n = bytebuf_len b in
+      let at = fn (i: int) -> if i < n then bytebuf_get b i else 0 - 1 in
+      if at 0 == 0x1f && at 1 == 0x8b then "gzip"
+      else if at 0 == 0x42 && at 1 == 0x5a && at 2 == 0x68 then "bzip2"
+      else if at 0 == 0xfd && at 1 == 0x37 && at 2 == 0x7a && at 3 == 0x58 && at 4 == 0x5a then "xz"
+      else if n > 262 && at 257 == 0x75 && at 258 == 0x73 && at 259 == 0x74
+              && at 260 == 0x61 && at 261 == 0x72 then "tar"
+      else "file"
+    };
+
 // A shell form becomes the same argv the runtime is given everywhere else.
 let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
 
@@ -2541,20 +2563,49 @@ let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
 // and that directory IS its layer. The lower stack is everything decided
 // before it -- the earlier steps newest-first, then the base image.
 
-let ovl_lowers = fn (work: str) -> fn (n: int) ->
+// The lower stack, newest first, with the base image under all of it. Kept as
+// a list rather than counted from a step number, because a step's layer may
+// come from the CACHE and live somewhere else entirely -- which is the whole
+// mechanism: a cached step is a directory that is already on the stack.
+// One list, kept in the order the layers will be written, and read BACKWARDS
+// here: overlayfs takes its lower directories newest first, and an image lists
+// them oldest first. Two lists of the same thing in two orders is two things
+// to keep in step.
+let ovl_lowers = fn (work: str) -> fn (layers) ->
   let rec go = fn (i: int) -> fn (acc: str) ->
-    if i < 1 then acc
-    else go (i - 1) (acc ++ work ++ "/diff/" ++ show i ++ ":") in
-  go (n - 1) "" ++ work ++ "/lower";
+    if i < 0 then acc
+    else go (i - 1) (acc ++ (vec_get layers i : str) ++ ":") in
+  go (vec_len layers - 1) "" ++ work ++ "/lower";
 
-let ovl_mount = fn (work: str) -> fn (n: int) -> fn (merged: str) ->
-  let up = work ++ "/diff/" ++ show n in
-  let wd = work ++ "/ovl/" ++ show n in
+let ovl_mount_at = fn (work: str) -> fn (lowers) -> fn (up: str) -> fn (merged: str) ->
+  let wd = up ++ "/../work" in
   let _ = mkdir_p up in
   let _ = mkdir_p wd in
   let _ = mkdir_p merged in
-  st_mount_overlay merged ("lowerdir=" ++ ovl_lowers work n
+  st_mount_overlay merged ("lowerdir=" ++ ovl_lowers work lowers
                         ++ ",upperdir=" ++ up ++ ",workdir=" ++ wd);
+
+// ---- the build cache -------------------------------------------------------
+//
+// A step's layer is the upper directory of an overlay mount, so the cache can
+// BE that directory: a step that has been run before is one whose upper
+// directory is already sitting there, and using it costs nothing at all --
+// nothing is copied, unpacked or re-run. The next step simply mounts on top
+// of it.
+//
+// The key chains: each step's key is a digest of the key before it and what
+// this step says, so changing a line invalidates it and everything after it
+// and nothing before it. FROM starts the chain at the base image, because the
+// same RUN on a different base is a different answer.
+//
+// `done` is written LAST. A directory without it is a step that was
+// interrupted, and it is thrown away rather than believed -- a half-finished
+// layer reused is an image with a plausible, wrong filesystem in it.
+let cache_dir = fn (store: str) -> fn (key: str) -> store ++ "/buildcache/" ++ key;
+let cache_hit = fn (store: str) -> fn (key: str) ->
+  file_exists (cache_dir store key ++ "/done");
+let step_key = fn (prev: str) -> fn (line: str) -> fn (extra: str) ->
+  sha256_hex (prev ++ "\n" ++ line ++ "\n" ++ extra);
 
 // Asked once, before the first step, and answered out loud. The machine that
 // cannot mount an overlay can still build a correct image -- one flat layer,
@@ -2608,30 +2659,44 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
       // The merged view. Its path does not change, because it is what the
       // runtime is handed and what COPY writes into.
       let rootfs = work ++ "/bundle/rootfs" in
-      // 0: how many layers have been started, 1: is one mounted right now,
-      // 2: can this machine do it at all.
+      // 0: is a mount live right now, 1: can this machine do it at all.
       let ov = vec_new () in
       let _ = vec_push ov 0 in
-      let _ = vec_push ov 0 in
       let _ = vec_push ov (if ovl_usable work then 1 else 0) in
-      let _ = if (vec_get ov 2 : int) == 0 then
+      let _ = if (vec_get ov 1 : int) == 0 then
                 (let _ = bstream fd ("mengd: no overlay mount here -- "
                                   ++ "writing the whole root filesystem as one layer") in ())
               else () in
-      // A step that can change the filesystem runs on its own upper directory.
-      // Begin and end are a pair: a mount left behind would put the NEXT
-      // step's changes in this step's layer.
-      let layer_begin = fn (u: unit) ->
-        if (vec_get ov 2 : int) == 0 then 0
-        else
-          let n = (vec_get ov 0 : int) + 1 in
-          let rc = ovl_mount work n rootfs in
-          if rc != 0 then 0
-          else let _ = vec_set ov 0 n in
-               let _ = vec_set ov 1 1 in n in
-      let layer_end = fn (u: unit) ->
+      // The layers, in the order they will be written. The mount reads the
+      // same list backwards.
+      let layers = vec_new () in
+      // The chain key. FROM puts the base image in it; every instruction
+      // extends it, including the ones that make no layer -- an ENV before a
+      // RUN changes what that RUN does.
+      let keyv = vec_new () in
+      let _ = vec_push keyv "" in
+      // A step that can change the filesystem runs on its own upper directory,
+      // and that directory is where the cache keeps it. Begin and end are a
+      // pair: a mount left behind would put the NEXT step's changes in this
+      // step's layer.
+      // The cache is made of layers, so a machine that cannot make layers
+      // cannot use it. Without this a build on such a machine would SKIP the
+      // step -- the cached directory is not the tree it is building into.
+      let cached = fn (key: str) ->
+        (vec_get ov 1 : int) == 1 && cache_hit store key in
+      let layer_begin = fn (up: str) ->
         if (vec_get ov 1 : int) == 0 then 0
-        else let _ = vec_set ov 1 0 in st_umount rootfs in
+        else
+          let rc = ovl_mount_at work layers up rootfs in
+          if rc != 0 then 0
+          else let _ = vec_set ov 0 1 in 1 in
+      let layer_end = fn (up: str) ->
+        if (vec_get ov 0 : int) == 0 then 0
+        else
+          let _ = vec_set ov 0 0 in
+          let rc = st_umount rootfs in
+          let _ = vec_push layers up in
+          rc in
       let stepno = vec_new () in
       let _ = vec_push stepno 0 in
       let rec run_steps = fn (i: int) ->
@@ -2654,7 +2719,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                  // With an overlay the base is the LOWER directory and stays
                  // untouched -- which is what lets the diffs be diffs. Without
                  // one it is the tree the steps run in, as before.
-                 let into = if (vec_get ov 2 : int) == 1 then work ++ "/lower" else rootfs in
+                 let into = if (vec_get ov 1 : int) == 1 then work ++ "/lower" else rootfs in
                  let _ = mkdir_p into in
                  let m = build_rootfs d into in
                  if m < 0 then (let _ = vec_set st2 4 ("mengd: cannot build a rootfs from " ++ arg) in ())
@@ -2663,6 +2728,9 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                    let cfgp = base_config_path d in
                    let cj = if str_len cfgp == 0 then Json.JNull else jparse (read_file cfgp) in
                    let bc = jget cj "config" in
+                   // The chain starts at the base image: the same RUN on a
+                   // different base is a different answer.
+                   let _ = vec_set keyv 0 (step_key "" line d) in
                    let _ = vec_set st2 0 d in
                    let _ = vec_set st2 1 (let e = jstrs (jget bc "Env") in
                                           if e == "[]" then
@@ -2674,7 +2742,18 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
               (if str_len (vec_get st2 0 : str) == 0 then
                  (let _ = vec_set st2 4 "mengd: RUN before FROM" in ())
                else
-                 let _ = layer_begin () in
+                 let key = step_key (vec_get keyv 0 : str) line "" in
+                 let _ = vec_set keyv 0 key in
+                 let up = cache_dir store key ++ "/diff" in
+                 if cached key then
+                   // Nothing is copied, unpacked or re-run: the layer is a
+                   // directory that is already there, and the next step mounts
+                   // on top of it.
+                   (let _ = bstream fd " ---> Using cache" in
+                    let _ = vec_push layers up in ())
+                 else
+                 let _ = st_rmtree (cache_dir store key) in
+                 let _ = layer_begin up in
                  let bundle = work ++ "/bundle" in
                  // The step's environment: the proxy first, the image's and
                  // the Dockerfile's after, so an ENV in the file overrides it.
@@ -2691,7 +2770,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                  let pid = st_spawn_logged runtime "run" ("build-" ++ uniq) pidf bundle
                                            (work ++ "/step.out") (work ++ "/step.err") in
                  if pid < 0 then (let _ = vec_set st2 4 "mengd: cannot fork the runtime" in
-                                  let _ = layer_end () in ())
+                                  let _ = layer_end up in ())
                  else
                    let code = st_wait pid in
                    let o = read_file_or (work ++ "/step.out") "" in
@@ -2705,7 +2784,14 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                    // Unmounted whether the step succeeded or not: a mount left
                    // behind would put the next step's changes in this layer,
                    // and on a failure it would be read by the cleanup.
-                   let _ = layer_end () in ())
+                   let _ = layer_end up in
+                   // `done` LAST, and only on success. A directory without it
+                   // is a step that was interrupted, and the next build throws
+                   // it away rather than believing it: a half-finished layer
+                   // reused is an image with a plausible, wrong filesystem.
+                   let _ = if code == 0 && str_len (vec_get st2 4 : str) == 0 then
+                             (let _ = write_file (cache_dir store key ++ "/done") key in ())
+                           else (let _ = st_rmtree (cache_dir store key) in ()) in ())
             else if ins == "ENV" then
               (let eq = str_index_of arg "=" in
                if eq < 0 then
@@ -2719,14 +2805,14 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
             else if ins == "CMD" then
               (let _ = vec_set st2 3 (if str_len arg > 0 && substring arg 0 1 == "["
                                       then arg else shell_argv arg) in ())
-            else if ins == "COPY" then
+            else if ins == "COPY" || ins == "ADD" then
               (if str_len (vec_get st2 0 : str) == 0 then
-                 (let _ = vec_set st2 4 "mengd: COPY before FROM" in ())
+                 (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " before FROM") in ())
                else
                  let ws = df_words arg in
                  let n = vec_len ws in
                  if n < 2 then
-                   (let _ = vec_set st2 4 ("mengd: COPY wants a source and a destination: " ++ arg) in ())
+                   (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " wants a source and a destination: " ++ arg) in ())
                  else
                    let flagged = (let rec any = fn (i: int) ->
                                     if i >= n then false
@@ -2741,11 +2827,11 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                     else any (i + 1) in
                                   any 0) in
                    if flagged then
-                     (let _ = vec_set st2 4 ("mengd: COPY takes no flags here: " ++ arg) in ())
+                     (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " takes no flags here: " ++ arg) in ())
                    else if globbed then
                      // Named rather than taken literally: a pattern copied as
                      // a filename copies nothing and reports success.
-                     (let _ = vec_set st2 4 ("mengd: COPY does not expand patterns: " ++ arg) in ())
+                     (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " does not expand patterns: " ++ arg) in ())
                    else
                      let dest0 = (vec_get ws (n - 1) : str) in
                      // Relative to WORKDIR, the way docker reads it.
@@ -2758,13 +2844,19 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                        if i >= n - 1 then 0
                        else
                          let srel = (vec_get ws i : str) in
-                         if not (inside_ctx srel) then
-                           (let _ = vec_set st2 4 ("mengd: COPY refuses a source outside the"
+                         // ADD takes a URL and this does not fetch one. Named,
+                         // because a URL treated as a path is "no such file in
+                         // the build context", which sends the reader looking
+                         // for a file that was never meant to be there.
+                         if str_index_of srel "://" >= 0 then
+                           (let _ = vec_set st2 4 ("mengd: ADD does not fetch a URL: " ++ srel) in 0 - 1)
+                         else if not (inside_ctx srel) then
+                           (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " refuses a source outside the"
                                                 ++ " build context: " ++ srel) in 0 - 1)
                          else
                            let sabs = work ++ "/ctx/" ++ srel in
                            if not (file_exists sabs) then
-                             (let _ = vec_set st2 4 ("mengd: COPY: no " ++ srel
+                             (let _ = vec_set st2 4 ("mengd: " ++ ins ++ ": no " ++ srel
                                                   ++ " in the build context") in 0 - 1)
                            else
                              let _ = fs_lstat sabs in
@@ -2783,21 +2875,84 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                              let _ = mkdir_p (if is_dir || dir_dest then
                                                 (if is_dir then rootfs ++ dest else rootfs ++ dest)
                                               else dirname target) in
-                             let r = copy_tree sabs target in
+                             let kind = if ins == "ADD" && not is_dir then add_kind sabs else "file" in
+                             // ADD unpacks an archive INTO the destination.
+                             // That is the whole difference from COPY, and it
+                             // is decided by what the file is.
+                             let r =
+                               if kind == "bzip2" || kind == "xz" then
+                                 (let _ = vec_set st2 4 ("mengd: ADD cannot unpack " ++ kind
+                                                      ++ ": " ++ srel) in 0 - 1)
+                               else if kind == "gzip" || kind == "tar" then
+                                 let into = rootfs ++ dest in
+                                 let _ = mkdir_p into in
+                                 let tmp = work ++ "/add.tar" in
+                                 let ok = if kind == "tar" then (let _ = copy_file sabs tmp in 0)
+                                          else region R {
+                                                 let d = bytebuf_of_bytes (read_bytes sabs) in
+                                                 let (len, crc) = gunzip_to d tmp in 0
+                                               } in
+                                 let n2 = walk tmp into true in
+                                 let _ = st_rmtree tmp in
+                                 if n2 < 0 then
+                                   (let _ = vec_set st2 4 ("mengd: ADD could not unpack " ++ srel
+                                                        ++ ": " ++ fs_last_error ()) in 0 - 1)
+                                 else 0
+                               else copy_tree sabs target in
                              if r < 0 then
-                               (let _ = vec_set st2 4 ("mengd: COPY failed: " ++ fs_last_error ()) in r)
+                               (let _ = if str_len (vec_get st2 4 : str) == 0 then
+                                          (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " failed: "
+                                                               ++ fs_last_error ()) in ()) else () in r)
                              else each (i + 1) in
-                     // COPY changes the filesystem, so it is a layer too --
-                     // written by this daemon rather than by the runtime, but
-                     // the same difference and the same upper directory.
-                     let _ = layer_begin () in
-                     let _ = each 0 in
-                     let _ = layer_end () in ())
+                     // COPY and ADD change the filesystem, so they are layers
+                     // too -- written by this daemon rather than by the
+                     // runtime, but the same difference and the same upper
+                     // directory.
+                     //
+                     // Their key has to include what they COPY. The line is
+                     // the same when the file has changed, and a cache keyed
+                     // on the line alone would hand back the old file forever
+                     // -- the one cache bug everybody has met.
+                     let content = (let rec go = fn (i: int) -> fn (acc: str) ->
+                                      if i >= n - 1 then acc
+                                      else
+                                        let sa = work ++ "/ctx/" ++ (vec_get ws i : str) in
+                                        let _ = fs_lstat sa in
+                                        let h = if fs_st_kind () == 1 then
+                                                  (let t = work ++ "/keyhash.tar" in
+                                                   let r = tar_create t sa in
+                                                   let x = if r < 0 then "" else st_sha256_file t in
+                                                   let _ = st_rmtree t in x)
+                                                else st_sha256_file sa in
+                                        go (i + 1) (acc ++ h) in
+                                    go 0 "") in
+                     let key = step_key (vec_get keyv 0 : str) line content in
+                     let _ = vec_set keyv 0 key in
+                     let up = cache_dir store key ++ "/diff" in
+                     if cached key then
+                       (let _ = bstream fd " ---> Using cache" in
+                        let _ = vec_push layers up in ())
+                     else
+                       let _ = st_rmtree (cache_dir store key) in
+                       let _ = layer_begin up in
+                       let r = each 0 in
+                       let _ = layer_end up in
+                       let _ = if r >= 0 && str_len (vec_get st2 4 : str) == 0 then
+                                 (let _ = write_file (cache_dir store key ++ "/done") key in ())
+                               else (let _ = st_rmtree (cache_dir store key) in ()) in ())
             else if ins == "LABEL" || ins == "MAINTAINER" then ()
             else
               // Refused by name. A Dockerfile whose COPY was ignored builds an
               // image that is missing files and says nothing about it.
               (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " is not implemented") in ()) in
+          // An instruction that writes no layer still changes what the next
+          // one does -- an ENV before a RUN is part of that RUN's answer -- so
+          // it goes in the chain. FROM, COPY and ADD have already put
+          // themselves in, with more than the line.
+          let _ = if str_len ins > 0 && ins != "FROM" && ins != "RUN"
+                     && ins != "COPY" && ins != "ADD" then
+                    (let _ = vec_set keyv 0 (step_key (vec_get keyv 0 : str) line "") in ())
+                  else () in
           run_steps (i + 1) in
       let r = run_steps 0 in
       if r < 0 || str_len (vec_get st2 4 : str) > 0 then
@@ -2814,7 +2969,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
         let err = vec_new () in
         let _ = vec_push err "" in
         let _ =
-          if (vec_get ov 2 : int) == 0 then ()
+          if (vec_get ov 1 : int) == 0 then ()
           else
             // The base image's layers are CARRIED, not rebuilt. Re-tarring
             // them would produce different bytes for the same content and the
@@ -2846,22 +3001,22 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                           ++ show (list_len bl) ++ " layers and "
                                           ++ show (list_len bd) ++ " diff ids") in ()) in
             each bl bd in
-        let nl = (vec_get ov 0 : int) in
+        let nl = vec_len layers in
         let _ =
           if str_len (vec_get err 0 : str) > 0 then ()
           else
-            let _ = bstream fd (if (vec_get ov 2 : int) == 1
+            let _ = bstream fd (if (vec_get ov 1 : int) == 1
                                 then "Writing " ++ show nl ++ " layers"
                                 else "Writing the layer") in
             let rec each = fn (i: int) ->
-              if i > nl then ()
+              if i >= (if (vec_get ov 1 : int) == 1 then nl else 1) then ()
               else
-                let src = if (vec_get ov 2 : int) == 1 then work ++ "/diff/" ++ show i else rootfs in
+                let src = if (vec_get ov 1 : int) == 1 then (vec_get layers i : str) else rootfs in
                 let ltar = work ++ "/layer-" ++ show i ++ ".tar" in
                 // tar_create_layer, not tar_create: the upper directory of an
                 // overlay says "deleted" with a device node, and this is where
                 // that becomes the .wh. name an image layer uses.
-                let entries = if (vec_get ov 2 : int) == 1 then tar_create_layer ltar src
+                let entries = if (vec_get ov 1 : int) == 1 then tar_create_layer ltar src
                               else tar_create ltar src in
                 if entries < 0 then
                   (let _ = vec_set err 0 ("mengd: cannot write the layer: " ++ fs_last_error ()) in ())
@@ -2874,7 +3029,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                     let _ = vec_push lp ("blobs/sha256/" ++ lhex) in
                     let _ = vec_push ld ("sha256:" ++ lhex) in
                     each (i + 1) in
-            each (if (vec_get ov 2 : int) == 1 then 1 else 0) in
+            each 0 in
         if str_len (vec_get err 0 : str) > 0 then bail (vec_get err 0 : str)
         else if vec_len lp == 0 then bail "mengd: the build produced no layers"
         else
