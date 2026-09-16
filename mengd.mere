@@ -849,7 +849,15 @@ let accept_types =
 let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
                        fn (dest: str) ->
   let fd = tcp_connect host port in
-  if fd < 0 then ""
+  if fd < 0 then
+    // Named, because the two ways this fails look identical to the client:
+    // nothing is listening there, or this machine cannot turn that name into
+    // an address. A guest with no resolver -- which is where this daemon runs
+    // inside mvm -- only ever meets the second, and "cannot fetch the
+    // manifest" says nothing about either.
+    let _ = fs_fail ("mengd: cannot reach a registry at " ++ host ++ ":" ++ show port
+                  ++ " (nothing listening, or this machine cannot resolve that name)") "" in
+    ""
   else
     let req = "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
            ++ "\r\nAccept: " ++ accept_types ++ "\r\nConnection: close\r\n\r\n" in
@@ -914,7 +922,9 @@ let pull_image = fn (store: str) -> fn (ref: str) ->
     let ct1 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ tag) mtmp in
     if str_len ct1 == 0 then
       let _ = st_rmtree dir in
-      let _ = fs_fail "mengd: cannot fetch the manifest for " ref in
+      // Whatever was recorded on the way down says more than this does.
+      let _ = if str_len (fs_last_error ()) == 0 then
+                (let _ = fs_fail "mengd: cannot fetch the manifest for " ref in ()) else () in
       ""
     else
       // An index is a list of manifests; fetch the one for this platform.
