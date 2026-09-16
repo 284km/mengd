@@ -456,6 +456,7 @@ let jget = fn (o: Json.json) -> fn (k: str) ->
   match o with | Json.JObj kvs -> jassoc kvs k | _ -> Json.JNull;
 let jstr = fn (v: Json.json) -> match v with | Json.JStr x -> x | _ -> "";
 let jbool = fn (v: Json.json) -> match v with | Json.JBool b -> b | _ -> false;
+let jint = fn (v: Json.json) -> match v with | Json.JNum x -> x | _ -> 0;
 let jarr = fn (v: Json.json) -> match v with | Json.JArr xs -> xs | _ -> [];
 let jfirst = fn (v: Json.json) -> match jarr v with | [] -> Json.JNull | [h, ...t] -> h;
 
@@ -2083,6 +2084,30 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
                  go (jarr (jget e "Aliases")) "") in
       let _ = cwrite store id "mounts" mj in
       let _ = cwrite store id "ports" (port_pairs spec) in
+      // What to do when it stops, and how to ask whether it is well. Both are
+      // ordinary compose, and both were read by nothing: `restart:
+      // unless-stopped` was a container that exited once and stayed exited,
+      // and `depends_on: condition: service_healthy` was
+      // "container has no healthcheck configured" about one that did.
+      let _ = cwrite store id "restart"
+                (jstr (jget (jget (jget spec "HostConfig") "RestartPolicy") "Name")) in
+      let _ = cwrite store id "restartmax"
+                (show (jint (jget (jget (jget spec "HostConfig") "RestartPolicy") "MaximumRetryCount"))) in
+      let hc = jget (jget spec "Healthcheck") "Test" in
+      let hc2 = if list_len (jarr hc) > 0 then hc else jget (jget icfg "Healthcheck") "Test" in
+      let hcsrc = if list_len (jarr hc) > 0 then jget spec "Healthcheck"
+                  else jget icfg "Healthcheck" in
+      let _ = cwrite store id "hctest" (jstrs hc2) in
+      // Nanoseconds in the API, seconds here: nothing in this daemon measures
+      // anything finer, and a number that says otherwise invites the belief
+      // that it does.
+      let _ = cwrite store id "hcinterval" (show (let i = jint (jget hcsrc "Interval") / 1000000000 in
+                                                  if i <= 0 then 30 else i)) in
+      let _ = cwrite store id "hcretries" (show (let r = jint (jget hcsrc "Retries") in
+                                                 if r <= 0 then 3 else r)) in
+      let _ = cwrite store id "hcstart" (show (jint (jget hcsrc "StartPeriod") / 1000000000)) in
+      let _ = cwrite store id "health" "" in
+      let _ = cwrite store id "hcstreak" "0" in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
       let _ = tc "created" in
@@ -2511,10 +2536,86 @@ let c_archive_in = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
         (obj [("message", s ("mengd: " ++ fs_last_error ()))])
     else respond fd "200 OK" "text/plain" "";
 
+// ---- health ----------------------------------------------------------------
+//
+// A container says whether it is WELL by answering a command inside itself,
+// which is exec with a schedule. Compose waits on it -- `depends_on:
+// condition: service_healthy` is how a file says "not until the database is
+// up" -- and a daemon that ignores it makes that wait fail with "container has
+// no healthcheck configured" about a container that has one.
+//
+// Three states and they are not opinions: `starting` until it first answers,
+// `healthy` when it does, `unhealthy` after `retries` consecutive failures.
+// The streak is what makes the difference: one failed probe on a busy machine
+// is not an unwell container.
+let hc_run_once = fn (store: str) -> fn (id: str) ->
+  let test = cread store id "hctest" in
+  let xs = jarr (jparse (if str_len test == 0 then "[]" else test)) in
+  let kind = match xs with | [] -> "" | [h, ...t] -> jstr h in
+  let cpid = int_or (cread store id "cpid") 0 in
+  if cpid <= 0 || (kind != "CMD" && kind != "CMD-SHELL") then 0 - 1
+  else
+    let d = store ++ "/hc-" ++ substring id 0 12 in
+    let _ = mkdir_p d in
+    // CMD is an argv; CMD-SHELL is one string for the container's own shell.
+    let rec rest_lines = fn (ys: Json.json list) -> fn (acc: str) ->
+      match ys with
+      | [] -> acc
+      | [h, ...t] -> rest_lines t (acc ++ jstr h ++ "\n") in
+    let argv = match xs with
+               | [] -> ""
+               | [h, ...t] -> if kind == "CMD-SHELL"
+                              then "/bin/sh\n-c\n" ++ rest_lines t ""
+                              else rest_lines t "" in
+    let _ = write_file (d ++ "/argv") argv in
+    let _ = write_file (d ++ "/env") "" in
+    let pid = ex_spawn cpid (d ++ "/argv") (d ++ "/env") "" (d ++ "/out") (d ++ "/err") in
+    if pid < 0 then 0 - 1 else st_wait pid;
+
+let hc_watch = fn (store: str) -> fn (id: str) ->
+  let interval = int_or (cread store id "hcinterval") 30 in
+  let retries = int_or (cread store id "hcretries") 3 in
+  let start = int_or (cread store id "hcstart") 0 in
+  let _ = cwrite store id "health" "starting" in
+  let _ = if start > 0 then (let _ = sleep_ms (start * 1000) in ()) else () in
+  let rec go = fn (streak: int) ->
+    // The loop belongs to the container, so it ends when the container does.
+    if cread store id "state" != "running" then ()
+    else
+      let rc = hc_run_once store id in
+      let s2 = if rc == 0 then 0 else streak + 1 in
+      let _ = cwrite store id "hcstreak" (show s2) in
+      let _ = cwrite store id "health"
+                (if rc == 0 then "healthy"
+                 else if s2 >= retries then "unhealthy"
+                 else if cread store id "health" == "healthy" then "healthy" else "starting") in
+      let _ = sleep_ms (interval * 1000) in
+      go s2 in
+  go 0;
+
+// ---- restarting ------------------------------------------------------------
+//
+// `restart: unless-stopped` is a container that comes back when it falls over,
+// and it was a container that exited once and stayed exited.
+//
+// "unless-stopped" and "always" differ on one thing: whether a container the
+// USER stopped comes back. So stopping records that it was asked for, and this
+// reads it -- without that record the two policies are the same policy.
+let restart_wanted = fn (store: str) -> fn (id: str) -> fn (code: int) -> fn (tries: int) ->
+  let pol = cread store id "restart" in
+  let asked = cread store id "stopwanted" == "1" in
+  let maxr = int_or (cread store id "restartmax") 0 in
+  if asked then false
+  else if pol == "always" || pol == "unless-stopped" then true
+  else if pol == "on-failure" then code != 0 && (maxr <= 0 || tries < maxr)
+  else false;
+
 let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
   let cd = cdir store id in
   let pidfile = cd ++ "/container.pid" in
   let _ = write_file pidfile "" in
+  // A start is a start: whatever was asked for last time is over.
+  let _ = cwrite store id "stopwanted" "0" in
   // The network first, and the container only if it worked. Starting anyway
   // would give something that comes up, looks healthy, and cannot reach the
   // service it was brought up to talk to.
@@ -2557,12 +2658,45 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
     // has started, not when it has finished. The reaping happens on this
     // thread afterwards, which is free once the response is written.
     let _ = respond fd "204 No Content" "text/plain" "" in
-    let code = st_wait pid in
-    let _ = cwrite store id "exit" (show code) in
-    let _ = cwrite store id "state" "exited" in
-    // The container is gone, so its namespace is gone, and a forwarder still
-    // holding a host port would accept connections it can never deliver.
-    let _ = fwd_stop store id in
+    // The health loop runs beside the container, not inside this wait: the
+    // wait ends when the container does and the probe has to happen while it
+    // is alive.
+    let _ = if str_len (cread store id "hctest") > 2 then
+              (let _ = spawn (fn (u: unit) -> hc_watch store id) in ()) else () in
+    // Then the container, again and again for as long as its policy says. Each
+    // turn is a fresh run of the same bundle: a new process, a new namespace,
+    // a new forwarder.
+    let rec supervise = fn (p: int) -> fn (tries: int) ->
+      let code = st_wait p in
+      let _ = cwrite store id "exit" (show code) in
+      let _ = fwd_stop store id in
+      if not (restart_wanted store id code tries) then
+        (let _ = cwrite store id "state" "exited" in ())
+      else
+        // A container that dies instantly would spin this loop as fast as the
+        // machine can fork. One second, which is what a person watching
+        // `docker ps` expects and what docker itself starts at.
+        let _ = cwrite store id "state" "restarting" in
+        let _ = sleep_ms 1000 in
+        if cread store id "stopwanted" == "1" then
+          (let _ = cwrite store id "state" "exited" in ())
+        else
+          let _ = write_file pidfile "" in
+          let neterr2 = if str_len netname > 0 then net_up store id netname else "" in
+          let _ = if str_len neterr2 > 0 then
+                    (let _ = print_err neterr2 in ()) else () in
+          let p2 = st_spawn_logged runtime "run" id pidfile (cd ++ "/bundle")
+                                   (cd ++ "/log.out") (cd ++ "/log.err") in
+          if p2 < 0 then (let _ = cwrite store id "state" "exited" in ())
+          else
+            let _ = cwrite store id "state" "running" in
+            let cp2 = wait_pid 0 in
+            let _ = if cp2 > 0 then (let _ = cwrite store id "cpid" (show cp2) in ()) else () in
+            let _ = if str_len (cread store id "ports") > 0 && cp2 > 0 then
+                      (let _ = cwrite store id "fwdpids"
+                                 (fwd_start store id cp2 (fwd_path ())) in ()) else () in
+            supervise p2 (tries + 1) in
+    let _ = supervise pid 0 in
     ();
 
 // Stop and kill. A container that has already exited is a 304 in the real API
@@ -2571,6 +2705,9 @@ let c_stop = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (sig: int) ->
   if cread store id "state" == "exited" then
     respond fd "304 Not Modified" "text/plain" ""
   else
+    // Recorded before the signal: `unless-stopped` and `always` differ on
+    // exactly this, and without it they are the same policy.
+    let _ = cwrite store id "stopwanted" "1" in
     let pid = int_or (cread store id "pid") 0 in
     let _ = if pid > 0 then st_kill pid sig else 0 in
     respond fd "204 No Content" "text/plain" "";
@@ -2769,7 +2906,18 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
   obj [("Id", s id), ("Created", s (st_rfc3339 (int_or (cread store id "created") 0))),
        ("Path", s (cmd_line store id)), ("Args", raw "[]"),
        ("State", obj [("Status", s state), ("Running", b running),
-                      ("Paused", b false), ("Restarting", b false),
+                      ("Paused", b false), ("Restarting", b (state == "restarting")),
+                      // Only when there IS one. A container with no
+                      // healthcheck must not report a health state, or every
+                      // client believes it has one -- which is the mirror of
+                      // the bug this fixes.
+                      ("Health", raw (let h = cread store id "health" in
+                                      if str_len h == 0 then "null"
+                                      else obj [("Status", s h),
+                                                ("FailingStreak",
+                                                 raw (let f = cread store id "hcstreak" in
+                                                      if str_len f == 0 then "0" else f)),
+                                                ("Log", raw "[]")])),
                       ("OOMKilled", b false), ("Dead", b false),
                       // The CONTAINER's pid when there is one, not the
                       // runtime's. The runtime supervises; the namespaces

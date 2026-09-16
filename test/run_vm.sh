@@ -193,7 +193,7 @@ else
   fail=1
 fi
 
-# Binds. `-v /host:/container` and compose's `volumes:` were read by nothing,
+# Binds. -v /host:/container and compose's volumes: were read by nothing,
 # so both did NOTHING -- a container whose source directory was not there, and
 # a daemon that said it had started. A silent no-op is the worst of the three
 # possible answers.
@@ -244,7 +244,7 @@ grep -q "Successfully tagged mine:v1" /var/tmp/build.log; say \$? "it tagged the
 timeout 20 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^mine:v1\$"
 say \$? "and docker images lists it"
 
-# What the image SAYS, not what the request says. `docker run mine:v1` with no
+# What the image SAYS, not what the request says. docker run mine:v1 with no
 # command has to find the CMD the Dockerfile set, and the ENV with it.
 o=\$(timeout 60 docker run --rm --network host mine:v1 2>/dev/null | tr '\\n' ' ')
 [ "\$o" = "built-by-mengd second-step " ]; say \$? "running it with no command runs the image's CMD (\$o)"
@@ -477,12 +477,66 @@ say \$? "docker compose down"
 grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down removed the network it created"
 # The project's network is gone and the DEFAULT BRIDGE is not. This asked for
 # zero networks before there was a default one; now a container that names no
-# network goes on the bridge, and `compose down` tries to remove it and is
+# network goes on the bridge, and compose down tries to remove it and is
 # refused -- which is what docker does with a pre-defined network.
 n=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^mengdtest_default\$" || true)
 [ "\$n" = 0 ]; say \$? "down removed its own network (\$n left)"
 b=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^bridge\$" || true)
 [ "\$b" = 1 ]; say \$? "and not the default bridge (\$b)"
+
+# HEALTHCHECKS. A container says whether it is WELL by answering a command
+# inside itself. compose waits on it -- depends_on: condition:
+# service_healthy is how a file says "not until the database is up" -- and a
+# daemon that ignores it makes that wait fail with "container has no
+# healthcheck configured" about a container that has one.
+timeout 60 docker run -d --name hc --health-cmd 'test -f /tmp/ready' \
+  --health-interval 2s --health-retries 2 alpine:latest \
+  sh -c 'sleep 6; touch /tmp/ready; sleep 120' >/dev/null 2>&1
+sleep 4
+h1=\$(timeout 20 docker inspect -f '{{.State.Health.Status}}' hc 2>/dev/null)
+[ "\$h1" != "healthy" ]; say \$? "a container that cannot answer yet is not healthy (\$h1)"
+sleep 8
+h2=\$(timeout 20 docker inspect -f '{{.State.Health.Status}}' hc 2>/dev/null)
+[ "\$h2" = "healthy" ]; say \$? "and is once it can (\$h2)"
+timeout 20 docker rm -f hc >/dev/null 2>&1
+
+# A container with NO healthcheck must not report one. The mirror of the bug:
+# a client that sees a health state believes there is a probe behind it.
+timeout 60 docker run -d --name nohc alpine:latest sh -c 'sleep 60' >/dev/null 2>&1
+sleep 2
+hn=\$(timeout 20 docker inspect -f '{{json .State.Health}}' nohc 2>/dev/null)
+[ "\$hn" = "null" ]; say \$? "a container without one reports no health at all (\$hn)"
+timeout 20 docker rm -f nohc >/dev/null 2>&1
+
+# RESTART POLICIES. restart: unless-stopped is a container that comes back
+# when it falls over, and it was a container that exited once and stayed
+# exited. Counted through a BIND MOUNT, not through the log: the log is
+# truncated on each start, so counting its lines says "1" however many times
+# the container ran -- which is what the first measurement of this said.
+rm -rf /var/tmp/rstate && mkdir -p /var/tmp/rstate
+timeout 60 docker run -d --name rp --restart unless-stopped -v /var/tmp/rstate:/s \
+  alpine:latest sh -c 'echo run >> /s/runs; sleep 1' >/dev/null 2>&1
+sleep 8
+n=\$(wc -l < /var/tmp/rstate/runs 2>/dev/null | tr -d ' ')
+[ -n "\$n" ] && [ "\$n" -ge 3 ]; say \$? "a container with restart: unless-stopped came back (\$n runs)"
+timeout 20 docker stop rp >/dev/null 2>&1
+sleep 4
+n2=\$(wc -l < /var/tmp/rstate/runs 2>/dev/null | tr -d ' ')
+sleep 3
+n3=\$(wc -l < /var/tmp/rstate/runs 2>/dev/null | tr -d ' ')
+[ "\$n2" = "\$n3" ]; say \$? "and stopping it stops that (\$n2 then \$n3)"
+st=\$(timeout 20 docker inspect -f '{{.State.Status}}' rp 2>/dev/null)
+[ "\$st" = "exited" ]; say \$? "the container the user stopped stays stopped (\$st)"
+timeout 20 docker rm -f rp >/dev/null 2>&1
+
+# no is the default, and it has to mean no.
+rm -rf /var/tmp/rstate2 && mkdir -p /var/tmp/rstate2
+timeout 60 docker run -d --name rp0 -v /var/tmp/rstate2:/s alpine:latest \
+  sh -c 'echo run >> /s/runs; sleep 1' >/dev/null 2>&1
+sleep 6
+n0=\$(wc -l < /var/tmp/rstate2/runs 2>/dev/null | tr -d ' ')
+[ "\$n0" = 1 ]; say \$? "a container with no policy runs once (\$n0)"
+timeout 20 docker rm -f rp0 >/dev/null 2>&1
 
 # docker exec. A second process inside a container that is already running,
 # which is three requests: one to say what to run, one to run it, one to ask
@@ -567,7 +621,7 @@ o=\$(timeout 60 docker run --rm alpine:latest sh -c "(echo probe | nc -w 3 \$ip1
 timeout 20 docker rm -f br1 >/dev/null 2>&1
 
 # ONE SERVICE REACHING ANOTHER. A network was a directory with an id in it, so
-# `up` succeeded, said nothing, and the services could not find each other --
+# up succeeded, said nothing, and the services could not find each other --
 # the failure this whole daemon keeps producing: correct-looking and silent.
 #
 # The question is asked the way an application asks it: connect to the OTHER

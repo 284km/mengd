@@ -951,3 +951,35 @@ filtered from the start; networks and volumes were not — so `down` deleted
 another project's volume and then tried to delete the default bridge. It is
 refused now, the way docker refuses to remove a pre-defined network, and the
 lists honour the label filter.
+
+## Healthchecks and restart policies
+
+Two more things a compose file says that were read by nothing.
+
+**A container says whether it is well by answering a command inside itself**,
+which is `exec` with a schedule. Compose waits on it — `depends_on: condition:
+service_healthy` is how a file says *not until the database is up* — and a
+daemon that ignores it makes that wait fail with "container has no healthcheck
+configured" about a container that has one.
+
+Three states, and they are not opinions: `starting` until it first answers,
+`healthy` when it does, `unhealthy` after `retries` **consecutive** failures.
+The streak is the whole difference — one failed probe on a busy machine is not
+an unwell container. A container with **no** healthcheck reports no health at
+all, which is the mirror of the same bug: a client that sees a health state
+believes there is a probe behind it.
+
+**`restart: unless-stopped`** is a container that comes back when it falls
+over, and it was a container that exited once and stayed exited. `always` and
+`unless-stopped` differ on exactly one thing — whether a container the *user*
+stopped comes back — so stopping records that it was asked for. Without that
+record the two policies are the same policy.
+
+A container that dies instantly would spin the supervisor as fast as the
+machine can fork, so each turn waits a second first.
+
+**The instrument was wrong before the feature was.** The first measurement
+counted lines in the container's log and got "1" however many times it had run
+— the log is truncated on each start. Counted through a bind mount, the same
+container had run four times. A feature that looks broken is sometimes a
+question asked through a broken instrument.
