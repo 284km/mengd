@@ -887,3 +887,33 @@ name. An archive of the directory's *contents* unpacks into nothing the client
 can find — which is exactly what happened, with no error anywhere. The oracle
 is the real docker: the same directory, copied out of both, has to arrive in
 the same shape.
+
+## docker push
+
+The pull client, backwards. A registry takes a blob at
+`POST /v2/<name>/blobs/uploads/?digest=<d>` with the whole thing as the body —
+the monolithic form, which needs no state on either side — and then the
+manifest at `PUT /v2/<name>/manifests/<ref>`.
+
+The manifest is a **description of blobs that are already there**: media type,
+size and digest for the config and for each layer. It is written from what is
+on disk rather than kept from a pull, because an image that was *built* was
+never described by anybody.
+
+**A blob that is already there is not sent again.** That is the whole economy
+of a registry — the same layer under a hundred images is stored once — and a
+push that uploads it anyway is correct and wasteful.
+
+**What the registry is told a blob is** comes from reading the blob, not from
+remembering: a layer this daemon compressed and one it carried across from a
+pull are both here, and they are different media types.
+
+The oracle is the strongest one available: the **real docker** pulls back what
+this pushed, and runs it. Every part in between — the uploads, the manifest,
+the media types — has to be right for that to work, and none of it is checked
+by looking at our own answers. Poisoned by claiming every blob is already in
+the registry, the pull fails and the container never runs.
+
+The image name has slashes in it, so on this route the **verb is the last
+segment** and the name is everything before it — the other way round from the
+container routes, where the id has none.

@@ -167,6 +167,26 @@ WHDF
   say \$? "the deleted files are gone in the container (\$o)"
   echo "\$o" | grep -q " b " || echo "\$o" | grep -q "b 0"
   say \$? "its sibling and the lower layers survived"
+  # PUSH, with the strongest oracle there is: the REAL docker pulls back what
+  # this daemon pushed, and runs it. Everything in between -- the blob uploads,
+  # the manifest this wrote from what was on disk, the media types -- has to be
+  # right for that to work, and none of it is checked by looking at our own
+  # answers.
+  rm -rf /var/tmp/pctx && mkdir -p /var/tmp/pctx
+  printf 'FROM alpine:latest\nRUN echo pushed-by-mengd > /p.txt\nCMD ["cat","/p.txt"]\n' > /var/tmp/pctx/Dockerfile
+  DOCKER_BUILDKIT=0 timeout 180 docker build -t localhost:5000/gate/pushed:v1 /var/tmp/pctx >/dev/null 2>&1
+  say \$? "built an image to push"
+  timeout 120 docker push localhost:5000/gate/pushed:v1 > /var/tmp/push.log 2>&1
+  say \$? "docker push"
+  grep -q "Pushed" /var/tmp/push.log; say \$? "it reported the layers it sent"
+  grep -q "digest: sha256:" /var/tmp/push.log; say \$? "and the manifest digest"
+  DOCKER_HOST= docker rmi localhost:5000/gate/pushed:v1 >/dev/null 2>&1
+  DOCKER_HOST= timeout 120 docker pull localhost:5000/gate/pushed:v1 >/dev/null 2>&1
+  say \$? "the REAL docker pulls it back out of the registry"
+  o=\$(DOCKER_HOST= timeout 60 docker run --rm localhost:5000/gate/pushed:v1 2>/dev/null | tr -d '\\r\\n')
+  [ "\$o" = "pushed-by-mengd" ]; say \$? "and runs it (\$o)"
+  DOCKER_HOST= docker rmi localhost:5000/gate/pushed:v1 >/dev/null 2>&1
+
   pkill mreg 2>/dev/null || true
 else
   echo "  SKIP  mreg not installed: the pull path is untested"

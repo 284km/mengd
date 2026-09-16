@@ -2210,6 +2210,152 @@ let send_file = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (path: str)
   let _ = file_close fh in
   t;
 
+// ---- push ------------------------------------------------------------------
+//
+// The pull client, backwards. A registry takes a blob at
+// POST /v2/<name>/blobs/uploads/?digest=<d> with the whole thing as the body
+// -- the monolithic form, which needs no state on either side -- and then the
+// manifest at PUT /v2/<name>/manifests/<ref>.
+//
+// The manifest is a DESCRIPTION of blobs that are already there: media type,
+// size and digest for the config and for each layer. It is written here from
+// what is on disk rather than kept from a pull, because an image that was
+// BUILT was never described by anybody.
+
+// A request that carries a file as its body, and the status line that comes
+// back. The body is streamed: a layer-sized string would defeat the point of
+// having written send_file.
+let reg_send_file = fn (host: str) -> fn (port: int) -> fn (verb: str) -> fn (path: str) ->
+                    fn (bearer: str) -> fn (ctype: str) -> fn (body: str) ->
+  let fd = reg_dial host port in
+  if fd < 0 then (0, "")
+  else
+    let sz = if str_len body == 0 then 0 else file_size body in
+    let _ = write_str fd (verb ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
+                       ++ "\r\nUser-Agent: mengd/" ++ mengd_version
+                       ++ (if str_len bearer == 0 then "" else "\r\nAuthorization: Bearer " ++ bearer)
+                       ++ (if str_len ctype == 0 then "" else "\r\nContent-Type: " ++ ctype)
+                       ++ "\r\nContent-Length: " ++ show sz
+                       ++ "\r\nConnection: close\r\n\r\n") in
+    let buf = mem_alloc 65536 in
+    let _ = if sz > 0 then (let _ = send_file fd buf 65536 body in ()) else () in
+    let n0 = tcp_read fd buf 65535 in
+    let head = if n0 <= 0 then "" else mem_to_str buf n0 in
+    let _ = tcp_close fd in
+    let code = (let i = str_index_of head " " in
+                if i < 0 then 0 else int_or (substring head (i + 1) (i + 4)) 0) in
+    (code, head);
+
+// A blob that is already there is not sent again. That is the whole economy of
+// a registry: the same layer under a hundred images is stored once, and a push
+// that uploads it anyway is correct and wasteful.
+let push_blob = fn (host: str) -> fn (port: int) -> fn (name: str) -> fn (bearer: str) ->
+                fn (digest: str) -> fn (path: str) ->
+  let (have, _h) = reg_send_file host port "HEAD" ("/v2/" ++ name ++ "/blobs/" ++ digest)
+                                 bearer "" "" in
+  if have == 200 then 200
+  else
+    let (code, _r) = reg_send_file host port "POST"
+                       ("/v2/" ++ name ++ "/blobs/uploads/?digest=" ++ digest)
+                       bearer "application/octet-stream" path in
+    code;
+
+// What the registry is told a blob IS. Read from the blob, not remembered from
+// somewhere: a layer this daemon compressed and one it carried across from a
+// pull are both here, and they are different media types.
+let media_of_layer = fn (path: str) ->
+  let gz = region R {
+             let b = bytebuf_of_bytes (read_bytes path) in
+             if bytebuf_len b >= 2 && bytebuf_get b 0 == 0x1f && bytebuf_get b 1 == 0x8b then 1 else 0
+           } in
+  if gz == 1 then "application/vnd.docker.image.rootfs.diff.tar.gzip"
+  else "application/vnd.oci.image.layer.v1.tar";
+
+let c_push = fn (fd: int) -> fn (store: str) -> fn (ref0: str) -> fn (q: str) ->
+  let tag0 = url_decode (query_param q "tag") in
+  let ref = if str_len tag0 == 0 then ref0 else ref0 ++ ":" ++ tag0 in
+  let dir = image_dir store ref in
+  let _ = write_str fd ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     ++ "Connection: close\r\n\r\n") in
+  let say = fn (line: str) -> write_str fd (obj [("status", s line)] ++ "\r\n") in
+  let bail = fn (why: str) ->
+    let _ = write_str fd (obj [("errorDetail", obj [("message", s why)]),
+                               ("error", s why)] ++ "\r\n") in 0 - 1 in
+  if str_len dir == 0 then bail ("mengd: no such image: " ++ ref)
+  else
+    let (host, port, name, tag) = split_host ref in
+    if str_len host == 0 then
+      bail ("mengd: " ++ ref ++ " names no registry to push to")
+    else
+      let m0 = match jarr (jparse (read_file_or (dir ++ "/manifest.json") "")) with
+               | [] -> Json.JNull
+               | [h, ...t] -> h in
+      let cfgrel = jstr (jget m0 "Config") in
+      let layers = jarr (jget m0 "Layers") in
+      if str_len cfgrel == 0 then bail ("mengd: " ++ ref ++ " has no config to push")
+      else
+        // The challenge, asked for once. A registry that wants nothing says so
+        // by not challenging, which is what the local one does.
+        let (probe, phead) = reg_send_file host port "GET" ("/v2/") "" "" "" in
+        let bearer = if probe == 401 then bearer_for (header_str_of phead "WWW-Authenticate:") else "" in
+        let _ = say ("The push refers to repository ["
+                  ++ (let i = str_index_of ref "/" in
+                      if i < 0 then host else substring ref 0 i)
+                  ++ "/" ++ name ++ "]") in
+        let err = vec_new () in
+        let _ = vec_push err "" in
+        let descs = vec_new () in
+        let rec each = fn (xs: Json.json list) ->
+          match xs with
+          | [] -> ()
+          | [h, ...t] ->
+              let rel = jstr h in
+              let p = dir ++ "/" ++ rel in
+              let d = "sha256:" ++ (let i = last_index_of_str rel "/" in
+                                    substring rel (i + 1) (str_len rel)) in
+              let code = push_blob host port name bearer d p in
+              if code != 200 && code != 201 && code != 202 then
+                (let _ = vec_set err 0 ("mengd: the registry answered " ++ show code
+                                     ++ " for " ++ d) in ())
+              else
+                let _ = say (substring d 7 19 ++ ": Pushed") in
+                let _ = vec_push descs (obj [("mediaType", s (media_of_layer p)),
+                                             ("size", raw (show (file_size p))),
+                                             ("digest", s d)]) in
+                each t in
+        let _ = each layers in
+        if str_len (vec_get err 0 : str) > 0 then bail (vec_get err 0 : str)
+        else
+          let cp = dir ++ "/" ++ cfgrel in
+          let cd = "sha256:" ++ (let i = last_index_of_str cfgrel "/" in
+                                 substring cfgrel (i + 1) (str_len cfgrel)) in
+          let ccode = push_blob host port name bearer cd cp in
+          if ccode != 200 && ccode != 201 && ccode != 202 then
+            bail ("mengd: the registry answered " ++ show ccode ++ " for the config")
+          else
+            let rec join = fn (i: int) -> fn (acc: str) ->
+              if i >= vec_len descs then acc
+              else join (i + 1) (if str_len acc == 0 then (vec_get descs i : str)
+                                 else acc ++ "," ++ (vec_get descs i : str)) in
+            let mj = obj [("schemaVersion", raw "2"),
+                          ("mediaType", s "application/vnd.docker.distribution.manifest.v2+json"),
+                          ("config", obj [("mediaType", s "application/vnd.docker.container.image.v1+json"),
+                                          ("size", raw (show (file_size cp))),
+                                          ("digest", s cd)]),
+                          ("layers", raw ("[" ++ join 0 "" ++ "]"))] in
+            let mpath = store ++ "/push-" ++ gen_request_id () ++ ".json" in
+            let _ = write_file mpath mj in
+            let (mcode, _mh) = reg_send_file host port "PUT"
+                                 ("/v2/" ++ name ++ "/manifests/" ++ tag) bearer
+                                 "application/vnd.docker.distribution.manifest.v2+json" mpath in
+            let _ = st_rmtree mpath in
+            if mcode != 200 && mcode != 201 && mcode != 202 then
+              bail ("mengd: the registry answered " ++ show mcode ++ " for the manifest")
+            else
+              let _ = say (tag ++ ": digest: sha256:" ++ sha256_hex mj
+                        ++ " size: " ++ show (str_len mj)) in
+              0;
+
 // ---- docker cp -------------------------------------------------------------
 //
 // A container's filesystem is a directory on this machine, so copying in and
@@ -3478,7 +3624,13 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   else if str_index_of path "/images/" == 0 then
     (let rest = seg_after path "/images/" in
      let i = str_index_of rest "/json" in
+     // The image name has slashes in it, so the VERB is the last segment and
+     // the name is everything before it -- the other way round from the
+     // container routes, where the id has none.
+     let p = last_index_of_str rest "/push" in
      if i >= 0 then c_image_inspect fd store (substring rest 0 i)
+     else if p >= 0 && p + 5 == str_len rest then
+       (let _ = c_push fd store (substring rest 0 p) q in ())
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/containers/json" then
