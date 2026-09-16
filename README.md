@@ -765,9 +765,19 @@ veth pair is the one thing with no ioctl, so that part speaks netlink — the on
 message this daemon builds by hand, and it puts the far end straight into the
 target namespace by fd, because at that moment there is no process in it to name.
 
-Still outside: a container on the default bridge (plain `docker run` keeps an
-isolated namespace), outbound NAT (a guest with no interface reaches the world
-through the proxy instead), and IPv6.
+A container that names **no** network goes on the default bridge, which is what
+docker does; before, it got a namespace with a loopback in it and no way to
+reach anything at all. Names are **not** resolved there — also what docker does,
+and the difference that makes creating a network worth doing. A container that
+names a network which does not exist is refused by name rather than quietly
+isolated.
+
+Still outside: **outbound NAT** and IPv6. NAT is not an omission that can be
+filled in here — the machine this daemon is built for has *no network interface
+of its own*, so there is nothing to translate to; a container reaches the
+outside through the proxy, which is the same path a build step uses. On a
+machine that does have a network, `--network host` is the answer until this
+speaks netfilter.
 
 ## ADD
 

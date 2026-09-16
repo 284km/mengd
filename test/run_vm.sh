@@ -458,6 +458,19 @@ grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down
 n=\$(timeout 20 docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "no networks left (\$n)"
 
+# THE DEFAULT BRIDGE. A container that names no network used to get a namespace
+# with a loopback in it and no way to reach anything -- docker puts it on the
+# default bridge, and so does this now. Names are NOT resolved there, which is
+# also what docker does: that difference is the reason to create a network.
+a=\$(timeout 60 docker run --rm alpine:latest sh -c 'ip -o addr show eth0 2>/dev/null | grep -c "10\.88\."' 2>/dev/null)
+[ "\$a" = 1 ]; say \$? "a plain docker run gets an address on the default bridge (\$a)"
+timeout 60 docker run -d --name br1 alpine:latest sh -c 'while true; do echo ON-THE-BRIDGE | nc -l -p 7000; done' >/dev/null 2>&1
+sleep 2
+ip1=\$(timeout 20 docker inspect -f '{{.NetworkSettings.IPAddress}}' br1 2>/dev/null)
+o=\$(timeout 60 docker run --rm alpine:latest sh -c "(echo probe | nc -w 3 \$ip1 7000) || echo NO" 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "ON-THE-BRIDGE" ]; say \$? "and can reach another container on it (\$o)"
+timeout 20 docker rm -f br1 >/dev/null 2>&1
+
 # ONE SERVICE REACHING ANOTHER. A network was a directory with an id in it, so
 # `up` succeeded, said nothing, and the services could not find each other --
 # the failure this whole daemon keeps producing: correct-looking and silent.

@@ -1609,6 +1609,38 @@ let net_is_user = fn (store: str) -> fn (mode: str) ->
   str_len mode > 0 && mode != "host" && mode != "none" && mode != "default"
   && mode != "bridge" && file_exists (ndir store mode ++ "/id");
 
+// A network that exists because something asked to be on it. `docker network
+// create` makes one explicitly; the DEFAULT BRIDGE is made the first time a
+// container that named no network starts, which is the only moment anyone
+// knows it is wanted.
+let net_ensure = fn (store: str) -> fn (name: str) ->
+  let d = ndir store name in
+  if file_exists (d ++ "/id") then name
+  else
+    let _ = mkdir_p d in
+    let _ = write_file (d ++ "/id") (sha256_hex (name ++ show (unix_time ()))) in
+    let _ = write_file (d ++ "/labels") "\{}" in
+    let _ = write_file (d ++ "/created") (show (unix_time ())) in
+    let _ = write_file (d ++ "/octet") (show (net_next_octet store)) in
+    name;
+
+// The network a container ends up on.
+//
+// "host" and "none" are not networks. Anything this daemon has a record for is
+// itself. Everything else -- nothing, "default", "bridge" -- is the default
+// bridge, which is what docker gives a container that asked for nothing; the
+// alternative, and what this did, is a namespace with a loopback in it and no
+// way to reach anything at all.
+//
+// A name that is none of those is a network the client believes exists. It
+// gets "" here and c_create refuses it BY NAME rather than quietly handing
+// back an isolated container.
+let net_effective = fn (store: str) -> fn (mode: str) ->
+  if mode == "host" || mode == "none" then ""
+  else if net_is_user store mode then mode
+  else if str_len mode == 0 || mode == "default" || mode == "bridge" then "bridge"
+  else "";
+
 let net_body = fn (store: str) -> fn (name: str) -> fn (with_status: bool) ->
   let id = read_file_or (ndir store name ++ "/id") "" in
   let base = [("Name", s name), ("Id", s id),
@@ -1983,13 +2015,18 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let (bj, mj) = binds_json store spec in
       // The namespace this container will be put in, named now because the
       // bundle is written now. It does not exist yet -- start makes it.
-      let netns = if net_is_user store netmode then netns_path id else "" in
+      let netname = net_effective store netmode in
+      let _ = if str_len netname == 0 && netmode != "host" && netmode != "none"
+                 && str_len netmode > 0 then
+                (let _ = print_err ("mengd: no such network: " ++ netmode) in ()) else () in
+      let netns = if str_len netname > 0 then netns_path id else "" in
       // The address is reserved here and not at start: compose creates every
       // service before it starts any of them, so by the time the first one
       // runs, every name in the file has an address to be resolved to.
-      let _ = if net_is_user store netmode then
-                (let _ = cwrite store id "net" netmode in
-                 let _ = cwrite store id "ip" (net_lease store netmode id) in ())
+      let _ = if str_len netname > 0 then
+                (let _ = net_ensure store netname in
+                 let _ = cwrite store id "net" netname in
+                 let _ = cwrite store id "ip" (net_lease store netname id) in ())
               else () in
       let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj netns in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
@@ -2139,7 +2176,12 @@ let net_up = fn (store: str) -> fn (id: str) -> fn (name: str) ->
           else if nw_config_in ns "eth0" ip "255.255.255.0" gw != 0 then
             "mengd: " ++ nw_last_error ()
           else
-            let _ = net_hosts store name in
+            // Names, but only on a network somebody asked for. Docker's
+            // default bridge resolves no container names either -- that is the
+            // difference between it and a network you created, and inventing
+            // the difference away would make `docker run --network x` and a
+            // plain `docker run` behave the same when they do not.
+            let _ = if name != "bridge" then net_hosts store name else () in
             "";
 
 let net_down = fn (store: str) -> fn (id: str) ->
@@ -2155,8 +2197,8 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
   // The network first, and the container only if it worked. Starting anyway
   // would give something that comes up, looks healthy, and cannot reach the
   // service it was brought up to talk to.
-  let netmode = cread store id "netmode" in
-  let neterr = if net_is_user store netmode then net_up store id netmode else "" in
+  let netname = cread store id "net" in
+  let neterr = if str_len netname > 0 then net_up store id netname else "" in
   if str_len neterr > 0 then
     respond fd "500 Internal Server Error" "application/json" (obj [("message", s neterr)])
   else
