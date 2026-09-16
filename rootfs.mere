@@ -29,11 +29,20 @@ let apply_layer = fn (imgdir: str) -> fn (dest: str) -> fn (rel: str) -> fn (tmp
   let blob = imgdir ++ "/" ++ rel in
   if not (file_exists blob) then 0 - 1
   else
-    let data = read_file_bytes blob in
-    let plain = if is_gzip data then gunzip data else data in
-    let _ = write_file_bytes tmp plain in
-    let n = walk tmp dest true in
-    n;
+    // In a region, because this is the largest allocation this daemon makes
+    // and Mere only gives memory back at a region boundary. The layer arrives
+    // as bytes and is inflated into a vector of ints -- eight bytes per byte
+    // of image -- so a 4 MB layer costs about 246 MB while it is being
+    // applied. Without the block that cost is permanent: measured at +246 MB
+    // per container, linear, and a daemon in a 1 GiB guest died on the fourth
+    // one. The result is a count, so there is nothing to copy out.
+    region R {
+      let data = read_file_bytes blob in
+      let plain = if is_gzip data then gunzip data else data in
+      let _ = write_file_bytes tmp plain in
+      let n = walk tmp dest true in
+      n
+    };
 
 // Returns the number of entries applied, or -1 if the image has no manifest.
 let build_rootfs = fn (imgdir: str) -> fn (dest: str) ->

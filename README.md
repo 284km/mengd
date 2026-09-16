@@ -439,3 +439,66 @@ The accept loop does not change: `accept(2)` does not care which family the
 listening fd came from, so this is one call rather than a second socket layer.
 [mvm](https://github.com/284km/mvm) is the VMM on the other end of it, and its
 `test/stack.sh` runs a real `docker` client against a mengd started this way.
+
+
+## Published ports
+
+A container that listens is reached through a forwarder, one per published
+port, started when the container starts and stopped when it exits:
+
+```
+mengd: forwarding vsock 18080 to 8080 in the container (pid 115)
+```
+
+The forwarder runs **inside the container's own network namespace**, which is
+why it needs the container's pid and not the runtime's — the runtime
+supervises, and the namespaces belong to its child. `mrun` writes that pid to a
+file for the same reason nothing else could find it.
+
+The vsock port is the published **host** port. That convention needs no
+agreement between the two ends: whoever opened the host's end already chose
+that number. What cannot be done is refused by name in the create response
+rather than accepted and dropped — a `udp` publish comes back as
+`mengd cannot publish 9999/udp (only tcp is forwarded)`, where before it came
+back as success with nothing listening.
+
+## Memory: where Mere gives it back
+
+This daemon had run for months in a virtual machine with 10 GB. In one with
+1 GiB it died on the fourth container. The measurement was unambiguous:
+
+```
+after load:        17776 kB
+after container 1: 214776 kB
+after container 2: 477224 kB
+...
+after container 6: 1461420 kB
+```
+
+**+246 MB per container, linear, never returned.** A big machine could not have
+shown it: nothing was wrong that a few more gigabytes did not hide.
+
+Two things cause it, and only one is fixable here.
+
+The size is the vendored inflate's doing: it decompresses into a vector of
+ints, one per byte, so a 4 MB layer becomes about 71 MB of vector — plus the
+doubling as it grows — before a single file is written.
+
+The lifetime is the language's model, used wrongly. Mere gives memory back at a
+`region R { }` boundary and nowhere else, and `probe/region_reclaim.sh`
+measures exactly where:
+
+| | five rounds of 2M elements |
+|---|---|
+| plain | 19 MB → 103 MB, nothing returned |
+| inside a `region` block | 17 MB → 32 MB, then flat |
+| a helper CALLED from inside a `region` block | 19 MB → 103 MB, nothing returned |
+
+**Reclamation is lexical.** A region gives back what the block allocates; a
+function called from inside it allocates somewhere else. Every real program is
+functions, which is why wrapping `apply_layer` in a region took the cost from
+246 MB to about 204 MB and no further: the inflate is a helper.
+
+The remaining fix is to stop building the vector at all — inflate straight into
+the file — and that is a change to the vendored decompressor rather than to
+this daemon.

@@ -1,0 +1,50 @@
+// probe/region_reclaim.mere — where Mere gives memory back, and where it does not.
+//
+// This exists because a daemon that had run for months in a 10 GB virtual
+// machine died on the fourth container in a 1 GiB one. The measurement said
+// +246 MB per container, linear, never returned -- and the big machine could
+// never have shown it. It is a probe rather than a test: it answers a question
+// about the language, and the answer decides how this daemon is written.
+//
+//   region_reclaim <rounds> <elements> <inline|region|region-call>
+//
+// Each round allocates the same amount and lets it go. Flat means reclaimed.
+extern fn rss_kb: unit -> int;
+
+let churn = fn (n: int) ->
+  let v = vec_new () in
+  let rec go = fn (i: int) -> if i == n then () else let _ = vec_push v i in go (i + 1) in
+  let _ = go 0 in
+  vec_len v;
+
+// The same work, lexically inside a region block.
+let churn_region = fn (n: int) ->
+  region R {
+    let v = vec_new () in
+    let rec go = fn (i: int) -> if i == n then () else let _ = vec_push v i in go (i + 1) in
+    let _ = go 0 in
+    vec_len v
+  };
+
+// A region block whose work happens in a function CALLED from inside it --
+// which is what every real program looks like, and what this daemon's layer
+// unpacking is.
+let churn_region_call = fn (n: int) ->
+  region R { churn n };
+
+let run = fn (rounds: int) -> fn (n: int) -> fn (mode: str) ->
+  let _ = print_err ("mode " ++ mode ++ ", round 0: " ++ show (rss_kb ()) ++ " kB") in
+  let rec loop = fn (r: int) ->
+    if r == rounds then ()
+    else
+      let _ = if mode == "region" then (let _ = churn_region n in ())
+              else if mode == "region-call" then (let _ = churn_region_call n in ())
+              else (let _ = churn n in ()) in
+      let _ = print_err ("mode " ++ mode ++ ", round " ++ show (r + 1) ++ ": "
+                      ++ show (rss_kb ()) ++ " kB") in
+      loop (r + 1) in
+  loop 0;
+
+match args () with
+| [rounds, n, mode] -> run (int_of_str rounds) (int_of_str n) mode
+| _ -> let _ = print_err "usage: region_reclaim <rounds> <elements> <inline|region|region-call>" in exit 2

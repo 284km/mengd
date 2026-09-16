@@ -27,7 +27,10 @@ extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
 extern fn st_rename: str -> str -> int;
-extern fn st_spawn_logged: str -> str -> str -> str -> str -> str -> int;
+extern fn st_spawn_logged: str -> str -> str -> str -> str -> str -> str -> int;
+extern fn st_px_reset: unit -> int;
+extern fn st_px_push: str -> int;
+extern fn st_px_spawn_log: str -> int;
 extern fn st_wait: int -> int;
 extern fn st_kill: int -> int -> int;
 extern fn st_ignore_sigpipe: unit -> int;
@@ -1248,6 +1251,109 @@ let c_events = fn (fd: int) -> fn (store: str) -> fn (q: str) ->
   let _ = watch 0 (states_of store) in
   end_chunks fd;
 
+// Where the port forwarder is. It runs in the guest, beside the runtime, and
+// a daemon that cannot find it says so when a port is published rather than
+// accepting the publish and forwarding nothing.
+let fwd_path = fn (u: unit) ->
+  let e = env_or "MENGD_FWD" in
+  if str_len e > 0 then e else "/usr/local/bin/mfwd";
+
+// Published ports, as "<container port>:<host port>" pairs.
+//
+// A container listening inside this VM is not reachable from the host: there
+// is no network interface, because vmnet.framework will not start one for a
+// process that is not root. The way in is vsock, and the convention that makes
+// it need no agreement is that THE VSOCK PORT IS THE PUBLISHED HOST PORT --
+// whoever opened the host's end already chose that number.
+//
+// Only tcp. udp and a bound HostIp are refused by name at create time rather
+// than accepted and dropped, which is what this daemon did before: compose
+// published a port, got no error, and nothing was listening.
+let port_pairs = fn (spec: Json.json) ->
+  match jget (jget spec "HostConfig") "PortBindings" with
+  | Json.JObj kvs ->
+      (let rec go = fn (ps: (str * Json.json) list) -> fn (acc: str) ->
+         match ps with
+         | [] -> acc
+         | [p, ...t] ->
+             let (k, v) = p in
+             let slash = str_index_of k "/" in
+             let cport = if slash < 0 then k else substring k 0 slash in
+             let proto = if slash < 0 then "tcp" else substring k (slash + 1) (str_len k) in
+             let hp = match jarr v with
+                      | [] -> ""
+                      | [h, ...rest] -> jstr (jget h "HostPort") in
+             if proto != "tcp" || str_len hp == 0 then go t acc
+             else
+               let one = cport ++ ":" ++ hp in
+               go t (if str_len acc == 0 then one else acc ++ "," ++ one) in
+       go kvs "")
+  | _ -> "";
+
+// What was asked for and cannot be done, by name.
+let port_refusals = fn (spec: Json.json) ->
+  match jget (jget spec "HostConfig") "PortBindings" with
+  | Json.JObj kvs ->
+      (let rec go = fn (ps: (str * Json.json) list) -> fn (acc: str) ->
+         match ps with
+         | [] -> acc
+         | [p, ...t] ->
+             let (k, v) = p in
+             let slash = str_index_of k "/" in
+             let proto = if slash < 0 then "tcp" else substring k (slash + 1) (str_len k) in
+             let hp = match jarr v with
+                      | [] -> ""
+                      | [h, ...rest] -> jstr (jget h "HostPort") in
+             let why = if proto != "tcp" then k ++ " (only tcp is forwarded)"
+                       else if str_len hp == 0 then k ++ " (a host port has to be given; this daemon cannot choose one)"
+                       else "" in
+             go t (if str_len why == 0 then acc
+                   else if str_len acc == 0 then why else acc ++ "; " ++ why) in
+       go kvs "")
+  | _ -> "";
+
+let rec split_on = fn (text: str) -> fn (sep: str) ->
+  if str_len text == 0 then []
+  else
+    let i = str_index_of text sep in
+    if i < 0 then [text]
+    else substring text 0 i :: split_on (substring text (i + str_len sep) (str_len text)) sep;
+
+// One forwarder per published port, inside the container's own network
+// namespace -- which is why it needs the CONTAINER's pid and not the
+// runtime's. mrun writes that pid to a file because nothing outside can find
+// it: the runtime supervises, and the namespaces belong to its child.
+let fwd_start = fn (store: str) -> fn (id: str) -> fn (cpid: int) -> fn (fwd: str) ->
+  let cd = cdir store id in
+  let rec go = fn (ps: str list) -> fn (acc: str) ->
+    match ps with
+    | [] -> acc
+    | [one, ...t] ->
+        let i = str_index_of one ":" in
+        if i < 0 then go t acc
+        else
+          let cport = substring one 0 i in
+          let hport = substring one (i + 1) (str_len one) in
+          let _ = st_px_reset () in
+          let _ = st_px_push fwd in
+          let _ = st_px_push hport in            // the vsock port IS the host port
+          let _ = st_px_push cport in
+          let _ = st_px_push (show cpid) in
+          let p = st_px_spawn_log (cd ++ "/fwd.log") in
+          let _ = print_err ("mengd: forwarding vsock " ++ hport ++ " to " ++ cport
+                          ++ " in the container (pid " ++ show cpid ++ ")") in
+          go t (if str_len acc == 0 then show p else acc ++ " " ++ show p) in
+  go (split_on (cread store id "ports") ",") "";
+
+let fwd_stop = fn (store: str) -> fn (id: str) ->
+  let rec go = fn (ps: str list) ->
+    match ps with
+    | [] -> 0
+    | [one, ...t] -> let _ = if str_len one > 0 then st_kill (int_or one 0) 15 else 0 in go t in
+  let _ = go (split_on (cread store id "fwdpids") " ") in
+  let _ = cwrite store id "fwdpids" "" in
+  0;
+
 let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) ->
   // Length only. A create body carries the container's environment, which is
   // where people put credentials; a daemon log is not the place for it.
@@ -1293,16 +1399,44 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
       let _ = cwrite store id "netmode" (if str_len netmode == 0 then "default" else netmode) in
+      let _ = cwrite store id "ports" (port_pairs spec) in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
       let _ = tc "created" in
       let _ = cwrite store id "exit" "0" in
+      let refused = port_refusals spec in
       respond fd "201 Created" "application/json"
-        (obj [("Id", s id), ("Warnings", raw "[]")]);
+        (obj [("Id", s id),
+              ("Warnings", raw (if str_len refused == 0 then "[]"
+                                else "[" ++ s ("mengd cannot publish " ++ refused) ++ "]"))]);
+
+// The same fact in the two shapes the client's two decoders want: a list for
+// `docker ps` and a map for `docker inspect`. One source, so they cannot drift.
+let ports_json = fn (store: str) -> fn (id: str) -> fn (as_map: bool) ->
+  let rec go = fn (ps: str list) -> fn (acc: str) ->
+    match ps with
+    | [] -> acc
+    | [one, ...t] ->
+        let i = str_index_of one ":" in
+        if i < 0 then go t acc
+        else
+          let cport = substring one 0 i in
+          let hport = substring one (i + 1) (str_len one) in
+          let entry =
+            if as_map then
+              "\"" ++ cport ++ "/tcp\":[\{\"HostIp\":\"0.0.0.0\",\"HostPort\":\"" ++ hport ++ "\"}]"
+            else
+              "\{\"IP\":\"0.0.0.0\",\"PrivatePort\":" ++ cport
+              ++ ",\"PublicPort\":" ++ hport ++ ",\"Type\":\"tcp\"}" in
+          go t (if str_len acc == 0 then entry else acc ++ "," ++ entry) in
+  let body = go (split_on (cread store id "ports") ",") "" in
+  if as_map then "\{" ++ body ++ "}" else "[" ++ body ++ "]";
 
 let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
   let cd = cdir store id in
-  let pid = st_spawn_logged runtime "run" id (cd ++ "/bundle")
+  let pidfile = cd ++ "/container.pid" in
+  let _ = write_file pidfile "" in
+  let pid = st_spawn_logged runtime "run" id pidfile (cd ++ "/bundle")
                             (cd ++ "/log.out") (cd ++ "/log.err") in
   if pid < 0 then
     respond fd "500 Internal Server Error" "application/json"
@@ -1310,6 +1444,24 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
   else
     let _ = cwrite store id "state" "running" in
     let _ = cwrite store id "pid" (show pid) in
+    // The container's pid arrives a moment after the runtime's, because the
+    // runtime has to fork first. Waiting for the FILE rather than guessing a
+    // delay is the difference between a forwarder in the right namespace and
+    // one in the guest's.
+    let _ = if str_len (cread store id "ports") > 0 then
+              (let rec wait_pid = fn (n: int) ->
+                 let t = read_file pidfile in
+                 if str_len t > 0 then int_or t 0
+                 else if n > 200 then 0
+                 else let _ = sleep_ms 10 in wait_pid (n + 1) in
+               let cpid = wait_pid 0 in
+               if cpid <= 0 then
+                 (let _ = print_err ("mengd: no container pid for " ++ substring id 0 12
+                                  ++ "; its published ports are not forwarded") in ())
+               else
+                 (let _ = cwrite store id "cpid" (show cpid) in
+                  let _ = cwrite store id "fwdpids" (fwd_start store id cpid (fwd_path ())) in ()))
+            else () in
     // 204 goes out BEFORE the wait: docker's start returns when the container
     // has started, not when it has finished. The reaping happens on this
     // thread afterwards, which is free once the response is written.
@@ -1317,6 +1469,9 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
     let code = st_wait pid in
     let _ = cwrite store id "exit" (show code) in
     let _ = cwrite store id "state" "exited" in
+    // The container is gone, so its namespace is gone, and a forwarder still
+    // holding a host port would accept connections it can never deliver.
+    let _ = fwd_stop store id in
     ();
 
 // Stop and kill. A container that has already exited is a 304 in the real API
@@ -1430,7 +1585,12 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
        ("State", obj [("Status", s state), ("Running", b running),
                       ("Paused", b false), ("Restarting", b false),
                       ("OOMKilled", b false), ("Dead", b false),
-                      ("Pid", n_ (int_or (cread store id "pid") 0)),
+                      // The CONTAINER's pid when there is one, not the
+                      // runtime's. The runtime supervises; the namespaces
+                      // belong to its child, and that is what a client asking
+                      // "what pid is this container" means.
+                      ("Pid", n_ (int_or (cread store id "cpid")
+                                         (int_or (cread store id "pid") 0))),
                       ("ExitCode", n_ (int_or (cread store id "exit") 0)),
                       ("Error", s ""), ("StartedAt", s ""), ("FinishedAt", s "")]),
        ("Image", s (cread store id "image")), ("ResolvConfPath", s ""),
@@ -1438,7 +1598,8 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
        ("Name", s ("/" ++ cread store id "name")), ("RestartCount", n_ 0),
        ("Driver", s "none"), ("Platform", s "linux"), ("MountLabel", s ""),
        ("ProcessLabel", s ""), ("AppArmorProfile", s ""), ("ExecIDs", raw "null"),
-       ("HostConfig", raw "\{}"), ("Mounts", raw "[]"),
+       ("HostConfig", raw ("\{\"PortBindings\":" ++ ports_json store id true ++ "}")),
+       ("Mounts", raw "[]"),
        ("Config", obj [("Image", s (cread store id "image")),
                        ("Cmd", raw (cread store id "cmd")),
                        ("Env", raw "[]"), ("Labels", raw "\{}")]),
@@ -1458,12 +1619,13 @@ let c_list_body = fn (store: str) -> fn (q: str) ->
                        ("Image", s (cread store h "image")), ("ImageID", s ""),
                        ("Command", s (cmd_line store h)),
                        ("Created", n_ (int_or (cread store h "created") 0)),
-                       ("Ports", raw "[]"),
+                       ("Ports", raw (ports_json store h false)),
                        ("Labels", raw (let l = cread store h "labels" in
                                        if str_len l == 0 then "\{}" else l)),
                        ("State", s (cread store h "state")),
                        ("Status", s (cread store h "state")),
-                       ("HostConfig", raw "\{}"), ("NetworkSettings", raw "\{}"),
+                       ("HostConfig", raw "\{}"),
+                       ("NetworkSettings", raw ("\{\"Ports\":" ++ ports_json store h true ++ "}")),
                        ("Mounts", raw "[]")] in
           go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
     "[" ++ go (list_dir d) "" ++ "]";

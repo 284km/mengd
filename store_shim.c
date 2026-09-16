@@ -60,7 +60,10 @@ int st_rmtree(const char *path) { return rmtree(path); }
  * of stderr came between two lines of stdout. The real daemon multiplexes at
  * the source and keeps it.
  */
-int st_spawn_logged(const char *path, const char *a1, const char *a2,
+/* a3 is optional: an empty string means the argument is not passed at all,
+ * rather than passed as "". A runtime that takes an optional pid file must not
+ * be handed an empty one and asked to write to it. */
+int st_spawn_logged(const char *path, const char *a1, const char *a2, const char *a3,
                     const char *cwd, const char *outfile, const char *errfile) {
     pid_t p = fork();
     if (p < 0) return -1;
@@ -73,7 +76,8 @@ int st_spawn_logged(const char *path, const char *a1, const char *a2,
     if (o > 2) close(o);
     if (e > 2) close(e);
     if (cwd && cwd[0] && chdir(cwd) != 0) _exit(126);
-    char *argv[4] = { (char *)path, (char *)a1, (char *)a2, NULL };
+    char *argv[5] = { (char *)path, (char *)a1, (char *)a2, NULL, NULL };
+    if (a3 && a3[0]) argv[3] = (char *)a3;
     execv(path, argv);
     _exit(127);
 }
@@ -184,6 +188,24 @@ int st_px_push(const char *s) {
 
 /* Fork, make `fd` the child's stdin and stdout, exec the pushed argv.
  * Returns the child's pid. */
+/* The argv built with st_px_push, spawned detached, with its output appended
+ * to a file. Separate from st_px_spawn because that one hands the child a
+ * socket as its stdin and stdout, which is right for a proxy and wrong for
+ * anything that outlives the request that started it. */
+int st_px_spawn_log(const char *errfile) {
+    if (PXn == 0) return -1;
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p > 0) return (int)p;
+    setsid();
+    int z = open("/dev/null", O_RDONLY);
+    if (z >= 0) { dup2(z, 0); if (z > 2) close(z); }
+    int e = open(errfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (e >= 0) { dup2(e, 1); dup2(e, 2); if (e > 2) close(e); }
+    execvp(PXV[0], PXV);
+    _exit(127);
+}
+
 int st_px_spawn(int fd) {
     if (PXn == 0) return -1;
     pid_t p = fork();
