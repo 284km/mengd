@@ -153,6 +153,39 @@ else
   fail=1
 fi
 
+# Binds. `-v /host:/container` and compose's `volumes:` were read by nothing,
+# so both did NOTHING -- a container whose source directory was not there, and
+# a daemon that said it had started. A silent no-op is the worst of the three
+# possible answers.
+rm -rf /var/tmp/bind && mkdir -p /var/tmp/bind
+printf 'from the host\\n' > /var/tmp/bind/hello.txt
+o=\$(timeout 60 docker run --rm --network host -v /var/tmp/bind:/data alpine cat /data/hello.txt 2>/dev/null)
+[ "\$o" = "from the host" ]; say \$? "a bind mount is readable in the container (\$o)"
+timeout 60 docker run --rm --network host -v /var/tmp/bind:/data alpine \
+  sh -c 'echo from-the-container > /data/back.txt' >/dev/null 2>&1
+[ "\$(cat /var/tmp/bind/back.txt 2>/dev/null)" = "from-the-container" ]
+say \$? "and what the container writes is on the host"
+
+# MS_RDONLY is ignored on the initial bind -- the kernel takes it on a remount
+# and not before. Without that second call "ro" means nothing, silently: the
+# container writes through and the file appears on the host.
+rm -f /var/tmp/bind/x
+ro=\$(timeout 60 docker run --rm --network host -v /var/tmp/bind:/data:ro alpine \
+        sh -c 'echo nope > /data/x' 2>&1 | head -1)
+[ ! -e /var/tmp/bind/x ]; say \$? "a read-only bind is read-only (\$ro)"
+
+# A named volume is a directory this daemon keeps, and it outlives the
+# container that wrote it.
+timeout 60 docker run --rm --network host -v gatevol:/v alpine sh -c 'echo in-a-volume > /v/f' >/dev/null 2>&1
+v=\$(timeout 60 docker run --rm --network host -v gatevol:/v alpine cat /v/f 2>/dev/null)
+[ "\$v" = "in-a-volume" ]; say \$? "a named volume outlives the container (\$v)"
+
+# And the client can ask what is mounted. It was told "nothing", which was true
+# of the config and not of the ask.
+timeout 60 docker run -d --name bm --network host -v /var/tmp/bind:/data alpine sleep 5 >/dev/null 2>&1
+timeout 20 docker inspect bm --format '{{json .Mounts}}' 2>/dev/null | grep -q '"Destination":"/data"'
+say \$? "docker inspect reports the mount"
+
 # docker build. The classic builder, because buildx does not use POST /build at
 # all -- it wants a BuildKit container, which is a different daemon feature and
 # not this one.

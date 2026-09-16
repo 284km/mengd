@@ -628,7 +628,7 @@ let header_int = fn (req: str) -> fn (name: str) ->
 // The OCI bundle mrun is handed. Same shape `runc spec` writes, with this
 // container's command, environment and working directory in it.
 let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
-                 fn (hostname: str) -> fn (host_net: bool) ->
+                 fn (hostname: str) -> fn (host_net: bool) -> fn (binds: str) ->
   let ns = fn (t: str) -> obj [("type", s t)] in
   let m = fn (dest: str) -> fn (ty: str) -> fn (src: str) -> fn (opts: str) ->
     obj [("destination", s dest), ("type", s ty), ("source", s src), ("options", raw opts)] in
@@ -645,7 +645,11 @@ let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
                      ("rlimits", raw "[]"), ("noNewPrivileges", b true)]),
     ("root", obj [("path", s "rootfs"), ("readonly", b false)]),
     ("hostname", s (if str_len hostname == 0 then "mengd" else hostname)),
-    ("mounts", raw ("[" ++
+    // `binds` is what the request asked for, appended after the ones every
+    // container gets. Appended rather than merged: a bind over /proc is the
+    // caller's business and the kernel's answer, not something to silently
+    // drop here.
+    ("mounts", raw ("[" ++ (if str_len binds == 0 then "" else binds ++ ",") ++
         m "/proc" "proc" "proc" "[]" ++ "," ++
         m "/dev" "tmpfs" "tmpfs" "[\"nosuid\",\"strictatime\",\"mode=755\",\"size=65536k\"]" ++ "," ++
         m "/dev/pts" "devpts" "devpts" "[\"nosuid\",\"noexec\",\"newinstance\",\"ptmxmode=0666\",\"mode=0620\"]" ++ "," ++
@@ -707,6 +711,110 @@ let image_dir = fn (store: str) -> fn (tag: str) ->
       if field l 1 == want then field l 2
       else go (substring rest (i + 1) (str_len rest)) in
   go (read_index store);
+
+// ---- binds ------------------------------------------------------------------
+//
+// `-v /host:/container` and compose's `volumes:` arrive as HostConfig.Binds
+// ("src:dst" or "src:dst:ro") or as HostConfig.Mounts (objects). Neither was
+// read, so both did NOTHING -- a container whose source directory is not there
+// and a daemon that said the container started. A silent no-op is the worst of
+// the three possible answers.
+//
+// A source that is not an absolute path is a NAMED volume: it becomes a
+// directory in this daemon's own store, which is what the name is for.
+
+// A stored file that may not be there.
+//
+// read_file RAISES when the path is missing, and in Mere that ends the
+// PROCESS, not the request. Every one of these reads a field that exists only
+// once something has written it -- a volume nobody created explicitly, a
+// network with no labels -- and `docker compose down` asks for exactly those.
+// The daemon died on a GET /volumes with a label filter.
+let read_file_or = fn (path: str) -> fn (dflt: str) ->
+  if file_exists path then read_file path else dflt;
+
+let vol_dir = fn (store: str) -> fn (name: str) -> store ++ "/volumes/" ++ name ++ "/_data";
+
+// A volume asked for by a bind is a volume: it gets the same record an
+// explicit `docker volume create` would leave, because everything that lists
+// volumes reads that record.
+let vol_ensure = fn (store: str) -> fn (name: str) ->
+  let d = store ++ "/volumes/" ++ name in
+  let _ = mkdir_p (d ++ "/_data") in
+  let _ = if not (file_exists (d ++ "/created")) then
+            (let _ = write_file (d ++ "/created") (show (unix_time ())) in ()) else () in
+  let _ = if not (file_exists (d ++ "/labels")) then
+            (let _ = write_file (d ++ "/labels") "\{}" in ()) else () in
+  d ++ "/_data";
+
+let bind_entry = fn (src: str) -> fn (dst: str) -> fn (ro: bool) ->
+  obj [("destination", s dst), ("type", s "bind"), ("source", s src),
+       ("options", raw (if ro then "[\"rbind\",\"rprivate\",\"ro\"]"
+                        else "[\"rbind\",\"rprivate\"]"))];
+
+// The same mount in the shape `docker inspect` prints. Built from the same
+// inputs as the runtime's, at the same moment -- two descriptions of one mount
+// that are made in different places become two mounts.
+let mount_entry = fn (src: str) -> fn (dst: str) -> fn (ro: bool) ->
+  obj [("Type", s "bind"), ("Source", s src), ("Destination", s dst),
+       ("Mode", s (if ro then "ro" else "")), ("RW", b (not ro)),
+       ("Propagation", s "rprivate")];
+
+// One "src:dst[:opts]". Returns "" for anything this cannot do, having said
+// what it was.
+let bind_of_str = fn (store: str) -> fn (b: str) ->
+  let c1 = str_index_of b ":" in
+  if c1 < 0 then
+    let _ = fs_fail ("mengd: a bind wants source:destination, not " ++ b) "" in ("", "")
+  else
+    let rest = substring b (c1 + 1) (str_len b) in
+    let c2 = str_index_of rest ":" in
+    let src0 = substring b 0 c1 in
+    let dst = if c2 < 0 then rest else substring rest 0 c2 in
+    let opts = if c2 < 0 then "" else substring rest (c2 + 1) (str_len rest) in
+    let ro = str_index_of opts "ro" >= 0 in
+    if str_len dst == 0 || substring dst 0 1 != "/" then
+      let _ = fs_fail ("mengd: a bind destination has to be an absolute path: " ++ b) "" in ("", "")
+    else
+      let src = if substring src0 0 1 == "/" then src0 else vol_ensure store src0 in
+      // docker's `-v` creates a source that is not there; `--mount` refuses.
+      // This follows `-v`, which is what compose generates.
+      let _ = mkdir_p src in
+      (bind_entry src dst ro, mount_entry src dst ro);
+
+let join_one = fn (acc: str) -> fn (one: str) ->
+  if str_len one == 0 then acc else if str_len acc == 0 then one else acc ++ "," ++ one;
+
+// Both shapes, from one reading of the request.
+let binds_json = fn (store: str) -> fn (spec: Json.json) ->
+  let hc = jget spec "HostConfig" in
+  let rec from_binds = fn (xs: Json.json list) -> fn (acc: str) -> fn (dacc: str) ->
+    match xs with
+    | [] -> (acc, dacc)
+    | [h, ...t] ->
+        let (one, done_) = bind_of_str store (jstr h) in
+        from_binds t (join_one acc one) (join_one dacc done_) in
+  let rec from_mounts = fn (xs: Json.json list) -> fn (acc: str) -> fn (dacc: str) ->
+    match xs with
+    | [] -> (acc, dacc)
+    | [h, ...t] ->
+        let ty = jstr (jget h "Type") in
+        let srcname = jstr (jget h "Source") in
+        let dst = jstr (jget h "Target") in
+        let ro = match jget h "ReadOnly" with | Json.JBool b -> b | _ -> false in
+        if str_len dst == 0 then from_mounts t acc dacc
+        else if ty != "bind" && ty != "volume" && str_len ty > 0 then
+          // tmpfs and npipe are different things wearing the same field.
+          let _ = fs_fail ("mengd: a mount of type " ++ ty ++ " is not implemented") "" in
+          from_mounts t acc dacc
+        else
+          let src = if str_len srcname > 0 && substring srcname 0 1 == "/" then srcname
+                    else vol_ensure store (if str_len srcname == 0 then dst else srcname) in
+          let _ = mkdir_p src in
+          from_mounts t (join_one acc (bind_entry src dst ro))
+                        (join_one dacc (mount_entry src dst ro)) in
+  let (a, da) = from_binds (jarr (jget hc "Binds")) "" "" in
+  from_mounts (jarr (jget hc "Mounts")) a da;
 
 // The config blob an image's manifest names. A base image's own Env and Cmd
 // come out of it: a build that ignored them would produce an image whose PATH
@@ -1399,16 +1507,16 @@ let nresolve = fn (store: str) -> fn (want: str) ->
         match xs with
         | [] -> ""
         | [h, ...t] ->
-            let i = read_file (ndir store h ++ "/id") in
+            let i = read_file_or (ndir store h ++ "/id") "" in
             if i == want then h
             else if str_len want >= 12 then (if str_index_of i want == 0 then h else go t)
             else go t in
       go (list_dir d);
 
 let net_body = fn (store: str) -> fn (name: str) -> fn (with_status: bool) ->
-  let id = read_file (ndir store name ++ "/id") in
+  let id = read_file_or (ndir store name ++ "/id") "" in
   let base = [("Name", s name), ("Id", s id),
-              ("Created", s (st_rfc3339 (int_or (read_file (ndir store name ++ "/created")) 0))),
+              ("Created", s (st_rfc3339 (int_or (read_file_or (ndir store name ++ "/created") "") 0))),
               ("Scope", s "local"), ("Driver", s "bridge"),
               ("EnableIPv4", b true), ("EnableIPv6", b false),
               ("IPAM", obj [("Driver", s "default"), ("Options", raw "null"),
@@ -1416,7 +1524,7 @@ let net_body = fn (store: str) -> fn (name: str) -> fn (with_status: bool) ->
               ("Internal", b false), ("Attachable", b false), ("Ingress", b false),
               ("ConfigFrom", obj [("Network", s "")]), ("ConfigOnly", b false),
               ("Containers", raw "\{}"), ("Options", raw "\{}"),
-              ("Labels", raw (let l = read_file (ndir store name ++ "/labels") in
+              ("Labels", raw (let l = read_file_or (ndir store name ++ "/labels") "" in
                               if str_len l == 0 then "\{}" else l))] in
   // `++` is string concatenation; a list grows with `::`. Key order in an
   // object does not matter, so prepending is fine.
@@ -1476,9 +1584,9 @@ let vdir = fn (store: str) -> fn (name: str) -> store ++ "/volumes/" ++ name;
 let vol_body = fn (store: str) -> fn (name: str) ->
   obj [("Name", s name), ("Driver", s "local"),
        ("Mountpoint", s (vdir store name ++ "/_data")),
-       ("CreatedAt", s (st_rfc3339 (int_or (read_file (vdir store name ++ "/created")) 0))),
+       ("CreatedAt", s (st_rfc3339 (int_or (read_file_or (vdir store name ++ "/created") "") 0))),
        ("Scope", s "local"), ("Options", raw "null"),
-       ("Labels", raw (let l = read_file (vdir store name ++ "/labels") in
+       ("Labels", raw (let l = read_file_or (vdir store name ++ "/labels") "" in
                        if str_len l == 0 then "\{}" else l))];
 
 let c_vol_list = fn (fd: int) -> fn (store: str) ->
@@ -1766,13 +1874,18 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
                  else rcmd in
       let wd = let w = jstr (jget spec "WorkingDir") in
                if str_len w > 0 then w else jstr (jget icfg "WorkingDir") in
-      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net in
+      // What the request asked to be mounted. Recorded as well as used: a
+      // client that asks `docker inspect` what a container has mounted was
+      // being told "nothing", which was true of the config and not of the ask.
+      let (bj, mj) = binds_json store spec in
+      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
       let _ = cwrite store id "netmode" (if str_len netmode == 0 then "default" else netmode) in
+      let _ = cwrite store id "mounts" mj in
       let _ = cwrite store id "ports" (port_pairs spec) in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
@@ -1973,7 +2086,7 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
        ("Driver", s "none"), ("Platform", s "linux"), ("MountLabel", s ""),
        ("ProcessLabel", s ""), ("AppArmorProfile", s ""), ("ExecIDs", raw "null"),
        ("HostConfig", raw ("\{\"PortBindings\":" ++ ports_json store id true ++ "}")),
-       ("Mounts", raw "[]"),
+       ("Mounts", raw ("[" ++ cread store id "mounts" ++ "]")),
        ("Config", obj [("Image", s (cread store id "image")),
                        ("Cmd", raw (cread store id "cmd")),
                        ("Env", raw "[]"), ("Labels", raw "\{}")]),
@@ -2242,7 +2355,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                else if base == "[]" then "[" ++ pe ++ "]"
                                else "[" ++ pe ++ "," ++ substring base 1 (str_len base) in
                  let cfg = oci_config (shell_argv arg) stepenv
-                                      (vec_get st2 2 : str) "builder" true in
+                                      (vec_get st2 2 : str) "builder" true "" in
                  let _ = write_file (bundle ++ "/config.json") cfg in
                  let pidf = work ++ "/step.pid" in
                  let _ = write_file pidf "" in
@@ -2251,8 +2364,8 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                  if pid < 0 then (let _ = vec_set st2 4 "mengd: cannot fork the runtime" in ())
                  else
                    let code = st_wait pid in
-                   let o = read_file (work ++ "/step.out") in
-                   let e = read_file (work ++ "/step.err") in
+                   let o = read_file_or (work ++ "/step.out") "" in
+                   let e = read_file_or (work ++ "/step.err") "" in
                    let _ = if str_len o > 0 then (let _ = bstream fd (str_trim o) in ()) else () in
                    let _ = if str_len e > 0 then (let _ = bstream fd (str_trim e) in ()) else () in
                    if code != 0 then

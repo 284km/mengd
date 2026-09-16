@@ -665,3 +665,30 @@ in that case — the runtime then said `process.args is empty`, naming the
 symptom and not the cause. Nothing noticed because every check here had always
 passed a command. `Env` merges with the image's first and the request's after,
 which is what `-e` means.
+
+
+## Binds and volumes
+
+`-v /host:/container`, `-v name:/container`, `:ro`, and compose's `volumes:`.
+
+They were read by **nothing** before, so both forms did nothing: a container
+whose source directory was not there, and a daemon that said it had started.
+A silent no-op is the worst of the three possible answers, and `docker inspect`
+made it worse by reporting `"Mounts": []` — true of the config it wrote, and
+not of what was asked.
+
+A source that is not an absolute path is a **named volume**: a directory in
+this daemon's own store, with the same record an explicit `docker volume
+create` leaves, because everything that lists volumes reads that record.
+
+**`:ro` needs a remount** — `MS_RDONLY` is ignored on the initial bind — and
+that is mrun's half. Without it the option meant nothing, silently.
+
+### A stored field that may not be there
+
+`read_file` raises when the path is missing, and in Mere that ends the
+**process**, not the request. A volume nobody created explicitly has no
+`created` file, and `docker compose down` asks for exactly those: it sends
+`GET /volumes` with a label filter, and the daemon died. Every read of a field
+that exists only once something has written it goes through `read_file_or`
+now — the same shape as `jparse`, and found the same way.
