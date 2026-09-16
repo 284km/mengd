@@ -37,7 +37,7 @@ echo "== build both for linux, static =="
 "$M" -c "$here/mengd.mere" > "$out/mengd.c" 2> "$out/e1" || { echo "FAIL: mengd emit"; sed -n 1,10p "$out/e1"; exit 1; }
 "$M" -c "$MRUN_SRC/mrun.mere" > "$MRUN_SRC/.build/mrun.c" 2> "$out/e2" || { echo "FAIL: mrun emit"; sed -n 1,10p "$out/e2"; exit 1; }
 docker run --rm -v "$here:/w" -w /w "$BUILD_IMG" \
-  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c \
+  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c net_shim.c \
      -lssl -lcrypto -lz -lzstd -ldl -lpthread || { echo "FAIL: cc mengd"; exit 1; }
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" \
   cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c || { echo "FAIL: cc mrun"; exit 1; }
@@ -354,6 +354,50 @@ say \$? "docker compose down"
 grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down removed the network it created"
 n=\$(timeout 20 docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "no networks left (\$n)"
+
+# ONE SERVICE REACHING ANOTHER. A network was a directory with an id in it, so
+# `up` succeeded, said nothing, and the services could not find each other --
+# the failure this whole daemon keeps producing: correct-looking and silent.
+#
+# The question is asked the way an application asks it: connect to the OTHER
+# SERVICE BY ITS NAME. An address would not be enough (the name is what a
+# compose file contains) and a ping would not be enough (it says a host is
+# there, not that anything answers).
+mkdir -p /var/tmp/mengd-net
+cat > /var/tmp/mengd-net/compose.yaml <<'YAML'
+services:
+  store:
+    image: alpine:latest
+    command: ["sh", "-c", "while true; do echo SERVED | nc -l -p 6379; done"]
+  app:
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3; (echo probe | nc -w 3 store 6379) || echo CANNOT-REACH-store; sleep 20"]
+YAML
+cd /var/tmp/mengd-net
+timeout 120 docker compose -p mengdnet up -d > /var/tmp/net.out 2>&1
+say \$? "docker compose up on a network with two services"
+sleep 9
+timeout 30 docker compose -p mengdnet logs app > /var/tmp/netlog.out 2>&1
+grep -q "SERVED" /var/tmp/netlog.out
+say \$? "one service reached the other BY NAME (\$(grep -o 'SERVED\|CANNOT-REACH-store' /var/tmp/netlog.out | head -1))"
+
+# The parts that make it true, each named, so a failure says which one broke.
+ipa=\$(timeout 20 docker inspect -f '{{.NetworkSettings.IPAddress}}' mengdnet-app-1 2>/dev/null)
+ips=\$(timeout 20 docker inspect -f '{{.NetworkSettings.IPAddress}}' mengdnet-store-1 2>/dev/null)
+[ -n "\$ipa" ] && [ -n "\$ips" ] && [ "\$ipa" != "\$ips" ]
+say \$? "each container has its own address (\$ipa, \$ips)"
+o=\$(timeout 60 docker run --rm --network mengdnet_default alpine:latest sh -c 'ip -o addr show eth0 | grep -c "10\.88\." ; ip route | grep -c "^default via 10\.88\."' 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "1 1 " ]; say \$? "a container joining later gets an address and a way out (\$o)"
+# A container that joined LATER has to know the names of the ones already
+# there. The table is rewritten for everybody on each start, because compose
+# decides the order and the one that came up first would otherwise never learn
+# the name of the one that came up second. Asked by USING the name, not by
+# grepping for it: a line in a file is not a resolution.
+h=\$(timeout 60 docker run --rm --network mengdnet_default alpine:latest \
+       sh -c '(echo probe | nc -w 3 store 6379) || echo NO' 2>/dev/null | tr -d '\\r\\n')
+[ "\$h" = "SERVED" ]; say \$? "a container that joined later resolves the others (\$h)"
+timeout 90 docker compose -p mengdnet down >> /var/tmp/net.out 2>&1
+say \$? "compose down took the network with it"
 cd /
 
 # --rm is not implemented, so containers started with it are still here. The

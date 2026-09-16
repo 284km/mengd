@@ -26,7 +26,7 @@ REF="${REF:-docker.io/library/alpine:latest}"
 echo "== build =="
 "$M" -c "$here/mengd.mere" > "$out/mengd.c" 2>"$out/e" || { echo "FAIL: emit"; sed -n 1,8p "$out/e"; exit 1; }
 SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
-cc -O1 -o "$out/mengd-hub" "$out/mengd.c" "$here/unix_shim.c" "$here/fs_shim.c" "$here/store_shim.c" \
+cc -O1 -o "$out/mengd-hub" "$out/mengd.c" "$here/unix_shim.c" "$here/fs_shim.c" "$here/store_shim.c" "$here/net_shim.c" \
    -I"$SSLPREFIX/include" -L"$SSLPREFIX/lib" -lssl -lcrypto 2>"$out/cc.err" \
   || { echo "FAIL: cc"; sed -n 1,10p "$out/cc.err"; exit 1; }
 say 0 "mengd builds with TLS"

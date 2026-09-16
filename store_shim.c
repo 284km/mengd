@@ -289,3 +289,14 @@ int st_umount(const char *target) {
 int st_mount_overlay(const char *target, const char *opts) { (void)target; (void)opts; return -1; }
 int st_umount(const char *target) { (void)target; return -1; }
 #endif
+
+/* mkdir that FAILS when the directory is already there.
+ *
+ * mkdir_p answers the same whether it made the directory or found it, which is
+ * what a path wants and the opposite of what a claim wants. This daemon serves
+ * a thread per connection, and compose starts its services at the same time:
+ * two threads reading the addresses in use and each picking "the next one"
+ * both picked the same one, and two containers came up on 10.88.1.2.
+ *
+ * mkdir is atomic, so the directory IS the lease. */
+int st_mkdir_excl(const char *path) { return mkdir(path, 0755) == 0 ? 0 : -1; }

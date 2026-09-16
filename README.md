@@ -131,8 +131,9 @@ to be wrong — and the framing here includes a hijacked attach stream, which
 does survive the trip: a foreground `docker run` from the host prints its output
 and returns its exit status.
 
-`--network host` shares the VM's network namespace, which is how a container can
-be reached on a port at all: nothing builds a veth pair yet.
+`--network host` shares the VM's network namespace. Containers on a user-defined
+network get one of their own, wired to a bridge — see **A network between
+containers** below.
 
 ### The test was measuring lima
 
@@ -716,3 +717,54 @@ that is mrun's half. Without it the option meant nothing, silently.
 `GET /volumes` with a label filter, and the daemon died. Every read of a field
 that exists only once something has written it goes through `read_file_or`
 now — the same shape as `jparse`, and found the same way.
+
+## A network between containers
+
+A compose file is written for **two** services. Before this, a network was a
+directory with an id in it: `up` succeeded, said nothing, and the services could
+not find each other. That is this project's recurring shape of failure —
+correct-looking, silent, and visible only to somebody using the thing for what
+it is for. It was found by running a real two-service compose file, which no
+check here had ever done.
+
+A network is now made of the parts the kernel actually has:
+
+| | |
+|---|---|
+| a bridge per network | `br-<12 hex of the network id>`, `10.88.<n>.1/24` |
+| a veth pair per container | one end on the bridge, one end inside |
+| an address per container | the next free one on that network |
+| a namespace made **first** | so the wiring is finished before the container exists |
+
+**The order is the point.** The namespace is created and configured, and the
+bundle names it by path; the runtime *enters* it rather than making one. A
+container wired up after it starts can connect before its address exists —
+rarely, which is worse than always, because rare failures get blamed on the
+network.
+
+**The address is taken with `mkdir`.** Reading the addresses in use and picking
+the next one is a read and then a write, and this daemon serves a thread per
+connection: compose starts its services at the same time, both threads read the
+same answer, and two containers came up on `10.88.1.2`. `mkdir` is atomic, so
+the directory *is* the lease. The address is reserved at **create**, because
+compose creates every service before it starts any of them — which is what makes
+the hosts table complete the first time it is written.
+
+**Names come from `/etc/hosts`, rewritten for everybody on each start.** The
+container that came up first has to learn the name of the one that came up
+second, and compose decides that order. The file is in the container's own root
+filesystem, which is a directory on this machine, so a running container sees
+the new line the next time it looks. The check asks by *using* the name — a
+line in a file is not a resolution.
+
+**A container that cannot be wired does not start.** It would come up, look
+healthy, and be unable to reach the service it was brought up to talk to.
+
+Addresses, links and routes go through ioctls, which are old and exact. Making a
+veth pair is the one thing with no ioctl, so that part speaks netlink — the only
+message this daemon builds by hand, and it puts the far end straight into the
+target namespace by fd, because at that moment there is no process in it to name.
+
+Still outside: a container on the default bridge (plain `docker run` keeps an
+isolated namespace), outbound NAT (a guest with no interface reaches the world
+through the proxy instead), and IPv6.

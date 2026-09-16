@@ -26,8 +26,21 @@ extern fn mem_to_bytes: int -> int -> bytes;
 extern fn mem_get_u8: int -> int -> int;
 extern fn st_rename: str -> str -> int;
 extern fn st_rmtree: str -> int;
+extern fn st_mkdir_excl: str -> int;
 extern fn st_mount_overlay: str -> str -> int;
 extern fn st_umount: str -> int;
+// The network a compose file describes: a bridge per network, a veth pair per
+// container, and a namespace made BEFORE the container so the wiring is
+// finished before anything can look at it.
+extern fn nw_bridge: str -> str -> str -> int;
+extern fn nw_bridge_del: str -> int;
+extern fn nw_bridge_add_if: str -> str -> int;
+extern fn nw_veth: str -> str -> str -> int;
+extern fn nw_netns_add: str -> int;
+extern fn nw_netns_del: str -> int;
+extern fn nw_config_in: str -> str -> str -> str -> str -> int;
+extern fn nw_rename_in: str -> str -> str -> int;
+extern fn nw_last_error: unit -> str;
 extern fn st_rename: str -> str -> int;
 extern fn st_spawn_logged: str -> str -> str -> str -> str -> str -> str -> int;
 extern fn st_px_reset: unit -> int;
@@ -631,6 +644,7 @@ let header_int = fn (req: str) -> fn (name: str) ->
 // container's command, environment and working directory in it.
 let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
                  fn (hostname: str) -> fn (host_net: bool) -> fn (binds: str) ->
+                 fn (netns: str) ->
   let ns = fn (t: str) -> obj [("type", s t)] in
   let m = fn (dest: str) -> fn (ty: str) -> fn (src: str) -> fn (opts: str) ->
     obj [("destination", s dest), ("type", s ty), ("source", s src), ("options", raw opts)] in
@@ -661,12 +675,16 @@ let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
       "]")),
     ("linux", obj [
         // --network host means share the machine's network namespace, which is
-        // expressed by leaving it out of the list rather than by a flag. mrun
-        // reads the list, so this is all it takes -- and it is the only way a
-        // container here can be reached on a port, because nothing builds a
-        // veth pair yet.
+        // expressed by leaving it out of the list rather than by a flag.
+        //
+        // A `path` means the opposite of the other entries: enter that one
+        // instead of making a new one. It is how a container is handed a
+        // network that was wired up before it existed.
         ("namespaces", raw ("[" ++ ns "pid"
-                             ++ (if host_net then "" else "," ++ ns "network")
+                             ++ (if host_net then ""
+                                 else if str_len netns > 0 then
+                                   ",\{\"type\":\"network\",\"path\":" ++ s netns ++ "}"
+                                 else "," ++ ns "network")
                              ++ "," ++ ns "ipc"
                              ++ "," ++ ns "uts" ++ "," ++ ns "mount" ++ "]")),
         ("maskedPaths", raw "[\"/proc/acpi\",\"/proc/kcore\",\"/proc/keys\",\"/proc/timer_list\",\"/sys/firmware\"]"),
@@ -1489,10 +1507,15 @@ let c_image_inspect = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
 
 // ---- networks ------------------------------------------------------------
 //
-// A record and an id. mrun gives each container its own network namespace and
-// nothing joins them, so a compose network is bookkeeping: compose asks for one
-// before it will start anything, and this says yes. Containers on it cannot
-// reach each other, which is written down rather than implied.
+// A network is a bridge, a /24, and a veth pair per container. Each network
+// gets its own third octet when it is created, and each container the next
+// free address in it.
+//
+// It was bookkeeping before -- a directory with an id in it -- so two services
+// in one compose file could not reach each other: `up` succeeded, said
+// nothing, and the application could not find its database. That is the shape
+// of failure this project keeps finding: correct-looking, silent, and only
+// visible to somebody using the thing for what it is for.
 
 let ndir = fn (store: str) -> fn (name: str) -> store ++ "/networks/" ++ name;
 
@@ -1514,6 +1537,76 @@ let nresolve = fn (store: str) -> fn (want: str) ->
             else if str_len want >= 12 then (if str_index_of i want == 0 then h else go t)
             else go t in
       go (list_dir d);
+
+// ---- the wires -------------------------------------------------------------
+//
+// Every network namespace this daemon makes is pinned here, so it exists
+// before the container that will live in it and survives with nothing running
+// inside. The bundle names it by path and the runtime enters it: a container
+// wired up AFTER it starts can connect before its address exists -- rarely,
+// which is worse than always, because rare failures get blamed on the network.
+let netns_dir = "/var/run/mengd/netns";
+let netns_path = fn (id: str) -> netns_dir ++ "/" ++ substring id 0 12;
+
+let net_bridge_of = fn (nid: str) -> "br-" ++ substring nid 0 12;
+
+// The third octet a network owns, decided once when it is created. 10.88 keeps
+// out of the way of the 172.16/12 that docker itself uses and of anything the
+// machine is likely to be on.
+let net_next_octet = fn (store: str) ->
+  let d = store ++ "/networks" in
+  if not (file_exists d) then 1
+  else
+    let rec go = fn (xs: str list) -> fn (best: int) ->
+      match xs with
+      | [] -> best
+      | [h, ...t] ->
+          let o = int_or (read_file_or (store ++ "/networks/" ++ h ++ "/octet") "") 0 in
+          go t (if o > best then o else best) in
+    go (list_dir d) 0 + 1;
+
+let net_prefix = fn (store: str) -> fn (name: str) ->
+  let o = int_or (read_file_or (ndir store name ++ "/octet") "") 0 in
+  if o == 0 then "" else "10.88." ++ show o;
+
+// An address, taken so that nobody else can take it.
+//
+// Reading the addresses in use and picking the next one is a read and then a
+// write, and this daemon serves a THREAD PER CONNECTION: compose starts its
+// services at the same time, both threads read the same answer, and two
+// containers came up on the same address. mkdir is atomic, so the directory is
+// the lease -- the first caller to make it owns that number.
+//
+// The lease outlives a stopped container and is released when it is removed,
+// which is what docker does and what makes a restart predictable.
+let net_lease = fn (store: str) -> fn (name: str) -> fn (id: str) ->
+  let ld = ndir store name ++ "/leases" in
+  let _ = mkdir_p ld in
+  let rec go = fn (n: int) ->
+    if n > 254 then ""
+    else if st_mkdir_excl (ld ++ "/" ++ show n) == 0 then
+      let _ = write_file (ld ++ "/" ++ show n ++ "/id") id in
+      net_prefix store name ++ "." ++ show n
+    else go (n + 1) in
+  go 2;
+
+let net_release = fn (store: str) -> fn (name: str) -> fn (id: str) ->
+  let ld = ndir store name ++ "/leases" in
+  if not (file_exists ld) then ()
+  else
+    let rec go = fn (xs: str list) ->
+      match xs with
+      | [] -> ()
+      | [h, ...t] ->
+          let _ = if read_file_or (ld ++ "/" ++ h ++ "/id") "" == id then
+                    (let _ = st_rmtree (ld ++ "/" ++ h) in ()) else () in
+          go t in
+    go (list_dir ld);
+
+// Is this a network this daemon made, as opposed to host / none / the default?
+let net_is_user = fn (store: str) -> fn (mode: str) ->
+  str_len mode > 0 && mode != "host" && mode != "none" && mode != "default"
+  && mode != "bridge" && file_exists (ndir store mode ++ "/id");
 
 let net_body = fn (store: str) -> fn (name: str) -> fn (with_status: bool) ->
   let id = read_file_or (ndir store name ++ "/id") "" in
@@ -1545,6 +1638,9 @@ let c_net_create = fn (fd: int) -> fn (store: str) -> fn (body: str) ->
     let _ = write_file (d ++ "/id") id in
     let _ = write_file (d ++ "/labels") (jobj_raw (jget spec "Labels")) in
     let _ = write_file (d ++ "/created") (show (unix_time ())) in
+    // Its own /24, decided now. Deciding it when the first container starts
+    // would make the address depend on the order things came up.
+    let _ = write_file (d ++ "/octet") (show (net_next_octet store)) in
     respond fd "201 Created" "application/json"
       (obj [("Id", s id), ("Warning", s "")]);
 
@@ -1571,6 +1667,10 @@ let c_net_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
     respond fd "404 Not Found" "application/json"
       (obj [("message", s ("network " ++ name ++ " not found"))])
   else
+    // The bridge goes with the record. A bridge left behind keeps the name and
+    // the address, so the next network with the same id -- there is not one --
+    // is not the problem: the problem is a machine that collects interfaces.
+    let _ = nw_bridge_del (net_bridge_of (read_file_or (ndir store name ++ "/id") "")) in
     let _ = st_rmtree (ndir store name) in
     respond fd "204 No Content" "text/plain" "";
 
@@ -1880,13 +1980,33 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       // client that asks `docker inspect` what a container has mounted was
       // being told "nothing", which was true of the config and not of the ask.
       let (bj, mj) = binds_json store spec in
-      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj in
+      // The namespace this container will be put in, named now because the
+      // bundle is written now. It does not exist yet -- start makes it.
+      let netns = if net_is_user store netmode then netns_path id else "" in
+      // The address is reserved here and not at start: compose creates every
+      // service before it starts any of them, so by the time the first one
+      // runs, every name in the file has an address to be resolved to.
+      let _ = if net_is_user store netmode then
+                (let _ = cwrite store id "net" netmode in
+                 let _ = cwrite store id "ip" (net_lease store netmode id) in ())
+              else () in
+      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj netns in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
       let _ = cwrite store id "netmode" (if str_len netmode == 0 then "default" else netmode) in
+      // The names the client wants this container known by on that network.
+      // compose puts the service name here, which is the name the other
+      // services in the file actually use.
+      let _ = cwrite store id "aliases"
+                (let e = jget (jget (jget spec "NetworkingConfig") "EndpointsConfig") netmode in
+                 let rec go = fn (xs: Json.json list) -> fn (acc: str) ->
+                   match xs with
+                   | [] -> acc
+                   | [h, ...t] -> go t (if str_len acc == 0 then jstr h else acc ++ "," ++ jstr h) in
+                 go (jarr (jget e "Aliases")) "") in
       let _ = cwrite store id "mounts" mj in
       let _ = cwrite store id "ports" (port_pairs spec) in
       let _ = cwrite store id "created" (show (unix_time ())) in
@@ -1921,10 +2041,124 @@ let ports_json = fn (store: str) -> fn (id: str) -> fn (as_map: bool) ->
   let body = go (split_on (cread store id "ports") ",") "" in
   if as_map then "\{" ++ body ++ "}" else "[" ++ body ++ "]";
 
+// Every name a container answers to on its network: the name compose gave it,
+// the service name it asked to be known by, and the short id -- the three
+// spellings a client may use.
+let jstrs_of_csv = fn (csv: str) ->
+  let rec go = fn (xs: str list) -> fn (acc: str) ->
+    match xs with
+    | [] -> acc
+    | [h, ...t] -> go t (if str_len acc == 0 then s h else acc ++ "," ++ s h) in
+  go (split_on csv ",") "";
+
+let net_names_of = fn (store: str) -> fn (id: str) ->
+  let nm = let n = cread store id "name" in
+           if str_len n > 0 && substring n 0 1 == "/" then substring n 1 (str_len n) else n in
+  let al = cread store id "aliases" in
+  (if str_len nm == 0 then "" else nm ++ " ")
+  ++ (if str_len al == 0 then "" else str_replace al "," " " ++ " ")
+  ++ substring id 0 12;
+
+// The hosts file of every container on a network, rewritten from one table.
+//
+// Rewritten for ALL of them, not just the one starting: a container that came
+// up first has to learn the name of one that came up later, and compose starts
+// things in an order it chooses. The file is in the container's own root
+// filesystem, which is a directory on this machine, so a running container
+// sees the new line the next time it looks -- which is what a resolver would
+// give it and is all a name lookup needs.
+let net_hosts = fn (store: str) -> fn (name: str) ->
+  let d = store ++ "/containers" in
+  if not (file_exists d) then ()
+  else
+    let ids = list_dir d in
+    let rec table = fn (xs: str list) -> fn (acc: str) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] ->
+          let n = read_file_or (d ++ "/" ++ h ++ "/net") "" in
+          let ip = read_file_or (d ++ "/" ++ h ++ "/ip") "" in
+          if n != name || str_len ip == 0 then table t acc
+          else table t (acc ++ ip ++ "\t" ++ net_names_of store h ++ "\n") in
+    let body = table ids "" in
+    let rec each = fn (xs: str list) ->
+      match xs with
+      | [] -> ()
+      | [h, ...t] ->
+          let n = read_file_or (d ++ "/" ++ h ++ "/net") "" in
+          if n != name then each t
+          else
+            let hp = d ++ "/" ++ h ++ "/bundle/rootfs/etc/hosts" in
+            let _ = if file_exists (d ++ "/" ++ h ++ "/bundle/rootfs/etc") then
+                      (let _ = write_file hp
+                        ("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+                         ++ body) in ()) else () in
+            each t in
+    each ids;
+
+// Put a container on its network: an address, a wire to the bridge, and the
+// names of everyone else on it.
+//
+// Returns "" or the reason. A container that cannot be wired must not start:
+// it would come up, look healthy, and be unable to reach anything -- the
+// failure this whole file exists to remove.
+let net_up = fn (store: str) -> fn (id: str) -> fn (name: str) ->
+  let nid = read_file_or (ndir store name ++ "/id") "" in
+  let pre = net_prefix store name in
+  if str_len nid == 0 || str_len pre == 0 then "mengd: no such network: " ++ name
+  else
+    let br = net_bridge_of nid in
+    let gw = pre ++ ".1" in
+    if nw_bridge br gw "255.255.255.0" != 0 then
+      "mengd: cannot bring up the bridge " ++ br ++ ": " ++ nw_last_error ()
+    else
+      let ns = netns_path id in
+      let _ = mkdir_p netns_dir in
+      // A namespace left over from a previous run of this same container: the
+      // path is derived from the id, so a restart would find it and the veth
+      // creation would fail on a name that is already taken.
+      let _ = nw_netns_del ns in
+      if nw_netns_add ns != 0 then "mengd: " ++ nw_last_error ()
+      else
+        let hv = "ve" ++ substring id 0 10 in
+        let pv = "vp" ++ substring id 0 10 in
+        if nw_veth hv pv ns != 0 then "mengd: cannot make a veth pair: " ++ nw_last_error ()
+        else if nw_bridge_add_if br hv != 0 then
+          "mengd: cannot put " ++ hv ++ " on " ++ br ++ ": " ++ nw_last_error ()
+        // eth0 inside, because that is the name everything in a container
+        // expects; the host side has to be unique across the machine instead.
+        else if nw_rename_in ns pv "eth0" != 0 then "mengd: " ++ nw_last_error ()
+        else
+          // The address was decided when the container was created, so that
+          // every container in a compose file has one before any of them
+          // starts -- which is what makes the hosts table complete the first
+          // time it is written.
+          let ip = cread store id "ip" in
+          if str_len ip == 0 then "mengd: no address was reserved for this container"
+          else if nw_config_in ns "eth0" ip "255.255.255.0" gw != 0 then
+            "mengd: " ++ nw_last_error ()
+          else
+            let _ = net_hosts store name in
+            "";
+
+let net_down = fn (store: str) -> fn (id: str) ->
+  // Deleting the namespace takes the far end of the veth with it, and a veth
+  // pair dies together -- so the host side goes too and there is nothing else
+  // to unpick.
+  let _ = nw_netns_del (netns_path id) in ();
+
 let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: str) ->
   let cd = cdir store id in
   let pidfile = cd ++ "/container.pid" in
   let _ = write_file pidfile "" in
+  // The network first, and the container only if it worked. Starting anyway
+  // would give something that comes up, looks healthy, and cannot reach the
+  // service it was brought up to talk to.
+  let netmode = cread store id "netmode" in
+  let neterr = if net_is_user store netmode then net_up store id netmode else "" in
+  if str_len neterr > 0 then
+    respond fd "500 Internal Server Error" "application/json" (obj [("message", s neterr)])
+  else
   let pid = st_spawn_logged runtime "run" id pidfile (cd ++ "/bundle")
                             (cd ++ "/log.out") (cd ++ "/log.err") in
   if pid < 0 then
@@ -2092,7 +2326,22 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
        ("Config", obj [("Image", s (cread store id "image")),
                        ("Cmd", raw (cread store id "cmd")),
                        ("Env", raw "[]"), ("Labels", raw "\{}")]),
-       ("NetworkSettings", raw "\{}"), ("Storage", raw "\{}"),
+       // The address, under the network's name, where every client looks for
+       // it. Empty stays "{}" so a container that is on no network says so
+       // rather than claiming an endpoint with no address in it.
+       ("NetworkSettings",
+        raw (let n = cread store id "net" in
+             let ip = cread store id "ip" in
+             if str_len n == 0 || str_len ip == 0 then "\{}"
+             else "\{\"IPAddress\":" ++ s ip
+               ++ ",\"Networks\":\{" ++ s n ++ ":"
+               ++ obj [("IPAddress", s ip), ("Gateway", s (net_prefix store n ++ ".1")),
+                       ("IPPrefixLen", raw "24"),
+                       ("Aliases", raw (let a = cread store id "aliases" in
+                                        if str_len a == 0 then "[]"
+                                        else "[" ++ jstrs_of_csv a ++ "]"))]
+               ++ "}}")),
+       ("Storage", raw "\{}"),
        ("ImageManifestDescriptor", raw "null")];
 
 let c_list_body = fn (store: str) -> fn (q: str) ->
@@ -2435,7 +2684,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                else if base == "[]" then "[" ++ pe ++ "]"
                                else "[" ++ pe ++ "," ++ substring base 1 (str_len base) in
                  let cfg = oci_config (shell_argv arg) stepenv
-                                      (vec_get st2 2 : str) "builder" true "" in
+                                      (vec_get st2 2 : str) "builder" true "" "" in
                  let _ = write_file (bundle ++ "/config.json") cfg in
                  let pidf = work ++ "/step.pid" in
                  let _ = write_file pidf "" in
@@ -2798,6 +3047,11 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
       respond fd "200 OK" "application/json" (c_inspect_body store id)
     else if str_len verb == 0 then
       (if m == "DELETE" then
+         // The namespace goes with the container. Left behind it would hold
+         // the address, and the next container on that network would be given
+         // one that is already taken.
+         let _ = net_down store id in
+         let _ = net_release store (cread store id "net") id in
          let _ = st_rmtree (cdir store id) in
          respond fd "204 No Content" "text/plain" ""
        else respond fd "404 Not Found" "application/json"
