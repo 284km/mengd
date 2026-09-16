@@ -35,8 +35,11 @@ extern fn st_slots: unit -> int;
 extern fn st_slot_acquire: unit -> int;
 extern fn st_slot_release: int -> int;
 extern fn fs_last_error: unit -> str;
+extern fn fs_fail: str -> str -> int;
+extern fn fs_clear_error: unit -> int;
 extern fn io_set_nonblocking: int -> int;
 extern fn st_rfc3339: int -> str;
+extern fn tcp_connect: str -> int -> int;
 extern fn gen_request_id: unit -> str;
 extern fn sha256_hex: str -> str;
 
@@ -675,22 +678,6 @@ let image_dir = fn (store: str) -> fn (tag: str) ->
       else go (substring rest (i + 1) (str_len rest)) in
   go (read_index store);
 
-let query_param = fn (q: str) -> fn (k: str) ->
-  let key = k ++ "=" in
-  let i = str_index_of q key in
-  if i < 0 then ""
-  else
-    let rest = substring q (i + str_len key) (str_len q) in
-    let e = str_index_of rest "&" in
-    if e < 0 then rest else substring rest 0 e;
-
-// ---- percent decoding + label filters ------------------------------------
-//
-// `docker compose` selects its own containers with
-//   ?filters={"label":{"com.docker.compose.project=p24b":true, ...}}
-// percent-encoded. A daemon that ignores the filter hands compose every
-// container on the host and it adopts them all.
-
 let url_decode = fn (v: str) ->
   let n = str_len v in
   let hexd = fn (c: str) ->
@@ -710,6 +697,25 @@ let url_decode = fn (v: str) ->
          else acc ++ c)
       else go (i + 1) (acc ++ c) in
   go 0 "";
+
+// Values arrive percent-encoded. `docker pull localhost:5000/lib/alpine:v1`
+// sends fromImage=localhost%3A5000%2Flib%2Falpine, and a reader that does not
+// decode sees no registry host at all.
+let query_param = fn (q: str) -> fn (k: str) ->
+  let key = k ++ "=" in
+  let i = str_index_of q key in
+  if i < 0 then ""
+  else
+    let rest = substring q (i + str_len key) (str_len q) in
+    let e = str_index_of rest "&" in
+    url_decode (if e < 0 then rest else substring rest 0 e);
+
+// ---- percent decoding + label filters ------------------------------------
+//
+// `docker compose` selects its own containers with
+//   ?filters={"label":{"com.docker.compose.project=p24b":true, ...}}
+// percent-encoded. A daemon that ignores the filter hands compose every
+// container on the host and it adopts them all.
 
 // Every key of filters.label, as stored: "k=v" or "k".
 let filter_labels = fn (q: str) ->
@@ -749,6 +755,234 @@ let rec matches_all = fn (labels: str) -> fn (wants: str list) ->
   match wants with
   | [] -> true
   | [h, ...t] -> if has_label labels h then matches_all labels t else false;
+
+// ---- pulling from a registry ---------------------------------------------
+
+let last_index_of_str = fn (hay: str) -> fn (needle: str) ->
+  let n = str_len hay in
+  let m = str_len needle in
+  let rec go = fn (i: int) -> fn (best: int) ->
+    if i + m > n then best
+    else go (i + 1) (if substring hay i (i + m) == needle then i else best) in
+  go 0 (0 - 1);
+
+let header_str_of = fn (req: str) -> fn (name: str) ->
+  let i = str_index_of req name in
+  if i < 0 then ""
+  else
+    let rest = substring req (i + str_len name) (str_len req) in
+    let e = str_index_of rest "\r" in
+    str_trim (if e < 0 then rest else substring rest 0 e);
+
+let rg_unlink_if = fn (p: str) -> if file_exists p then st_rmtree p else 0;
+
+let rd_copy = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+              fn (fh: File) -> fn (n: int) ->
+  let rec go = fn (left: int) ->
+    if left <= 0 then 0
+    else
+      let avail = rd_fill fd buf cap st in
+      if avail == 0 then left
+      else
+        let take = if avail < left then avail else left in
+        let p = (vec_get st rd_pos : int) in
+        let off = (vec_get st rd_out : int) in
+        let _ = file_pwrite_bytes fh off (mem_to_bytes (buf + p) take) in
+        let _ = vec_set st rd_pos (p + take) in
+        let _ = vec_set st rd_out (off + take) in
+        go (left - take) in
+  go n;
+
+//
+// Enough of a client to fetch an image: one manifest request, a second if the
+// first returned an index, then the config and layer blobs. What it writes is
+// the SAME on-disk shape `docker save` produces -- blobs/sha256/<hex> and a
+// manifest.json -- so everything downstream (registering, building a rootfs,
+// running) works on a pulled image without knowing it was pulled.
+
+let split_host = fn (ref: str) ->
+  // "localhost:5556/lib/alpine:v1" -> ("localhost", 5556, "lib/alpine", "v1")
+  let slash = str_index_of ref "/" in
+  let hostpart = if slash < 0 then "" else substring ref 0 slash in
+  let rest = if slash < 0 then ref else substring ref (slash + 1) (str_len ref) in
+  // A first segment is a registry only if it looks like one: a colon or a dot.
+  let is_host = str_index_of hostpart ":" >= 0 in
+  let host0 = if is_host then hostpart else "" in
+  let name_ref = if is_host then rest else ref in
+  let colon = last_index_of_str name_ref ":" in
+  let name = if colon < 0 then name_ref else substring name_ref 0 colon in
+  let tag = if colon < 0 then "latest" else substring name_ref (colon + 1) (str_len name_ref) in
+  let hc = str_index_of host0 ":" in
+  let h = if hc < 0 then host0 else substring host0 0 hc in
+  let pt = if hc < 0 then 5000 else int_or (substring host0 (hc + 1) (str_len host0)) 5000 in
+  (h, pt, name, tag);
+
+let accept_types =
+  "application/vnd.oci.image.index.v1+json,"
+  ++ "application/vnd.oci.image.manifest.v1+json,"
+  ++ "application/vnd.docker.distribution.manifest.list.v2+json,"
+  ++ "application/vnd.docker.distribution.manifest.v2+json";
+
+// One GET, body straight to a file. Returns the Content-Type, or "" on failure.
+let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+                       fn (dest: str) ->
+  let fd = tcp_connect host port in
+  if fd < 0 then ""
+  else
+    let req = "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
+           ++ "\r\nAccept: " ++ accept_types ++ "\r\nConnection: close\r\n\r\n" in
+    let _ = write_str fd req in
+    let buf = mem_alloc 65536 in
+    let n0 = tcp_read fd buf 65535 in
+    if n0 <= 0 then let _ = tcp_close fd in ""
+    else
+      let head = mem_to_str buf n0 in
+      let hend = str_index_of head "\r\n\r\n" in
+      if hend < 0 then let _ = tcp_close fd in ""
+      else
+        let status = substring head 9 12 in
+        let ctype = header_str_of head "Content-Type:" in
+        let clen = int_or (header_str_of head "Content-Length:") 0 in
+        let st = rd_new n0 (hend + 4) in
+        let _ = st_rmtree dest in
+        let fh = file_openrw dest in
+        let missing = rd_copy fd buf 65535 st fh clen in
+        let _ = file_close fh in
+        let _ = tcp_close fd in
+        if status != "200" then "" else if missing > 0 then "" else ctype;
+
+let hex_of_dig = fn (d: str) ->
+  let i = str_index_of d ":" in
+  if i < 0 then d else substring d (i + 1) (str_len d);
+
+// An index lists one manifest per platform. Pick the one this machine can run;
+// pulling the index itself and treating it as a manifest is how an image with
+// no layers and a "config" that is really a manifest list gets built.
+let pick_platform = fn (idx: Json.json) ->
+  let want_arch = "arm64" in
+  let rec go = fn (xs: Json.json list) ->
+    match xs with
+    | [] -> ""
+    | [h, ...t] ->
+        let p = jget h "platform" in
+        if jstr (jget p "architecture") == want_arch then
+          (if jstr (jget p "os") == "linux" then jstr (jget h "digest") else go t)
+        else go t in
+  go (jarr (jget idx "manifests"));
+
+let is_index = fn (ct: str) ->
+  if str_index_of ct "index" >= 0 then true
+  else if str_index_of ct "manifest.list" >= 0 then true
+  else false;
+
+// Returns the repo tag on success, "" on failure. `why` carries the reason.
+// The reason for a failure goes into the shim's error slot, the same one
+// mtar uses, so the route can report it without a second mechanism.
+let pull_image = fn (store: str) -> fn (ref: str) ->
+  let parts = split_host ref in
+  let (host, port, name, tag) = parts in
+  if str_len host == 0 then
+    let _ = fs_fail "mengd: only an explicit registry host is supported (host/name:tag)" "" in
+    ""
+  else
+    let uniq = gen_request_id () in
+    let dir = store ++ "/images/.pull-" ++ uniq in
+    let _ = mkdir_p (dir ++ "/blobs/sha256") in
+    let mtmp = dir ++ "/manifest.raw" in
+    let ct1 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ tag) mtmp in
+    if str_len ct1 == 0 then
+      let _ = st_rmtree dir in
+      let _ = fs_fail "mengd: cannot fetch the manifest for " ref in
+      ""
+    else
+      // An index is a list of manifests; fetch the one for this platform.
+      let man_path =
+        if not (is_index ct1) then mtmp
+        else
+          let d = pick_platform (Json.parse_json (read_file mtmp)) in
+          if str_len d == 0 then ""
+          else
+            let m2 = dir ++ "/manifest2.raw" in
+            let ct2 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ d) m2 in
+            if str_len ct2 == 0 then "" else m2 in
+      if str_len man_path == 0 then
+        let _ = st_rmtree dir in
+        let _ = fs_fail "mengd: no linux/arm64 manifest in " ref in
+        ""
+      else
+        let man = Json.parse_json (read_file man_path) in
+        let cfg_dig = jstr (jget (jget man "config") "digest") in
+        let get_blob = fn (d: str) ->
+          http_get_to_file host port ("/v2/" ++ name ++ "/blobs/" ++ d)
+                           (dir ++ "/blobs/sha256/" ++ hex_of_dig d) in
+        let okc = get_blob cfg_dig in
+        let rec layers = fn (xs: Json.json list) -> fn (acc: str) -> fn (good: bool) ->
+          match xs with
+          | [] -> (acc, good)
+          | [h, ...t] ->
+              let d = jstr (jget h "digest") in
+              let r = get_blob d in
+              let one = "\"blobs/sha256/" ++ hex_of_dig d ++ "\"" in
+              layers t (if str_len acc == 0 then one else acc ++ "," ++ one)
+                     (if str_len r == 0 then false else good) in
+        let lr = layers (jarr (jget man "layers")) "" true in
+        let (llist, lok) = lr in
+        if str_len okc == 0 then
+          let _ = st_rmtree dir in
+          let _ = fs_fail "mengd: cannot fetch the image config blob" "" in
+          ""
+        else if not lok then
+          let _ = st_rmtree dir in
+          let _ = fs_fail "mengd: cannot fetch a layer blob" "" in
+          ""
+        else
+          // The same manifest.json `docker save` writes, so the loader path and
+          // the rootfs builder do not need to know where this came from.
+          let full_tag = host ++ ":" ++ show port ++ "/" ++ name ++ ":" ++ tag in
+          let mj = "[\{\"Config\":\"blobs/sha256/" ++ hex_of_dig cfg_dig ++ "\","
+                ++ "\"RepoTags\":[" ++ s full_tag ++ "],"
+                ++ "\"Layers\":[" ++ llist ++ "]}]" in
+          let _ = write_file (dir ++ "/manifest.json") mj in
+          let _ = rg_unlink_if (dir ++ "/manifest.raw") in
+          let _ = rg_unlink_if (dir ++ "/manifest2.raw") in
+          let idx = read_index store in
+          let id = "sha256:" ++ hex_of_dig cfg_dig in
+          // Same content under a different name is still a new name. The first
+          // version returned early on a duplicate id and the tag was never
+          // recorded, so `docker pull other/alpine:v1` succeeded and then
+          // `docker images` did not list it.
+          if str_index_of idx (id ++ "\t") >= 0 then
+            let _ = st_rmtree dir in
+            let existing = image_dir store full_tag in
+            if str_len existing > 0 then full_tag
+            else
+              let rec find_dir = fn (rest: str) ->
+                let i = str_index_of rest "\n" in
+                if i < 0 then ""
+                else let l = substring rest 0 i in
+                     if field l 0 == id then field l 2
+                     else find_dir (substring rest (i + 1) (str_len rest)) in
+              let d0 = find_dir idx in
+              if str_len d0 == 0 then full_tag
+              else
+                let _ = write_file (index_path store)
+                          (idx ++ id ++ "\t" ++ full_tag ++ "\t" ++ d0 ++ "\t0\n") in
+                full_tag
+          else
+            let final = store ++ "/images/" ++ substring id 7 19 in
+            let _ = st_rmtree final in
+            let _ = st_rename dir final in
+            let sz = fn (u: unit) ->
+              let rec go = fn (xs: Json.json list) -> fn (acc: int) ->
+                match xs with
+                | [] -> acc
+                | [h, ...t] ->
+                    let f = final ++ "/blobs/sha256/" ++ hex_of_dig (jstr (jget h "digest")) in
+                    go t (acc + (if file_exists f then file_size f else 0)) in
+              go (jarr (jget man "layers")) 0 in
+            let _ = write_file (index_path store)
+                      (idx ++ id ++ "\t" ++ full_tag ++ "\t" ++ final ++ "\t" ++ show (sz ()) ++ "\n") in
+            full_tag;
 
 // ---- images: inspect -----------------------------------------------------
 
@@ -1262,6 +1496,28 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   else if path == "/images/json" then
     respond fd "200 OK" "application/json" (images_body store)
   else if path == "/events" then c_events fd store q
+  else if path == "/images/create" then
+    // `docker pull` and `docker run` on an image that is not here both land
+    // on this. The response is the progress stream the client prints.
+    let from = query_param q "fromImage" in
+    let t = query_param q "tag" in
+    // A tag is a colon AFTER the last slash. `localhost:5000/lib/alpine` has a
+    // colon in the registry host, and taking that as "already tagged" asked the
+    // registry for `latest` and reported that the manifest was missing.
+    let tail = let sl = last_index_of_str from "/" in
+               if sl < 0 then from else substring from (sl + 1) (str_len from) in
+    let ref = if str_len t == 0 then from
+              else if str_index_of tail ":" >= 0 then from
+              else from ++ ":" ++ t in
+    let _ = fs_clear_error () in
+    let got = pull_image store ref in
+    if str_len got == 0 then
+      respond fd "404 Not Found" "application/json"
+        (obj [("message", s (let w = fs_last_error () in
+                             if str_len w == 0 then ("mengd: cannot pull " ++ ref) else w))])
+    else
+      respond fd "200 OK" "application/json"
+        (obj [("status", s ("Downloaded newer image for " ++ got))])
   else if path == "/volumes" then c_vol_list fd store
   else if path == "/volumes/create" then
     let clen = header_int req "Content-Length: " in

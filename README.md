@@ -113,6 +113,44 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## `docker pull`, from a registry that is also Mere
+
+```
+$ docker pull localhost:5000/lib/alpine:v1
+Downloaded newer image for localhost:5000/lib/alpine:v1
+$ docker run --rm localhost:5000/lib/alpine:v1 echo pulled-and-ran
+pulled-and-ran
+```
+
+`/images/create` fetches the manifest, follows an index to the linux/arm64
+manifest inside it, and downloads the config and layer blobs. The registry on
+the other end is [mreg](https://github.com/284km/mreg) and the container is run
+by [mrun](https://github.com/284km/mrun), so nothing in that line is Go.
+
+What it writes is the **same on-disk shape `docker save` produces** —
+`blobs/sha256/<hex>` and a `manifest.json` — so registering it, building a
+rootfs from it and running it are the code paths that already existed. A pulled
+image and a loaded one are indistinguishable downstream.
+
+### Two off-by-a-colon bugs in one route
+
+`docker pull localhost:5000/lib/alpine:v1` sends
+`fromImage=localhost%3A5000%2Flib%2Falpine` and `tag=v1`. **Percent-encoded**,
+so a reader that does not decode sees no registry host at all — the same bug
+class that cost eleven conformance specs in mreg, in a different codebase, a day
+apart.
+
+And then: a tag is a colon **after the last slash**. Taking any colon as "already
+tagged" makes `localhost:5000/lib/alpine` look tagged by its own port number,
+so the pull asked for `latest` and reported the manifest missing.
+
+### Same content, different name
+
+The first version returned early when the config digest was already in the
+store, so `docker pull` succeeded and `docker images` did not list what it had
+just pulled. Content that is already here under another name is still a new
+name.
+
 ## `docker compose up`
 
 ```
