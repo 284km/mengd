@@ -913,20 +913,68 @@ let insecure_registry = fn (host: str) -> fn (port: int) ->
   go (split_on (env_or "MENGD_INSECURE") ",");
 
 // One GET, body straight to a file. Returns the Content-Type, or "" on failure.
+// A tunnel through an HTTP proxy. MENGD_PROXY is "host:port".
+//
+// This exists for a machine that has no route to the internet and cannot be
+// given one as a table: a registry redirects blobs to a content network whose
+// host nobody knows when the machine starts, and a route cannot follow a name
+// it was never given. A proxy can be TOLD the name.
+//
+// The TLS handshake still happens here, with the real host, through the
+// tunnel. The proxy sees the name in the CONNECT line and ciphertext after it
+// -- which is the whole difference between this and letting something else
+// terminate TLS on our behalf.
+let proxy_connect = fn (host: str) -> fn (port: int) ->
+  let proxy = env_or "MENGD_PROXY" in
+  let c = last_index_of_str proxy ":" in
+  if c < 0 then 0 - 1
+  else
+    let ph = substring proxy 0 c in
+    let pp = int_or (substring proxy (c + 1) (str_len proxy)) 0 in
+    let fd = tcp_connect ph pp in
+    if fd < 0 then
+      let _ = fs_fail ("mengd: cannot reach the proxy at " ++ proxy) "" in 0 - 1
+    else
+      let target = host ++ ":" ++ show port in
+      let _ = write_str fd ("CONNECT " ++ target ++ " HTTP/1.1\r\nHost: " ++ target
+                         ++ "\r\nProxy-Connection: keep-alive\r\n\r\n") in
+      let buf = mem_alloc 4096 in
+      let n = tcp_read fd buf 4095 in
+      if n <= 0 then
+        let _ = fs_fail ("mengd: the proxy at " ++ proxy ++ " said nothing about "
+                      ++ target) "" in
+        let _ = tcp_close fd in 0 - 1
+      else
+        let head = mem_to_str buf n in
+        let status = if str_len head > 12 then substring head 9 12 else "" in
+        if status != "200" then
+          let _ = fs_fail ("mengd: the proxy at " ++ proxy ++ " refused " ++ target
+                        ++ " with " ++ status) "" in
+          let _ = tcp_close fd in 0 - 1
+        else
+          let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                    print_err ("reg: tunnelled to " ++ target ++ " through " ++ proxy) else () in
+          fd;
+
 // Connect to a registry and, unless it was named as a plaintext one, verify
 // it. The socket goes where MENGD_DIAL says; the certificate is checked
 // against the name the image was asked for, which are the same thing except
 // inside a machine with no resolver and no route.
 let reg_dial = fn (host: str) -> fn (port: int) ->
   let (dh, dp) = dial_for host port in
-  let fd = tcp_connect dh dp in
+  // A proxy takes precedence over the dial table: it resolves the name itself,
+  // which is the reason for having one.
+  let fd = if str_len (env_or "MENGD_PROXY") > 0 then proxy_connect host port
+           else tcp_connect dh dp in
   if fd < 0 then
     // Named, because the two ways this fails look identical to the client:
     // nothing is listening there, or this machine cannot turn that name into
     // an address. A guest with no resolver only ever meets the second, and
     // "cannot fetch the manifest" says nothing about either.
-    let _ = fs_fail ("mengd: cannot reach a registry at " ++ dh ++ ":" ++ show dp
-                  ++ " (nothing listening, or this machine cannot resolve that name)") "" in
+    let _ = if str_len (fs_last_error ()) == 0 then
+              (let _ = fs_fail ("mengd: cannot reach a registry at " ++ dh ++ ":" ++ show dp
+                             ++ " (nothing listening, or this machine cannot resolve"
+                             ++ " that name)") "" in ()) else () in
     0 - 1
   else if insecure_registry host port == false
           && tcp_starttls_verified fd host (env_or "MENGD_CA") != 0 then

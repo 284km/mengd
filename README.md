@@ -595,6 +595,17 @@ a check that cannot run is not a check that passed, and the authentication
 path, the redirect and the chunked response are only reachable against the real
 thing.
 
+## Through a proxy
+
+`MENGD_PROXY=host:port` tunnels every registry connection with HTTP `CONNECT`.
+It exists for a machine with no route to the internet that cannot be given one
+as a table: a registry redirects blobs to a content network whose host nobody
+knows when the machine starts, and a route cannot follow a name it was never
+given.
+
+**The handshake still happens here**, with the real host, through the tunnel.
+The proxy sees the name in the CONNECT line and ciphertext after it.
+
 ## Where to dial, and what to verify
 
 `MENGD_DIAL=<registry host:port>=<host:port>` separates the socket from the
