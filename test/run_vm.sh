@@ -106,6 +106,32 @@ say \$? "and does not reflect raw bytes from the archive"
 
 timeout 30 docker load -i /var/tmp/mengd-test.tar >/dev/null 2>&1; say \$? "a good archive still loads afterwards"
 
+# docker compose. Two services so the network is listed as well as created,
+# and one that fails so the exit codes have to come back separately.
+mkdir -p /var/tmp/mengd-compose
+cat > /var/tmp/mengd-compose/compose.yaml <<'YAML'
+services:
+  one:
+    image: alpine:latest
+    command: ["sh", "-c", "echo service-one; exit 0"]
+  two:
+    image: alpine:latest
+    command: ["sh", "-c", "echo service-two 1>&2; exit 3"]
+YAML
+cd /var/tmp/mengd-compose
+timeout 120 docker compose -p mengdtest up > /var/tmp/compose.out 2>&1
+say \$? "docker compose up"
+grep -q "service-one" /var/tmp/compose.out; say \$? "a service's stdout reached the terminal"
+grep -q "service-two" /var/tmp/compose.out; say \$? "and the other's stderr"
+grep -q "exited with code 0" /var/tmp/compose.out; say \$? "compose saw the first exit code"
+grep -q "exited with code 3" /var/tmp/compose.out; say \$? "and the second, which differs"
+timeout 90 docker compose -p mengdtest down >> /var/tmp/compose.out 2>&1
+say \$? "docker compose down"
+grep -q "Network mengdtest_default *Removed" /var/tmp/compose.out; say \$? "down removed the network it created"
+n=\$(timeout 20 docker network ls -q 2>/dev/null | wc -l | tr -d ' ')
+[ "\$n" = 0 ]; say \$? "no networks left (\$n)"
+cd /
+
 timeout 20 docker rm -f ok1 bad1 fg fg2 >/dev/null 2>&1; say \$? "docker rm"
 n=\$(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
 [ "\$n" = 0 ]; say \$? "and they are gone (\$n)"

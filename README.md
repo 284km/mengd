@@ -113,6 +113,57 @@ check that could not run as one that passed. That is the third assertion in this
 project to pass for a reason other than the one it was written for; the poison
 is what caught all three.
 
+## `docker compose up`
+
+```
+$ docker compose up
+ Network mengdtest_default  Created
+ Container mengdtest-one-1  Started
+ Container mengdtest-two-1  Started
+one-1  | service-one
+two-1  | service-two
+one-1 exited with code 0
+two-1 exited with code 3
+$ docker compose down
+ Container mengdtest-one-1  Removed
+ Network mengdtest_default  Removed
+```
+
+Two services, their streams kept apart, their exit codes kept apart, and the
+network created and removed. Fifteen routes: `_ping`, `version`, `info`,
+`images/load`, `images/json`, `images/{name}/json`, `containers/create`,
+`containers/{id}/` json, start, stop, kill, wait, logs, attach and delete, plus
+`networks/*`, `volumes/*` and `events`.
+
+### What compose needed that a single `docker run` did not
+
+**Label filters.** compose finds its own containers with
+`?filters={"label":{"com.docker.compose.project=x":true}}`, percent-encoded. A
+daemon that ignores the filter hands compose every container on the host and it
+adopts them all.
+
+**Events with labels in them.** compose attaches and then waits for a `die`
+event to know the service finished. An events stream that published nothing
+left it printing the container's output and then sitting there until its own
+timeout — the container had been gone for a minute. And the events have to
+carry the container's labels, because compose filters those too: an event
+without them is an event compose does not believe is its own.
+
+**Docker's vocabulary, not the store's.** The first working event stream sent
+`Action: "running"`. A client filters for `start` and throws the rest away.
+
+**A parseable timestamp.** `Created: ""` is not an empty field to a Go client,
+it is `parsing time "" as "2006-01-02T15:04:05Z07:00"` and a fatal error before
+a single network is listed. RFC 3339 on the inspect routes, a Unix integer in
+the list ones — the API uses both and the client has two decoders.
+
+**Resolving a network by id.** The store is keyed by name and compose removes by
+id, so `down` reported "No resource found to remove" for a network that was
+right there.
+
+**`/volumes`.** `docker compose down` will not finish without listing them,
+even for a project that has none.
+
 ## It runs containers
 
 ```

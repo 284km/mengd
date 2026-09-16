@@ -136,3 +136,24 @@ int st_slot_release(int i) {
     pthread_mutex_unlock(&slot_m);
     return 0;
 }
+
+/* ---- timestamps -------------------------------------------------------- */
+/*
+ * The API's Created fields are RFC 3339 strings, and the client parses them
+ * with Go's time package: an empty one is a fatal error, not a missing field.
+ * `docker compose up` on a second project died with
+ *   parsing time "" as "2006-01-02T15:04:05Z07:00"
+ * before it had listed a single network.
+ *
+ * Formatting a date from epoch seconds is a civil-calendar problem that libc
+ * already solves, so it solves it here rather than in the caller.
+ */
+#include <time.h>
+static _Thread_local char ts_buf[64];
+const char *st_rfc3339(int secs) {
+    time_t t = (time_t)secs;
+    struct tm g;
+    if (!gmtime_r(&t, &g)) { ts_buf[0] = 0; return ts_buf; }
+    strftime(ts_buf, sizeof ts_buf, "%Y-%m-%dT%H:%M:%SZ", &g);
+    return ts_buf;
+}

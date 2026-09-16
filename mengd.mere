@@ -35,6 +35,8 @@ extern fn st_slots: unit -> int;
 extern fn st_slot_acquire: unit -> int;
 extern fn st_slot_release: int -> int;
 extern fn fs_last_error: unit -> str;
+extern fn io_set_nonblocking: int -> int;
+extern fn st_rfc3339: int -> str;
 extern fn gen_request_id: unit -> str;
 extern fn sha256_hex: str -> str;
 
@@ -421,6 +423,26 @@ let basename = fn (p: str) ->
     else go (i + 1) (if char_at p i == "/" then i else last) in
   go 0 (0 - 1);
 
+// int_of_str ABORTS on anything it cannot read, empty string included, and a
+// stored field is missing whenever the thing it describes has not happened yet
+// -- a container that was created but never started has no pid file. Reading
+// one took the daemon down on the first `docker compose up`, at the first
+// inspect. Every read of a stored number goes through this.
+let int_or = fn (v: str) -> fn (dflt: int) ->
+  let t = str_trim v in
+  let n = str_len t in
+  if n == 0 then dflt
+  else
+    let neg = char_at t 0 == "-" in
+    let start = if neg then 1 else 0 in
+    let rec go = fn (i: int) -> fn (acc: int) ->
+      if i >= n then (if neg then 0 - acc else acc)
+      else
+        let c = ord (char_at t i) in
+        if c < 48 then dflt else if c > 57 then dflt
+        else go (i + 1) (acc * 10 + (c - 48)) in
+    if start >= n then dflt else go start 0;
+
 let index_path = fn (store: str) -> store ++ "/images.index";
 
 let read_index = fn (store: str) ->
@@ -511,7 +533,7 @@ let images_body = fn (store: str) ->
       else
         let id = field l 0 in
         let tag = field l 1 in
-        let sz = int_of_str (field l 3) in
+        let sz = int_or (field l 3) 0 in
         let e = obj [("Containers", n_ (0 - 1)), ("Created", n_ 0),
                      ("Descriptor", raw "null"), ("Id", s id),
                      ("Labels", raw "null"), ("ParentId", s ""),
@@ -574,7 +596,9 @@ let header_int = fn (req: str) -> fn (name: str) ->
   else
     let rest = substring req (i + str_len name) (str_len req) in
     let e = str_index_of rest "\r" in
-    int_of_str (str_trim (if e < 0 then rest else substring rest 0 e));
+    // A malformed Content-Length is a bad request, not a reason to abort: this
+    // value comes straight off the wire.
+    int_or (if e < 0 then rest else substring rest 0 e) 0;
 
 // The OCI bundle mrun is handed. Same shape `runc spec` writes, with this
 // container's command, environment and working directory in it.
@@ -612,6 +636,21 @@ let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) -> f
 // Re-serialise a parsed string array. The create body gives Cmd and Env as
 // JSON; the OCI bundle wants them as JSON too, so they make a round trip
 // through the parser rather than being pasted across as raw text.
+// An object back out as JSON text. Only what a create body puts in Labels --
+// flat string to string -- which is all compose uses it for.
+let jobj_raw = fn (v: Json.json) ->
+  match v with
+  | Json.JObj kvs ->
+      (let rec go = fn (ps: (str * Json.json) list) -> fn (acc: str) ->
+         match ps with
+         | [] -> acc
+         | [p, ...t] ->
+             let (k, x) = p in
+             let one = "\"" ++ k ++ "\":" ++ s (jstr x) in
+             go t (if str_len acc == 0 then one else acc ++ "," ++ one) in
+       "\{" ++ go kvs "" ++ "}")
+  | _ -> "\{}";
+
 let jstrs = fn (v: Json.json) ->
   let rec go = fn (xs: Json.json list) -> fn (acc: str) ->
     match xs with
@@ -644,6 +683,327 @@ let query_param = fn (q: str) -> fn (k: str) ->
     let rest = substring q (i + str_len key) (str_len q) in
     let e = str_index_of rest "&" in
     if e < 0 then rest else substring rest 0 e;
+
+// ---- percent decoding + label filters ------------------------------------
+//
+// `docker compose` selects its own containers with
+//   ?filters={"label":{"com.docker.compose.project=p24b":true, ...}}
+// percent-encoded. A daemon that ignores the filter hands compose every
+// container on the host and it adopts them all.
+
+let url_decode = fn (v: str) ->
+  let n = str_len v in
+  let hexd = fn (c: str) ->
+    let o = ord c in
+    if o >= 48 then (if o <= 57 then o - 48
+                     else if o >= 97 then (if o <= 102 then o - 87 else 0)
+                     else if o >= 65 then (if o <= 70 then o - 55 else 0) else 0)
+    else 0 in
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= n then acc
+    else
+      let c = char_at v i in
+      if c == "+" then go (i + 1) (acc ++ " ")
+      else if c == "%" then
+        (if i + 2 < n then go (i + 3) (acc ++ chr (hexd (char_at v (i + 1)) * 16
+                                                  + hexd (char_at v (i + 2))))
+         else acc ++ c)
+      else go (i + 1) (acc ++ c) in
+  go 0 "";
+
+// Every key of filters.label, as stored: "k=v" or "k".
+let filter_labels = fn (q: str) ->
+  let raw = query_param q "filters" in
+  if str_len raw == 0 then []
+  else
+    match Json.parse_json (url_decode raw) with
+    | Json.JObj kvs ->
+        (let rec find = fn (ps: (str * Json.json) list) ->
+           match ps with
+           | [] -> []
+           | [p, ...t] ->
+               let (k, v) = p in
+               if k == "label" then
+                 (match v with
+                  | Json.JObj ls ->
+                      (let rec keys = fn (qs: (str * Json.json) list) ->
+                         match qs with
+                         | [] -> []
+                         | [q2, ...t2] -> let (k2, v2) = q2 in k2 :: keys t2 in
+                       keys ls)
+                  | _ -> [])
+               else find t in
+         find kvs)
+    | _ -> [];
+
+// The container's own labels, stored at create as the raw JSON object.
+let has_label = fn (labels: str) -> fn (want: str) ->
+  let i = str_index_of want "=" in
+  if i < 0 then str_index_of labels ("\"" ++ want ++ "\":") >= 0
+  else
+    let k = substring want 0 i in
+    let v = substring want (i + 1) (str_len want) in
+    str_index_of labels ("\"" ++ k ++ "\":\"" ++ v ++ "\"") >= 0;
+
+let rec matches_all = fn (labels: str) -> fn (wants: str list) ->
+  match wants with
+  | [] -> true
+  | [h, ...t] -> if has_label labels h then matches_all labels t else false;
+
+// ---- images: inspect -----------------------------------------------------
+
+let c_image_inspect = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  let dir = image_dir store (norm_tag name) in
+  if str_len dir == 0 then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such image: " ++ name))])
+  else
+    let rec find_id = fn (rest: str) ->
+      let i = str_index_of rest "\n" in
+      if i < 0 then ""
+      else let l = substring rest 0 i in
+           if field l 2 == dir then field l 0
+           else find_id (substring rest (i + 1) (str_len rest)) in
+    let id = find_id (read_index store) in
+    respond fd "200 OK" "application/json"
+      (obj [("Id", s id), ("RepoTags", raw ("[" ++ s (norm_tag name) ++ "]")),
+            ("RepoDigests", raw "[]"), ("Created", s (st_rfc3339 (unix_time ()))),
+            ("Size", n_ 0),
+            ("Architecture", s "arm64"), ("Os", s "linux"), ("Variant", s ""),
+            ("Comment", s ""), ("Descriptor", raw "null"), ("Identity", raw "null"),
+            ("Metadata", raw "\{}"),
+            ("RootFS", obj [("Type", s "layers"), ("Layers", raw "[]")]),
+            ("Config", obj [("Env", raw "[]"), ("Cmd", raw "null"),
+                            ("Entrypoint", raw "null"), ("Labels", raw "null"),
+                            ("WorkingDir", s ""), ("User", s "")])]);
+
+// ---- networks ------------------------------------------------------------
+//
+// A record and an id. mrun gives each container its own network namespace and
+// nothing joins them, so a compose network is bookkeeping: compose asks for one
+// before it will start anything, and this says yes. Containers on it cannot
+// reach each other, which is written down rather than implied.
+
+let ndir = fn (store: str) -> fn (name: str) -> store ++ "/networks/" ++ name;
+
+// The store is keyed by name; the client refers to a network by either name or
+// id, and compose uses the ID to remove one. `docker compose down` reported
+// "No resource found to remove" for a network that was right there.
+let nresolve = fn (store: str) -> fn (want: str) ->
+  if file_exists (ndir store want ++ "/id") then want
+  else
+    let d = store ++ "/networks" in
+    if not (file_exists d) then ""
+    else
+      let rec go = fn (xs: str list) ->
+        match xs with
+        | [] -> ""
+        | [h, ...t] ->
+            let i = read_file (ndir store h ++ "/id") in
+            if i == want then h
+            else if str_len want >= 12 then (if str_index_of i want == 0 then h else go t)
+            else go t in
+      go (list_dir d);
+
+let net_body = fn (store: str) -> fn (name: str) -> fn (with_status: bool) ->
+  let id = read_file (ndir store name ++ "/id") in
+  let base = [("Name", s name), ("Id", s id),
+              ("Created", s (st_rfc3339 (int_or (read_file (ndir store name ++ "/created")) 0))),
+              ("Scope", s "local"), ("Driver", s "bridge"),
+              ("EnableIPv4", b true), ("EnableIPv6", b false),
+              ("IPAM", obj [("Driver", s "default"), ("Options", raw "null"),
+                            ("Config", raw "[]")]),
+              ("Internal", b false), ("Attachable", b false), ("Ingress", b false),
+              ("ConfigFrom", obj [("Network", s "")]), ("ConfigOnly", b false),
+              ("Containers", raw "\{}"), ("Options", raw "\{}"),
+              ("Labels", raw (let l = read_file (ndir store name ++ "/labels") in
+                              if str_len l == 0 then "\{}" else l))] in
+  // `++` is string concatenation; a list grows with `::`. Key order in an
+  // object does not matter, so prepending is fine.
+  obj (if with_status then ("Status", raw "\{}") :: base else base);
+
+let c_net_create = fn (fd: int) -> fn (store: str) -> fn (body: str) ->
+  let spec = Json.parse_json body in
+  let name = jstr (jget spec "Name") in
+  if str_len name == 0 then
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s "mengd: a network needs a Name")])
+  else
+    let d = ndir store name in
+    let id = sha256_hex (gen_request_id ()) in
+    let _ = mkdir_p d in
+    let _ = write_file (d ++ "/id") id in
+    let _ = write_file (d ++ "/labels") (jobj_raw (jget spec "Labels")) in
+    let _ = write_file (d ++ "/created") (show (unix_time ())) in
+    respond fd "201 Created" "application/json"
+      (obj [("Id", s id), ("Warning", s "")]);
+
+let c_net_list = fn (fd: int) -> fn (store: str) ->
+  let d = store ++ "/networks" in
+  if not (file_exists d) then respond fd "200 OK" "application/json" "[]"
+  else
+    let rec go = fn (xs: str list) -> fn (acc: str) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] ->
+          let e = net_body store h false in
+          go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
+    respond fd "200 OK" "application/json" ("[" ++ go (list_dir d) "" ++ "]");
+
+let c_net_inspect = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  if not (file_exists (ndir store name ++ "/id")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("network " ++ name ++ " not found"))])
+  else respond fd "200 OK" "application/json" (net_body store name true);
+
+let c_net_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  if not (file_exists (ndir store name ++ "/id")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("network " ++ name ++ " not found"))])
+  else
+    let _ = st_rmtree (ndir store name) in
+    respond fd "204 No Content" "text/plain" "";
+
+// ---- volumes -------------------------------------------------------------
+//
+// A named directory and a record. Nothing mounts them yet -- the OCI bundle
+// mengd writes has no bind mounts in it -- so a volume here is a name that can
+// be created, listed and removed. `docker compose down` asks for the list
+// before it will finish, which is how this came to be written.
+
+let vdir = fn (store: str) -> fn (name: str) -> store ++ "/volumes/" ++ name;
+
+let vol_body = fn (store: str) -> fn (name: str) ->
+  obj [("Name", s name), ("Driver", s "local"),
+       ("Mountpoint", s (vdir store name ++ "/_data")),
+       ("CreatedAt", s (st_rfc3339 (int_or (read_file (vdir store name ++ "/created")) 0))),
+       ("Scope", s "local"), ("Options", raw "null"),
+       ("Labels", raw (let l = read_file (vdir store name ++ "/labels") in
+                       if str_len l == 0 then "\{}" else l))];
+
+let c_vol_list = fn (fd: int) -> fn (store: str) ->
+  let d = store ++ "/volumes" in
+  let items =
+    if not (file_exists d) then ""
+    else
+      let rec go = fn (xs: str list) -> fn (acc: str) ->
+        match xs with
+        | [] -> acc
+        | [h, ...t] ->
+            let e = vol_body store h in
+            go t (if str_len acc == 0 then e else acc ++ "," ++ e) in
+      go (list_dir d) "" in
+  respond fd "200 OK" "application/json"
+    (obj [("Volumes", raw ("[" ++ items ++ "]")), ("Warnings", raw "[]")]);
+
+let c_vol_create = fn (fd: int) -> fn (store: str) -> fn (body: str) ->
+  let spec = Json.parse_json body in
+  let name0 = jstr (jget spec "Name") in
+  let name = if str_len name0 == 0 then substring (sha256_hex (gen_request_id ())) 0 24 else name0 in
+  let d = vdir store name in
+  let _ = mkdir_p (d ++ "/_data") in
+  let _ = write_file (d ++ "/created") (show (unix_time ())) in
+  let _ = write_file (d ++ "/labels") (jobj_raw (jget spec "Labels")) in
+  respond fd "201 Created" "application/json" (vol_body store name);
+
+let c_vol_inspect = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  if not (file_exists (vdir store name ++ "/created")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("get " ++ name ++ ": no such volume"))])
+  else respond fd "200 OK" "application/json" (vol_body store name);
+
+let c_vol_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  if not (file_exists (vdir store name ++ "/created")) then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("get " ++ name ++ ": no such volume"))])
+  else
+    let _ = st_rmtree (vdir store name) in
+    respond fd "204 No Content" "text/plain" "";
+
+// ---- events --------------------------------------------------------------
+//
+// `docker compose up` attaches and then waits for the service to finish, and
+// what tells it so is a `die` event. With an events stream that published
+// nothing, compose printed the container's output and then sat there until its
+// own timeout -- the container had been gone for a minute.
+//
+// The state lives in files, so this watches them: a poll, a remembered state
+// per container, and an event whenever one changes.
+// The names are Docker's, not the store's: a client filters on `start` and
+// `die`, and an event that says `running` is one it throws away.
+let action_of = fn (state: str) ->
+  if state == "created" then "create"
+  else if state == "running" then "start"
+  else if state == "exited" then "die"
+  else "";
+
+// Actor.Attributes carries the container's LABELS as well as its name and
+// image. compose asks for events filtered by its own project label, so an
+// event without labels is an event compose does not believe is its own --
+// which is why it kept waiting for a container that had already died.
+let event_json = fn (store: str) -> fn (id: str) -> fn (action: str) ->
+  let ls = cread store id "labels" in
+  let inner = if str_len ls > 2 then substring ls 1 (str_len ls - 1) else "" in
+  let fixed = "\"image\":" ++ s (cread store id "image")
+           ++ ",\"name\":" ++ s (cread store id "name")
+           ++ ",\"exitCode\":" ++ s (str_trim (cread store id "exit")) in
+  let attrs = "\{" ++ fixed ++ (if str_len inner == 0 then "" else "," ++ inner) ++ "}" in
+  obj [("status", s action), ("id", s id), ("from", s (cread store id "image")),
+       ("Type", s "container"), ("Action", s action),
+       ("Actor", obj [("ID", s id), ("Attributes", raw attrs)]),
+       ("scope", s "local"), ("time", n_ (unix_time ()))] ++ "\n";
+
+// The state of every container, as one string, so a change is a string compare.
+let states_of = fn (store: str) ->
+  let d = store ++ "/containers" in
+  if not (file_exists d) then ""
+  else
+    let rec go = fn (xs: str list) -> fn (acc: str) ->
+      match xs with
+      | [] -> acc
+      | [h, ...t] -> go t (acc ++ h ++ "=" ++ cread store h "state" ++ ";") in
+    go (list_dir d) "";
+
+let c_events = fn (fd: int) -> fn (store: str) -> fn (q: str) ->
+  // The client filters by label; so does the daemon.
+  let wants = filter_labels q in
+  let _ = respond_chunked_head fd "application/json" in
+  let _ = io_set_nonblocking fd in
+  let probe = mem_alloc 16 in
+  let rec watch = fn (n: int) -> fn (prev: str) ->
+    // A read of 0 on a non-blocking socket means the peer closed; -1 is
+    // "nothing to read yet", which is the normal case and not a reason to stop.
+    let r = tcp_read fd probe 16 in
+    if r == 0 then ()
+    else if n > 1200 then ()                 // ten minutes, then let it go
+    else
+      let now = states_of store in
+      let _ =
+        if now == prev then ()
+        else
+          // Emit for every container whose state is not what it was. Comparing
+          // whole snapshots would say "something changed"; this says which.
+          let d = store ++ "/containers" in
+          let rec each_c = fn (xs: str list) ->
+            match xs with
+            | [] -> ()
+            | [h, ...t] ->
+                let cur = cread store h "state" in
+                let was = h ++ "=" ++ cur ++ ";" in
+                let act = action_of cur in
+                // A container directory exists for a moment before its files
+                // are written; an event for that state says nothing and its
+                // fields are all empty.
+                let _ = if str_len act == 0 then ()
+                        else if str_index_of prev was >= 0 then ()
+                        else if not (matches_all (cread store h "labels") wants) then ()
+                        else send_chunk fd (event_json store h act) in
+                each_c t in
+          each_c (list_dir d) in
+      let _ = sleep_ms 200 in
+      watch (n + 1) now in
+  let _ = watch 0 (states_of store) in
+  end_chunks fd;
 
 let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) ->
   // Length only. A create body carries the container's environment, which is
@@ -685,6 +1045,7 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
+      let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
       let _ = cwrite store id "created" (show (unix_time ())) in
       let _ = cwrite store id "state" "created" in
       let _ = tc "created" in
@@ -711,12 +1072,22 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
     let _ = cwrite store id "state" "exited" in
     ();
 
+// Stop and kill. A container that has already exited is a 304 in the real API
+// for stop -- "not modified" -- and the client treats that as success.
+let c_stop = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (sig: int) ->
+  if cread store id "state" == "exited" then
+    respond fd "304 Not Modified" "text/plain" ""
+  else
+    let pid = int_or (cread store id "pid") 0 in
+    let _ = if pid > 0 then st_kill pid sig else 0 in
+    respond fd "204 No Content" "text/plain" "";
+
 let c_wait = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
   // Headers first, before the container has even been started: the client
   // sends /start only after these arrive.
   let _ = respond_chunked_head fd "application/json" in
   let rec poll = fn (n: int) ->
-    if cread store id "state" == "exited" then int_of_str (str_trim (cread store id "exit"))
+    if cread store id "state" == "exited" then int_or (cread store id "exit") 0
     else if n > 3000 then 0 - 1            // five minutes, then answer anyway
     else let _ = sleep_ms 100 in poll (n + 1) in
   let code = poll 0 in
@@ -794,13 +1165,15 @@ let cmd_line = fn (store: str) -> fn (id: str) ->
 let c_inspect_body = fn (store: str) -> fn (id: str) ->
   let state = cread store id "state" in
   let running = state == "running" in
-  obj [("Id", s id), ("Created", s (cread store id "created")),
+  // RFC 3339 here; the LIST uses a unix integer for the same idea, which is
+  // what the API says and what the client's two decoders expect.
+  obj [("Id", s id), ("Created", s (st_rfc3339 (int_or (cread store id "created") 0))),
        ("Path", s (cmd_line store id)), ("Args", raw "[]"),
        ("State", obj [("Status", s state), ("Running", b running),
                       ("Paused", b false), ("Restarting", b false),
                       ("OOMKilled", b false), ("Dead", b false),
-                      ("Pid", n_ (int_of_str (str_trim (cread store id "pid")))),
-                      ("ExitCode", n_ (int_of_str (str_trim (cread store id "exit")))),
+                      ("Pid", n_ (int_or (cread store id "pid") 0)),
+                      ("ExitCode", n_ (int_or (cread store id "exit") 0)),
                       ("Error", s ""), ("StartedAt", s ""), ("FinishedAt", s "")]),
        ("Image", s (cread store id "image")), ("ResolvConfPath", s ""),
        ("HostnamePath", s ""), ("HostsPath", s ""), ("LogPath", s (cdir store id ++ "/log.out")),
@@ -814,7 +1187,7 @@ let c_inspect_body = fn (store: str) -> fn (id: str) ->
        ("NetworkSettings", raw "\{}"), ("Storage", raw "\{}"),
        ("ImageManifestDescriptor", raw "null")];
 
-let c_list_body = fn (store: str) ->
+let c_list_body = fn (store: str) -> fn (q: str) ->
   let d = store ++ "/containers" in
   if not (file_exists d) then "[]"
   else
@@ -822,12 +1195,15 @@ let c_list_body = fn (store: str) ->
       match xs with
       | [] -> acc
       | [h, ...t] ->
+          if not (matches_all (cread store h "labels") (filter_labels q)) then go t acc else
           let e = obj [("Id", s h), ("Names", raw ("[" ++ s ("/" ++ cread store h "name") ++ "]")),
                        ("Image", s (cread store h "image")), ("ImageID", s ""),
                        ("Command", s (cmd_line store h)),
-                       ("Created", n_ (int_of_str (str_trim (cread store h "created")))),
+                       ("Created", n_ (int_or (cread store h "created") 0)),
                        ("Ports", raw "[]"),
-                       ("Labels", raw "\{}"), ("State", s (cread store h "state")),
+                       ("Labels", raw (let l = cread store h "labels" in
+                                       if str_len l == 0 then "\{}" else l)),
+                       ("State", s (cread store h "state")),
                        ("Status", s (cread store h "state")),
                        ("HostConfig", raw "\{}"), ("NetworkSettings", raw "\{}"),
                        ("Mounts", raw "[]")] in
@@ -885,8 +1261,32 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   else if path == "/info" then respond fd "200 OK" "application/json" (info_body ())
   else if path == "/images/json" then
     respond fd "200 OK" "application/json" (images_body store)
+  else if path == "/events" then c_events fd store q
+  else if path == "/volumes" then c_vol_list fd store
+  else if path == "/volumes/create" then
+    let clen = header_int req "Content-Length: " in
+    let body = read_body fd buf cap st clen in
+    c_vol_create fd store body
+  else if str_index_of path "/volumes/" == 0 then
+    let vn = seg_after path "/volumes/" in
+    (if m == "DELETE" then c_vol_delete fd store vn else c_vol_inspect fd store vn)
+  else if path == "/networks" then c_net_list fd store
+  else if path == "/networks/create" then
+    let clen = header_int req "Content-Length: " in
+    let body = read_body fd buf cap st clen in
+    c_net_create fd store body
+  else if str_index_of path "/networks/" == 0 then
+    let asked = seg_after path "/networks/" in
+    let nm = let r = nresolve store asked in if str_len r == 0 then asked else r in
+    (if m == "DELETE" then c_net_delete fd store nm else c_net_inspect fd store nm)
+  else if str_index_of path "/images/" == 0 then
+    (let rest = seg_after path "/images/" in
+     let i = str_index_of rest "/json" in
+     if i >= 0 then c_image_inspect fd store (substring rest 0 i)
+     else respond fd "404 Not Found" "application/json"
+            (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/containers/json" then
-    respond fd "200 OK" "application/json" (c_list_body store)
+    respond fd "200 OK" "application/json" (c_list_body store q)
   else if path == "/containers/create" then
     let clen = header_int req "Content-Length: " in
     let body = read_body fd buf cap st clen in
@@ -903,6 +1303,9 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     else if verb == "wait" then c_wait fd store id
     else if verb == "logs" then c_logs fd store id
     else if verb == "attach" then c_attach fd store id req
+    else if verb == "stop" then c_stop fd store id 15
+    else if verb == "kill" then c_stop fd store id 9
+    else if verb == "restart" then c_stop fd store id 15
     else if verb == "json" then
       respond fd "200 OK" "application/json" (c_inspect_body store id)
     else if str_len verb == 0 then
