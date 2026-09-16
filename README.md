@@ -641,6 +641,22 @@ does not do that yet, so the whole root filesystem is written as a single
 uncompressed layer. Correct, runnable, and larger than it needs to be. That is
 the next thing to fix, and writing it here is cheaper than finding it later.
 
+### A step that needs the network
+
+A `RUN` step shares the machine's network namespace, and inside a VM that
+namespace has a loopback and nothing else — `apk add` would resolve nothing.
+When this daemon was itself given a `MENGD_PROXY`, build steps get
+`HTTP_PROXY`, `HTTPS_PROXY` and the lower-case pair pointing at it, so the
+tools find the way out that the daemon has.
+
+Only then. On a machine with a network the step needs no proxy, and adding one
+would send its traffic somewhere it was not asked to go. The Dockerfile wins:
+an `ENV` in the file is set after these.
+
+**A tool has to speak `CONNECT`.** `curl`, `apk`, `npm` and `pip` do; busybox's
+`wget` does not — it asks the proxy to fetch on its behalf, which for `https`
+would mean the proxy doing the TLS and the caller verifying nothing.
+
 ### What the image says, where the request said nothing
 
 An image carries a `Cmd`, an `Env` and a `WorkingDir`, and `docker run mine:v1`

@@ -2140,6 +2140,24 @@ let rec copy_tree = fn (src: str) -> fn (dst: str) ->
       // that behaves differently and says nothing.
       let _ = refuse "not a file, a directory or a symlink" src in 0 - 1;
 
+// The proxy a build step should use, as environment entries.
+//
+// A RUN step shares the machine's network namespace, and inside a VM that
+// namespace has a loopback and nothing else: `apk add` would resolve nothing.
+// What it does have is the forwarder out, and every tool worth building with
+// honours these four names. They are added only when this daemon was itself
+// given a proxy -- on a machine with a network the step needs none, and adding
+// one would send its traffic somewhere it was not asked to go.
+//
+// The Dockerfile wins: an ENV in the file is set after these.
+let proxy_env = fn (u: unit) ->
+  let p = env_or "MENGD_PROXY" in
+  if str_len p == 0 then ""
+  else
+    let url = "http://" ++ p in
+    s ("HTTP_PROXY=" ++ url) ++ "," ++ s ("HTTPS_PROXY=" ++ url) ++ ","
+    ++ s ("http_proxy=" ++ url) ++ "," ++ s ("https_proxy=" ++ url);
+
 // A shell form becomes the same argv the runtime is given everywhere else.
 let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
 
@@ -2216,7 +2234,14 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                  (let _ = vec_set st2 4 "mengd: RUN before FROM" in ())
                else
                  let bundle = work ++ "/bundle" in
-                 let cfg = oci_config (shell_argv arg) (vec_get st2 1 : str)
+                 // The step's environment: the proxy first, the image's and
+                 // the Dockerfile's after, so an ENV in the file overrides it.
+                 let pe = proxy_env () in
+                 let base = (vec_get st2 1 : str) in
+                 let stepenv = if str_len pe == 0 then base
+                               else if base == "[]" then "[" ++ pe ++ "]"
+                               else "[" ++ pe ++ "," ++ substring base 1 (str_len base) in
+                 let cfg = oci_config (shell_argv arg) stepenv
                                       (vec_get st2 2 : str) "builder" true in
                  let _ = write_file (bundle ++ "/config.json") cfg in
                  let pidf = work ++ "/step.pid" in
