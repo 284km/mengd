@@ -49,6 +49,7 @@ extern fn tcp_connect: str -> int -> int;
 extern fn tcp_starttls_verified: int -> str -> str -> int;
 extern fn gen_request_id: unit -> str;
 extern fn sha256_hex: str -> str;
+extern fn st_sha256_file: str -> str;
 
 // A request trace behind an env var. The routes of one `docker run` land on
 // several connections and several threads, and "which request arrived" is the
@@ -300,6 +301,8 @@ let recv_chunked = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) -> 
   let total = go 0 in
   let _ = file_close fh in
   total;
+
+
 
 // ---- the routes ----------------------------------------------------------
 
@@ -620,6 +623,8 @@ let header_int = fn (req: str) -> fn (name: str) ->
     // value comes straight off the wire.
     int_or (if e < 0 then rest else substring rest 0 e) 0;
 
+
+
 // The OCI bundle mrun is handed. Same shape `runc spec` writes, with this
 // container's command, environment and working directory in it.
 let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
@@ -702,6 +707,15 @@ let image_dir = fn (store: str) -> fn (tag: str) ->
       if field l 1 == want then field l 2
       else go (substring rest (i + 1) (str_len rest)) in
   go (read_index store);
+
+// The config blob an image's manifest names. A base image's own Env and Cmd
+// come out of it: a build that ignored them would produce an image whose PATH
+// is not the one the base set, and the first RUN would not find /bin/sh.
+let base_config_path = fn (dir: str) ->
+  let mj = jparse (read_file (dir ++ "/manifest.json")) in
+  let first = match jarr mj with | [] -> Json.JNull | [h, ...t] -> h in
+  let c = jstr (jget first "Config") in
+  if str_len c == 0 then "" else dir ++ "/" ++ c;
 
 let url_decode = fn (v: str) ->
   let n = str_len v in
@@ -807,6 +821,21 @@ let header_str_of = fn (req: str) -> fn (name: str) ->
     let rest = substring req (i + str_len name) (str_len req) in
     let e = str_index_of rest "\r" in
     str_trim (if e < 0 then rest else substring rest 0 e);
+
+// The body to a file, however the client framed it. `docker load` sends it
+// chunked and `docker build` sends a Content-Length, and a receiver that knows
+// only one of those reads nothing from the other -- which arrives as an empty
+// request rather than as an error.
+let recv_body = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+                fn (req: str) -> fn (path: str) ->
+  if str_index_of (to_lower (header_str_of req "Transfer-Encoding:")) "chunked" >= 0
+  then recv_chunked fd buf cap st path
+  else
+    let clen = header_int req "Content-Length: " in
+    let fh = file_openrw path in
+    let missing = rd_copy fd buf cap st fh clen in
+    let _ = file_close fh in
+    if missing > 0 then clen - missing else clen;
 
 let rg_unlink_if = fn (p: str) -> if file_exists p then st_rmtree p else 0;
 
@@ -1703,14 +1732,41 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
     else
       let name0 = query_param q "name" in
       let name = if str_len name0 == 0 then substring id 0 12 else name0 in
-      let env = match jget spec "Env" with | Json.JArr xs -> jstrs (Json.JArr xs)
-                | _ -> "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]" in
+      // What the IMAGE says, where the request said nothing.
+      //
+      // An image carries a Cmd, an Env and a WorkingDir, and a client that
+      // types `docker run mine:v1` with no command expects the image's. mengd
+      // used only the request, which is empty in that case -- the runtime then
+      // said "process.args is empty", naming the symptom and not the cause.
+      // Nothing noticed because every check here has always passed a command.
+      let icfg = let d = image_dir store (norm_tag img) in
+                 if str_len d == 0 then Json.JNull
+                 else let cp = base_config_path d in
+                      if str_len cp == 0 then Json.JNull else jget (jparse (read_file cp)) "config" in
+      let ienv = jstrs (jget icfg "Env") in
+      let renv = match jget spec "Env" with | Json.JArr xs -> jstrs (Json.JArr xs) | _ -> "[]" in
+      // The image's first, then the request's: a later one wins, which is what
+      // "-e" means.
+      let env = if renv == "[]" then
+                  (if ienv == "[]"
+                   then "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]"
+                   else ienv)
+                else if ienv == "[]" then renv
+                else substring ienv 0 (str_len ienv - 1) ++ "," ++ substring renv 1 (str_len renv) in
       let _ = tc "oci_config" in
       let netmode = jstr (jget (jget spec "HostConfig") "NetworkMode") in
       let host_net = netmode == "host" in
-      let cfg = oci_config (jstrs (jget spec "Cmd")) env
-                           (jstr (jget spec "WorkingDir")) (jstr (jget spec "Hostname"))
-                           host_net in
+      let rcmd = jstrs (jget spec "Cmd") in
+      let argv = if rcmd == "[]" then
+                   let ic = jstrs (jget icfg "Cmd") in
+                   let ie = jstrs (jget icfg "Entrypoint") in
+                   if ie != "[]" && ic != "[]" then
+                     substring ie 0 (str_len ie - 1) ++ "," ++ substring ic 1 (str_len ic)
+                   else if ie != "[]" then ie else ic
+                 else rcmd in
+      let wd = let w = jstr (jget spec "WorkingDir") in
+               if str_len w > 0 then w else jstr (jget icfg "WorkingDir") in
+      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
@@ -1958,10 +2014,229 @@ let split_slash = fn (p: str) ->
   let i = str_index_of p "/" in
   if i < 0 then (p, "") else (substring p 0 i, substring p (i + 1) (str_len p));
 
+// ---- building ---------------------------------------------------------------
+//
+// FROM and RUN, and the result is ONE layer.
+//
+// A real build writes a layer per step, by taking the difference between the
+// filesystem before and after. That wants the runtime to hand back the
+// difference -- overlayfs, whose upper directory IS the layer -- and this does
+// not do that yet, so the whole root filesystem is written as a single layer.
+// Correct, runnable, and larger than it needs to be. The limit is written here
+// rather than left to be discovered, and it is the next thing to fix.
+
+
+
+let bstream = fn (fd: int) -> fn (line: str) ->
+  write_str fd (obj [("stream", s (line ++ "\n"))] ++ "\r\n");
+
+// One line of a Dockerfile, as (instruction, argument). A continuation is
+// joined before this sees it.
+let df_split = fn (line: str) ->
+  let t = str_trim line in
+  if str_len t == 0 || substring t 0 1 == "#" then ("", "")
+  else
+    let sp = str_index_of t " " in
+    if sp < 0 then (to_upper t, "")
+    else (to_upper (substring t 0 sp), str_trim (substring t (sp + 1) (str_len t)));
+
+// Lines, with backslash continuations joined. A RUN spread over five lines is
+// one instruction, and splitting it into five would run four commands that do
+// not make sense on their own.
+let df_lines = fn (text: str) ->
+  let v = vec_new () in
+  let rec go = fn (rest: str) -> fn (acc: str) ->
+    let i = str_index_of rest "\n" in
+    let line = if i < 0 then rest else substring rest 0 i in
+    let more = if i < 0 then "" else substring rest (i + 1) (str_len rest) in
+    let t = str_trim line in
+    let cont = str_len t > 0 && substring t (str_len t - 1) (str_len t) == "\\" in
+    let body = if cont then substring t 0 (str_len t - 1) else t in
+    let joined = if str_len acc == 0 then body else acc ++ " " ++ body in
+    if cont then (if str_len more == 0 then (let _ = vec_push v joined in ()) else go more joined)
+    else
+      let _ = if str_len (str_trim joined) > 0 then (let _ = vec_push v joined in ()) else () in
+      if str_len more == 0 then () else go more "" in
+  let _ = go text "" in
+  v;
+
+// A shell form becomes the same argv the runtime is given everywhere else.
+let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
+
+let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
+              fn (runtime: str) ->
+  let tag0 = url_decode (query_param q "t") in
+  let tag = if str_len tag0 == 0 then "" else norm_tag tag0 in
+  let dfname = let d = url_decode (query_param q "dockerfile") in
+               if str_len d == 0 then "Dockerfile" else d in
+  let uniq = gen_request_id () in
+  let work = store ++ "/build-" ++ uniq in
+  let _ = mkdir_p (work ++ "/ctx") in
+  let _ = write_str fd ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     ++ "Connection: close\r\n\r\n") in
+  let bail = fn (why: str) ->
+    let _ = st_rmtree work in
+    let _ = write_str fd (obj [("errorDetail", obj [("message", s why)]),
+                               ("error", s why)] ++ "\r\n") in
+    0 - 1 in
+  // The context is a tar, the same shape `docker build` always sends.
+  let n = walk ctx (work ++ "/ctx") true in
+  if n < 0 then bail ("mengd: cannot read the build context: " ++ fs_last_error ())
+  else
+    let dfpath = work ++ "/ctx/" ++ dfname in
+    if not (file_exists dfpath) then bail ("mengd: no " ++ dfname ++ " in the build context")
+    else
+      let lines = df_lines (read_file dfpath) in
+      let total = vec_len lines in
+      // What the steps decide, threaded through as strings because that is
+      // what both the runtime config and the image config want.
+      let st2 = vec_new () in
+      let _ = vec_push st2 "" in       // 0: base image dir
+      let _ = vec_push st2 "[]" in     // 1: env, as JSON
+      let _ = vec_push st2 "" in       // 2: workdir
+      let _ = vec_push st2 "" in       // 3: cmd, as JSON
+      let _ = vec_push st2 "" in       // 4: error
+      let rootfs = work ++ "/bundle/rootfs" in
+      let stepno = vec_new () in
+      let _ = vec_push stepno 0 in
+      let rec run_steps = fn (i: int) ->
+        if i >= total then 0
+        else if str_len (vec_get st2 4 : str) > 0 then 0 - 1
+        else
+          let line = (vec_get lines i : str) in
+          let (ins, arg) = df_split line in
+          let _ = vec_set stepno 0 ((vec_get stepno 0 : int) + 1) in
+          let _ = if str_len ins > 0 then
+                    (let _ = bstream fd ("Step " ++ show (vec_get stepno 0 : int) ++ "/"
+                                      ++ show total ++ " : " ++ line) in ()) else () in
+          let _ =
+            if str_len ins == 0 then ()
+            else if ins == "FROM" then
+              (let d = image_dir store arg in
+               if str_len d == 0 then
+                 (let _ = vec_set st2 4 ("mengd: no such image: " ++ arg) in ())
+               else
+                 let _ = mkdir_p rootfs in
+                 let m = build_rootfs d rootfs in
+                 if m < 0 then (let _ = vec_set st2 4 ("mengd: cannot build a rootfs from " ++ arg) in ())
+                 else
+                   // What the base image says about the environment it wants.
+                   let cfgp = base_config_path d in
+                   let cj = if str_len cfgp == 0 then Json.JNull else jparse (read_file cfgp) in
+                   let bc = jget cj "config" in
+                   let _ = vec_set st2 0 d in
+                   let _ = vec_set st2 1 (let e = jstrs (jget bc "Env") in
+                                          if e == "[]" then
+                                            "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]"
+                                          else e) in
+                   let _ = vec_set st2 2 (jstr (jget bc "WorkingDir")) in
+                   let _ = vec_set st2 3 (jstrs (jget bc "Cmd")) in ())
+            else if ins == "RUN" then
+              (if str_len (vec_get st2 0 : str) == 0 then
+                 (let _ = vec_set st2 4 "mengd: RUN before FROM" in ())
+               else
+                 let bundle = work ++ "/bundle" in
+                 let cfg = oci_config (shell_argv arg) (vec_get st2 1 : str)
+                                      (vec_get st2 2 : str) "builder" true in
+                 let _ = write_file (bundle ++ "/config.json") cfg in
+                 let pidf = work ++ "/step.pid" in
+                 let _ = write_file pidf "" in
+                 let pid = st_spawn_logged runtime "run" ("build-" ++ uniq) pidf bundle
+                                           (work ++ "/step.out") (work ++ "/step.err") in
+                 if pid < 0 then (let _ = vec_set st2 4 "mengd: cannot fork the runtime" in ())
+                 else
+                   let code = st_wait pid in
+                   let o = read_file (work ++ "/step.out") in
+                   let e = read_file (work ++ "/step.err") in
+                   let _ = if str_len o > 0 then (let _ = bstream fd (str_trim o) in ()) else () in
+                   let _ = if str_len e > 0 then (let _ = bstream fd (str_trim e) in ()) else () in
+                   if code != 0 then
+                     (let _ = vec_set st2 4 ("mengd: the command returned " ++ show code
+                                          ++ ": " ++ arg) in ())
+                   else ())
+            else if ins == "ENV" then
+              (let eq = str_index_of arg "=" in
+               if eq < 0 then
+                 (let _ = vec_set st2 4 ("mengd: ENV wants KEY=value, not " ++ arg) in ())
+               else
+                 let cur = (vec_get st2 1 : str) in
+                 let one = s arg in
+                 let _ = vec_set st2 1 (if cur == "[]" then "[" ++ one ++ "]"
+                                        else substring cur 0 (str_len cur - 1) ++ "," ++ one ++ "]") in ())
+            else if ins == "WORKDIR" then (let _ = vec_set st2 2 arg in ())
+            else if ins == "CMD" then
+              (let _ = vec_set st2 3 (if str_len arg > 0 && substring arg 0 1 == "["
+                                      then arg else shell_argv arg) in ())
+            else if ins == "LABEL" || ins == "MAINTAINER" then ()
+            else
+              // Refused by name. A Dockerfile whose COPY was ignored builds an
+              // image that is missing files and says nothing about it.
+              (let _ = vec_set st2 4 ("mengd: " ++ ins ++ " is not implemented") in ()) in
+          run_steps (i + 1) in
+      let r = run_steps 0 in
+      if r < 0 || str_len (vec_get st2 4 : str) > 0 then
+        bail (let w = (vec_get st2 4 : str) in if str_len w == 0 then "mengd: the build failed" else w)
+      else if str_len (vec_get st2 0 : str) == 0 then bail "mengd: no FROM in the Dockerfile"
+      else
+        // One layer: the whole root filesystem.
+        let _ = bstream fd "Writing the layer" in
+        let ltar = work ++ "/layer.tar" in
+        let entries = tar_create ltar rootfs in
+        if entries < 0 then bail ("mengd: cannot write the layer: " ++ fs_last_error ())
+        else
+          let lhex = st_sha256_file ltar in
+          if str_len lhex == 0 then bail "mengd: cannot digest the layer"
+          else
+            let dir = work ++ "/img" in
+            let _ = mkdir_p (dir ++ "/blobs/sha256") in
+            let _ = st_rename ltar (dir ++ "/blobs/sha256/" ++ lhex) in
+            let cfgjson =
+              obj [("architecture", s "arm64"), ("os", s "linux"),
+                   ("config", obj [("Env", raw (vec_get st2 1 : str)),
+                                   ("Cmd", raw (let c = (vec_get st2 3 : str) in
+                                                if str_len c == 0 then "[]" else c)),
+                                   ("WorkingDir", s (vec_get st2 2 : str))]),
+                   ("rootfs", obj [("type", s "layers"),
+                                   ("diff_ids", raw ("[" ++ s ("sha256:" ++ lhex) ++ "]"))])] in
+            let cfgp = dir ++ "/blobs/sha256/tmp-config" in
+            let _ = write_file cfgp cfgjson in
+            let chex = st_sha256_file cfgp in
+            let _ = st_rename cfgp (dir ++ "/blobs/sha256/" ++ chex) in
+            let full_tag = if str_len tag == 0 then chex else tag in
+            let mj = "[\{\"Config\":\"blobs/sha256/" ++ chex ++ "\","
+                  ++ "\"RepoTags\":[" ++ s full_tag ++ "],"
+                  ++ "\"Layers\":[" ++ s ("blobs/sha256/" ++ lhex) ++ "]}]" in
+            let _ = write_file (dir ++ "/manifest.json") mj in
+            let final = store ++ "/images/" ++ substring chex 0 12 in
+            let _ = st_rmtree final in
+            let _ = mkdir_p (store ++ "/images") in
+            let _ = st_rename dir final in
+            let sz = if file_exists (final ++ "/blobs/sha256/" ++ lhex)
+                     then file_size (final ++ "/blobs/sha256/" ++ lhex) else 0 in
+            let _ = write_file (index_path store)
+                      (read_index store ++ "sha256:" ++ chex ++ "\t" ++ full_tag
+                       ++ "\t" ++ final ++ "\t" ++ show sz ++ "\n") in
+            let _ = st_rmtree work in
+            let _ = bstream fd ("Successfully built " ++ substring chex 0 12) in
+            let _ = if str_len tag > 0 then (let _ = bstream fd ("Successfully tagged " ++ tag) in ()) else () in
+            0;
+
 let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
              fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
              fn (m: str) -> fn (path: str) ->
-  if path == "/images/load" then
+  if path == "/build" then
+    let uniq = gen_request_id () in
+    let ctx = store ++ "/build-ctx-" ++ uniq ++ ".tar" in
+    let _ = st_rmtree ctx in
+    let n = recv_body fd buf cap st req ctx in
+    if n <= 0 then
+      respond fd "400 Bad Request" "application/json"
+        (obj [("message", s "mengd: empty or unreadable build context")])
+    else
+      let _ = c_build fd store ctx q runtime in
+      let _ = st_rmtree ctx in
+      ()
+  else if path == "/images/load" then
     // Per-request paths. One shared staging directory meant four concurrent
     // loads unpacked into the same tree and deleted each other's files: the
     // visible symptoms were `lchown(2) failed` on a file that had just
@@ -2081,6 +2356,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     // unimplemented route names itself instead of looking like a broken daemon.
     let msg = obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))] in
     respond fd "404 Not Found" "application/json" msg;
+
 
 // ---- accept loop ---------------------------------------------------------
 

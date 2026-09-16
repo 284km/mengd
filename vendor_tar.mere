@@ -18,6 +18,17 @@ extern fn fs_unlink: str -> int;
 extern fn fs_lchmod: str -> int -> int;
 extern fn fs_lchown: str -> int -> int -> int;
 extern fn fs_is_symlink: str -> int;
+extern fn fs_opendir: str -> int;
+extern fn fs_readdir: int -> str;
+extern fn fs_closedir: int -> int;
+extern fn fs_lstat: str -> int;
+extern fn fs_st_mode: unit -> int;
+extern fn fs_st_mtime: unit -> int;
+extern fn fs_st_uid: unit -> int;
+extern fn fs_st_gid: unit -> int;
+extern fn fs_st_kind: unit -> int;
+extern fn fs_st_size: unit -> int;
+extern fn fs_readlink: str -> str;
 extern fn fs_fail: str -> str -> int;
 extern fn fs_last_error: unit -> str;
 extern fn fs_clear_error: unit -> int;
@@ -254,3 +265,206 @@ let walk = fn (path: str) -> fn (dest: str) -> fn (do_extract: bool) ->
   let n = go 0 0 in
   let _ = file_close fh in
   n;
+
+
+// ---- writing ---------------------------------------------------------------
+//
+// The other direction, and it is not the same code backwards: reading an
+// archive means believing what the header says, and writing one means DECIDING
+// what it says. Every field that is a choice is made here and written down.
+//
+// USTAR, the same subset this file reads: regular files, directories and
+// symlinks. Anything else is refused by name rather than given a type flag
+// that happens to be close -- a device node written as a regular file is an
+// archive that is wrong in a way no reader can see.
+
+let w_block = 512;
+
+// An octal field: `width` bytes, the last one a NUL, zero-padded. Tar's
+// numeric fields are octal strings, which is the one place where writing the
+// number is not the same as knowing it.
+let oct_field = fn (v: int) -> fn (width: int) ->
+  let digits = width - 1 in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 8) (chr (48 + n % 8) ++ acc) in
+  let body = if v == 0 then "0" else go v "" in
+  let rec pad = fn (t: str) -> if str_len t >= digits then t else pad ("0" ++ t) in
+  pad body;
+
+let put_bytes = fn (h) -> fn (off: int) -> fn (text: str) ->
+  let n = str_len text in
+  let rec go = fn (i: int) ->
+    if i == n then () else let _ = bytebuf_set h (off + i) (ord (char_at text i)) in go (i + 1) in
+  go 0;
+
+// The name, split across name[100] and prefix[155] at a slash if it has to be.
+// A name that does not fit either way is refused: truncating it would make an
+// archive whose entries are not the files they came from.
+let split_name = fn (path: str) ->
+  if str_len path <= 100 then (path, "")
+  else
+    let rec find = fn (i: int) -> fn (best: int) ->
+      if i >= str_len path then best
+      else if char_at path i == "/" && str_len path - i - 1 <= 100 && i <= 155
+      then (if best < 0 then i else best)
+      else find (i + 1) best in
+    let cut = find 0 (0 - 1) in
+    if cut < 0 then ("", "")
+    else (substring path (cut + 1) (str_len path), substring path 0 cut);
+
+// One 512-byte header. `kind` is the type flag as tar spells it.
+let w_header = fn (name: str) -> fn (kind: str) -> fn (size: int) -> fn (mode: int) ->
+               fn (uid: int) -> fn (gid: int) -> fn (mtime: int) -> fn (link: str) ->
+  let h = bytebuf_new w_block in
+  let (nm, prefix) = split_name name in
+  if str_len nm == 0 && str_len name > 0 then h        // the caller checks and refuses
+  else
+    let _ = put_bytes h 0 nm in
+    let _ = put_bytes h 100 (oct_field mode 8) in
+    let _ = put_bytes h 108 (oct_field uid 8) in
+    let _ = put_bytes h 116 (oct_field gid 8) in
+    let _ = put_bytes h 124 (oct_field size 12) in
+    let _ = put_bytes h 136 (oct_field mtime 12) in
+    // The checksum is computed with its own field full of SPACES, which is the
+    // one self-referential rule in the format.
+    let _ = put_bytes h 148 "        " in
+    let _ = put_bytes h 156 kind in
+    let _ = put_bytes h 157 link in
+    let _ = put_bytes h 257 "ustar" in
+    let _ = put_bytes h 263 "00" in
+    let _ = put_bytes h 345 prefix in
+    let rec sum = fn (i: int) -> fn (acc: int) ->
+      if i == w_block then acc else sum (i + 1) (acc + bytebuf_get h i) in
+    let ck = sum 0 0 in
+    let _ = put_bytes h 148 (oct_field ck 7) in
+    let _ = bytebuf_set h 154 0 in
+    let _ = bytebuf_set h 155 32 in
+    h;
+
+// The names in one directory, sorted, with the handle closed before anything
+// recurses into them. Handles are a small fixed pool, and a walk that held one
+// per level would run out somewhere deep and blame the directory it was in.
+// Sorted because the same tree should give the same archive.
+let dir_names = fn (path: str) ->
+  let d = fs_opendir path in
+  let v = vec_new () in
+  if d < 0 then
+    let _ = refuse (if d == 0 - 2 then "too many open directories" else "cannot read the directory") path in v
+  else
+    let rec read = fn (u: unit) ->
+      let n = fs_readdir d in
+      if str_len n == 0 then () else let _ = vec_push v n in read () in
+    let _ = read () in
+    let _ = fs_closedir d in
+    let rec sort = fn (i: int) ->
+      if i >= vec_len v then ()
+      else
+        let rec back = fn (j: int) ->
+          if j <= 0 then ()
+          else
+            let a = (vec_get v (j - 1) : str) in
+            let b = (vec_get v j : str) in
+            if str_compare a b <= 0 then ()
+            else
+              let _ = vec_set v (j - 1) b in
+              let _ = vec_set v j a in
+              back (j - 1) in
+        let _ = back i in
+        sort (i + 1) in
+    let _ = sort 0 in
+    v;
+
+// st = [offset in the archive, entries written]
+let w_off = 0; let w_count = 1;
+
+let w_put = fn (fh) -> fn (st) -> fn (b) ->
+  let n = bytebuf_len b in
+  let off = (vec_get st w_off : int) in
+  let _ = region R { file_pwrite_bytes fh off (bytes_of_bytebuf b) } in
+  let _ = vec_set st w_off (off + n) in
+  n;
+
+// A file's contents, in blocks, padded to the next block boundary.
+let w_body = fn (fh) -> fn (st) -> fn (path: str) -> fn (size: int) ->
+  let src = file_openrw path in
+  let chunk = 65536 in
+  let rec go = fn (done: int) ->
+    if done >= size then ()
+    else
+      let want = if size - done < chunk then size - done else chunk in
+      let _ = region R {
+                let b = file_pread_bytes src done want in
+                let off = (vec_get st w_off : int) in
+                file_pwrite_bytes fh off b
+              } in
+      let _ = vec_set st w_off ((vec_get st w_off : int) + want) in
+      go (done + want) in
+  let _ = go 0 in
+  let _ = file_close src in
+  let pad = round_up size - size in
+  if pad == 0 then 0 else w_put fh st (bytebuf_new pad);
+
+let rec w_walk = fn (fh) -> fn (st) -> fn (root: str) -> fn (rel: str) ->
+  let full = if str_len rel == 0 then root else join2 root rel in
+  if fs_lstat full != 0 then let _ = refuse "cannot stat" full in 0 - 1
+  else
+    let kind = fs_st_kind () in
+    let mode = fs_st_mode () in
+    let uid = fs_st_uid () in
+    let gid = fs_st_gid () in
+    let mtime = fs_st_mtime () in
+    let size = fs_st_size () in
+    if kind == 3 then
+      // Not a file, a directory or a symlink. Refused by name: a device node
+      // or a socket written as a regular file is an archive that is wrong in a
+      // way no reader can see.
+      let _ = refuse "not a file, a directory or a symlink" full in 0 - 1
+    else if kind == 0 && size < 0 then
+      let _ = refuse "larger than this writer can record" full in 0 - 1
+    else
+      let name = if kind == 1 then rel ++ "/" else rel in
+      let (nm, px) = split_name name in
+      if str_len nm == 0 && str_len name > 0 then
+        let _ = refuse "name too long for a ustar header" full in 0 - 1
+      else
+        let link = if kind == 2 then fs_readlink full else "" in
+        let flag = if kind == 1 then "5" else if kind == 2 then "2" else "0" in
+        let body = if kind == 0 then size else 0 in
+        let _ = w_put fh st (w_header name flag body mode uid gid mtime link) in
+        let _ = vec_set st w_count ((vec_get st w_count : int) + 1) in
+        let _ = if kind == 0 then (let _ = w_body fh st full size in ()) else () in
+        if kind != 1 then 0
+        else
+          let names = dir_names full in
+          let rec each = fn (i: int) ->
+            if i >= vec_len names then 0
+            else
+              let child = if str_len rel == 0 then (vec_get names i : str)
+                          else rel ++ "/" ++ (vec_get names i : str) in
+              let r = w_walk fh st root child in
+              if r < 0 then r else each (i + 1) in
+          each 0;
+
+// Build an archive from a directory. Returns the number of entries, or -1 with
+// the reason in fs_last_error.
+let tar_create = fn (dest: str) -> fn (root: str) ->
+  let _ = fs_clear_error () in
+  // file_openrw does not truncate, so a longer archive already there would
+  // keep its tail past the end of this one -- and a tar reader stops at the
+  // first zero block, so it would look fine and be a different archive.
+  let _ = write_bytes dest (bytes_of_bytebuf (bytebuf_new 0)) in
+  let fh = file_openrw dest in
+  let st = vec_new () in
+  let _ = vec_push st 0 in
+  let _ = vec_push st 0 in
+  let names = dir_names root in
+  let rec each = fn (i: int) ->
+    if i >= vec_len names then 0
+    else
+      let r = w_walk fh st root (vec_get names i : str) in
+      if r < 0 then r else each (i + 1) in
+  let r = each 0 in
+  // Two zero blocks end an archive.
+  let _ = w_put fh st (bytebuf_new (2 * w_block)) in
+  let _ = file_close fh in
+  if r < 0 || fs_has_error () == 1 then 0 - 1 else (vec_get st w_count : int);

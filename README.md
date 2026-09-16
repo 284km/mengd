@@ -613,3 +613,33 @@ name. They are the same thing almost always — and they cannot be inside a
 machine with no resolver and no route, which reaches the outside through a port
 on its own loopback. The certificate is still checked against the name the
 image was asked for.
+
+
+## docker build
+
+```sh
+DOCKER_BUILDKIT=0 docker build -t mine:v1 .
+```
+
+`FROM`, `RUN`, `ENV`, `WORKDIR`, `CMD`, and `LABEL` ignored. Anything else is
+**refused by name**: a Dockerfile whose `COPY` was skipped builds an image that
+is missing files and says so nowhere.
+
+`DOCKER_BUILDKIT=0` because buildx does not use `POST /build` at all — it wants
+a BuildKit container, which is a different daemon feature and not this one.
+
+**One layer.** A real build writes a layer per step, by taking the difference
+between the filesystem before and after. That wants the runtime to hand back
+the difference — overlayfs, whose upper directory *is* the layer — and this
+does not do that yet, so the whole root filesystem is written as a single
+uncompressed layer. Correct, runnable, and larger than it needs to be. That is
+the next thing to fix, and writing it here is cheaper than finding it later.
+
+### What the image says, where the request said nothing
+
+An image carries a `Cmd`, an `Env` and a `WorkingDir`, and `docker run mine:v1`
+with no command expects the image's. This used only the request, which is empty
+in that case — the runtime then said `process.args is empty`, naming the
+symptom and not the cause. Nothing noticed because every check here had always
+passed a command. `Env` merges with the image's first and the request's after,
+which is what `-e` means.

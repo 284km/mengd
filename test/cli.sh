@@ -82,8 +82,11 @@ echo "== refusals name themselves =="
 # of a feature that arrived -- red on every run and telling nobody anything.
 # A route that really is absent is asked instead, and the answer still has to
 # name the method and the path rather than being a bare 404.
-curl -s --unix-socket "$sock" -X POST "http://localhost/v1.43/build" > "$out/refuse.txt" 2>&1
-grep -q "POST /build is not implemented" "$out/refuse.txt"
+# /build used to be the absent route this asked about. It is not absent any
+# more, so the question moved to one that is -- and this check exists to make
+# sure a refusal NAMES itself, not to record which feature is missing.
+curl -s --unix-socket "$sock" -X POST "http://localhost/v1.43/commit" > "$out/refuse.txt" 2>&1
+grep -q "POST /commit is not implemented" "$out/refuse.txt"
 say $? "an unimplemented route names the method and path"
 
 echo "== images: load, list, and load the same thing again =="

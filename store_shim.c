@@ -220,3 +220,37 @@ int st_px_spawn(int fd) {
 /* Reap anything that has finished, without blocking. A proxy that never reaps
  * accumulates zombies at one per connection. */
 int st_reap(void) { int n = 0; while (waitpid(-1, NULL, WNOHANG) > 0) n++; return n; }
+
+/* SHA-256 of a file.
+ *
+ * The runtime's sha256_hex takes a NUL-terminated str, which a layer tarball
+ * is not: the digest of an image's contents cannot go through a type that
+ * stops at the first zero byte. OpenSSL is already linked here -- declaring
+ * the TLS primitives is what does that -- so this is the digest and not a
+ * second implementation of one.
+ */
+#include <openssl/evp.h>
+
+const char *st_sha256_file(const char *path) {
+    static _Thread_local char hex[65];
+    hex[0] = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return hex;
+    EVP_MD_CTX *c = EVP_MD_CTX_new();
+    if (!c || EVP_DigestInit_ex(c, EVP_sha256(), NULL) != 1) {
+        if (c) EVP_MD_CTX_free(c);
+        fclose(f);
+        return hex;
+    }
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) EVP_DigestUpdate(c, buf, n);
+    fclose(f);
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    EVP_DigestFinal_ex(c, out, &len);
+    EVP_MD_CTX_free(c);
+    for (unsigned int i = 0; i < len && i < 32; i++) snprintf(hex + i * 2, 3, "%02x", out[i]);
+    hex[64] = 0;
+    return hex;
+}

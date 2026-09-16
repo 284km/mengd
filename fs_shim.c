@@ -1,3 +1,4 @@
+/* Vendored from 284km/mtar fs_shim.c by tools/vendor-mgz.sh. Do not edit here. */
 /* fs_shim.c — the filesystem calls tar needs and the Mere stdlib does not have.
  *
  * Mere has mkdir_p / write_bytes / file_pread_bytes, but no symlink, no
@@ -54,6 +55,7 @@ int fs_lchown(const char *path, int uid, int gid) {
  * points. lstat, not stat: stat would follow the very link being asked about.
  */
 #include <sys/types.h>
+#include <dirent.h>
 int fs_is_symlink(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
@@ -85,3 +87,88 @@ int fs_fail(const char *what, const char *ctx) {
 const char *fs_last_error(void) { return fs_err; }
 int fs_clear_error(void) { fs_err[0] = 0; return 0; }
 int fs_has_error(void) { return fs_err[0] != 0 ? 1 : 0; }
+
+/* ---- reading a tree, for the writer ------------------------------------- */
+/*
+ * Everything below exists because an archive has to be BUILT from a directory,
+ * and neither the language nor this shim could look at one: no directory
+ * listing, no lstat, no readlink.
+ */
+#define FS_DIRS 32
+static DIR *FS_DIR[FS_DIRS];
+
+int fs_opendir(const char *path) {
+    for (int i = 0; i < FS_DIRS; i++) {
+        if (FS_DIR[i]) continue;
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        FS_DIR[i] = d;
+        return i;
+    }
+    return -2;                      /* no room: a refusal, not "empty" */
+}
+
+/* The next name, or "" at the end. "." and ".." are never returned: a walker
+ * that had to skip them is a walker that can forget to. */
+static _Thread_local char FS_NAME[1024];
+const char *fs_readdir(int h) {
+    FS_NAME[0] = 0;
+    if (h < 0 || h >= FS_DIRS || !FS_DIR[h]) return FS_NAME;
+    struct dirent *e;
+    while ((e = readdir(FS_DIR[h]))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(FS_NAME, sizeof FS_NAME, "%s", e->d_name);
+        return FS_NAME;
+    }
+    return FS_NAME;
+}
+
+int fs_closedir(int h) {
+    if (h < 0 || h >= FS_DIRS || !FS_DIR[h]) return -1;
+    closedir(FS_DIR[h]);
+    FS_DIR[h] = NULL;
+    return 0;
+}
+
+/*
+ * lstat once, then ask about it. One call per field because a tuple cannot
+ * cross the FFI boundary -- and the stat is CACHED rather than repeated,
+ * because five questions about one file should not be five system calls, and a
+ * file that changed between them would be answering five questions about five
+ * different files.
+ */
+static _Thread_local struct stat FS_ST;
+static _Thread_local int FS_ST_OK;
+
+int fs_lstat(const char *path) {
+    FS_ST_OK = (lstat(path, &FS_ST) == 0);
+    return FS_ST_OK ? 0 : -1;
+}
+int fs_st_mode(void)  { return FS_ST_OK ? (int)(FS_ST.st_mode & 07777) : -1; }
+int fs_st_mtime(void) { return FS_ST_OK ? (int)FS_ST.st_mtime : -1; }
+int fs_st_uid(void)   { return FS_ST_OK ? (int)FS_ST.st_uid : -1; }
+int fs_st_gid(void)   { return FS_ST_OK ? (int)FS_ST.st_gid : -1; }
+/* 0 file, 1 directory, 2 symlink, 3 something else -- which the caller refuses
+ * by name rather than guessing a type flag for. */
+int fs_st_kind(void) {
+    if (!FS_ST_OK) return -1;
+    if (S_ISREG(FS_ST.st_mode)) return 0;
+    if (S_ISDIR(FS_ST.st_mode)) return 1;
+    if (S_ISLNK(FS_ST.st_mode)) return 2;
+    return 3;
+}
+/* -1 for a size this boundary cannot carry. The FFI int is 32 bits, and a
+ * silently truncated size writes a header that says one length and a body that
+ * is another -- which every reader would believe. */
+int fs_st_size(void) {
+    if (!FS_ST_OK) return -1;
+    if (FS_ST.st_size > 2147483647LL) return -1;
+    return (int)FS_ST.st_size;
+}
+
+static _Thread_local char FS_LINK[1024];
+const char *fs_readlink(const char *path) {
+    ssize_t n = readlink(path, FS_LINK, sizeof FS_LINK - 1);
+    FS_LINK[n > 0 ? n : 0] = 0;
+    return FS_LINK;
+}

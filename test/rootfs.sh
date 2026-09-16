@@ -24,6 +24,7 @@ echo "== build =="
 [ -s "$out/mkrootfs.c" ] || { echo "FAIL: emitted C is empty" >&2; exit 1; }
 SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
 cc -O2 -o "$out/mkrootfs" "$out/mkrootfs.c" "$here/fs_shim.c" "$here/store_shim.c" \
+  -I"$SSLPREFIX/include" -L"$SSLPREFIX/lib" -lssl -lcrypto \
   2> "$out/cc.err" || { echo "FAIL: cc" >&2; sed -n 1,20p "$out/cc.err" >&2; exit 1; }
 
 echo "== unpack $IMAGE with mgz + mtar =="

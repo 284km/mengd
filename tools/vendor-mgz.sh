@@ -28,5 +28,11 @@ if [ -n "$MTAR_SRC" ]; then
   [ -f "$MTAR_SRC/tar.mere" ] || { echo "MTAR_SRC has no tar.mere" >&2; exit 2; }
   { echo "// Vendored from 284km/mtar tar.mere by tools/vendor-mgz.sh. Do not edit here."
     cat "$MTAR_SRC/tar.mere"; } > "$here/vendor_tar.mere"
+  # And the shim it needs. The reader wanted symlinks and ownership; the writer
+  # wants a directory listing, an lstat and a readlink, and a vendored library
+  # whose shim is a version behind fails at the link step with a name that
+  # says nothing about which package is stale.
+  { echo "/* Vendored from 284km/mtar fs_shim.c by tools/vendor-mgz.sh. Do not edit here. */"
+    cat "$MTAR_SRC/fs_shim.c"; } > "$here/fs_shim.c"
 fi
 wc -l "$here/vendor_inflate.mere" "$here/vendor_crc32.mere" "$here/vendor_tar.mere"

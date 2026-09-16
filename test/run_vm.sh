@@ -153,6 +153,50 @@ else
   fail=1
 fi
 
+# docker build. The classic builder, because buildx does not use POST /build at
+# all -- it wants a BuildKit container, which is a different daemon feature and
+# not this one.
+rm -rf /var/tmp/bctx && mkdir -p /var/tmp/bctx
+cat > /var/tmp/bctx/Dockerfile <<'DF'
+FROM alpine:latest
+RUN echo built-by-mengd > /built.txt
+RUN echo second-step >> /built.txt
+ENV GREETING=hello
+WORKDIR /
+CMD ["cat", "/built.txt"]
+DF
+DOCKER_BUILDKIT=0 timeout 180 docker build -t mine:v1 /var/tmp/bctx > /var/tmp/build.log 2>&1
+say \$? "docker build"
+grep -q "Successfully tagged mine:v1" /var/tmp/build.log; say \$? "it tagged the result"
+timeout 20 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^mine:v1\$"
+say \$? "and docker images lists it"
+
+# What the image SAYS, not what the request says. `docker run mine:v1` with no
+# command has to find the CMD the Dockerfile set, and the ENV with it.
+o=\$(timeout 60 docker run --rm --network host mine:v1 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "built-by-mengd second-step " ]; say \$? "running it with no command runs the image's CMD (\$o)"
+e=\$(timeout 60 docker run --rm --network host mine:v1 sh -c 'echo \$GREETING' 2>/dev/null)
+[ "\$e" = "hello" ]; say \$? "and the image's ENV is in the container (\$e)"
+
+# A step that fails must fail the build, and say which step.
+cat > /var/tmp/bctx/Dockerfile <<'DF'
+FROM alpine:latest
+RUN exit 3
+DF
+DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v1 /var/tmp/bctx > /var/tmp/build2.log 2>&1
+[ \$? != 0 ]; say \$? "a failing step fails the build"
+grep -q "returned 3" /var/tmp/build2.log; say \$? "and says what the command returned"
+
+# An instruction this does not implement is refused BY NAME, not ignored. A
+# Dockerfile whose COPY was skipped builds an image missing files and says so
+# nowhere.
+cat > /var/tmp/bctx/Dockerfile <<'DF'
+FROM alpine:latest
+COPY . /app
+DF
+DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v2 /var/tmp/bctx > /var/tmp/build3.log 2>&1
+grep -q "COPY is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+
 # docker compose. Two services so the network is listed as well as created,
 # and one that fails so the exit codes have to come back separately.
 mkdir -p /var/tmp/mengd-compose

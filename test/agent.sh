@@ -28,8 +28,9 @@ say() { [ "$1" = 0 ] && echo "  ok    $2" || { echo "  FAIL  $2"; fail=1; }; }
 echo "== build =="
 "$M" -c "$here/magent.mere" > "$out/magent.c" 2> "$out/e" || { echo "FAIL: emit"; sed -n 1,10p "$out/e"; exit 1; }
 [ -s "$out/magent.c" ] || { echo "FAIL: emitted C is empty"; exit 1; }
+SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
 cc -O2 -o "$out/magent" "$out/magent.c" "$here/unix_shim.c" "$here/store_shim.c" \
-  2> "$out/cc" || { echo "FAIL: cc"; sed -n 1,10p "$out/cc"; exit 1; }
+  -I"$SSLPREFIX/include" -L"$SSLPREFIX/lib" -lssl -lcrypto 2> "$out/cc" || { echo "FAIL: cc"; sed -n 1,10p "$out/cc"; exit 1; }
 
 echo "== a container listening in the VM =="
 $RUNNER sudo sh -c "DOCKER_HOST=unix://$REMOTE docker rm -f agenttest >/dev/null 2>&1; \
