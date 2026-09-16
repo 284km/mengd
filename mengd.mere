@@ -31,6 +31,8 @@ extern fn st_rmtree: str -> int;
 extern fn st_mkdir_excl: str -> int;
 extern fn st_b64_of: str -> str;
 extern fn ex_spawn: int -> str -> str -> str -> str -> str -> int;
+extern fn st_top: int -> str;
+extern fn st_read_small: str -> str;
 extern fn st_mount_overlay: str -> str -> int;
 extern fn st_umount: str -> int;
 // The network a compose file describes: a bridge per network, a veth pair per
@@ -545,10 +547,37 @@ let register_image = fn (store: str) -> fn (tarfile: str) -> fn (uniq: str) ->
             let f = dir ++ "/" ++ jstr h in
             go t (acc + (if file_exists f then file_size f else 0)) in
       go (jarr (jget m "Layers")) 0 in
-    // Loading the same image twice must not add a second row -- and must not
-    // leave the tree it just unpacked behind either.
-    if str_index_of idx (id ++ "\t") >= 0 then
+    // THE SAME IMAGE AND THE SAME TAG is a no-op -- and must not leave the
+    // tree it just unpacked behind either.
+    //
+    // The same image under a DIFFERENT tag is not: this checked the digest
+    // alone, so after `docker rmi alpine:latest` on a machine where another
+    // tag pointed at the same content, loading alpine:latest again said it had
+    // worked and the tag never came back. One row per (image, tag), and the
+    // directory is shared because the content is.
+    let dir_for = (let rec go = fn (rest: str) ->
+                     let i = str_index_of rest "\n" in
+                     if i < 0 then ""
+                     else
+                       let l = substring rest 0 i in
+                       if field l 0 == id then field l 2
+                       else go (substring rest (i + 1) (str_len rest)) in
+                   go idx) in
+    if str_index_of idx (id ++ "\t" ++ tag ++ "\t") >= 0 then
       let _ = st_rmtree stage in
+      tag
+    else if str_len dir_for > 0 then
+      let _ = st_rmtree stage in
+      let szx = (let rec go = fn (rest: str) ->
+                   let i = str_index_of rest "\n" in
+                   if i < 0 then "0"
+                   else
+                     let l = substring rest 0 i in
+                     if field l 0 == id then field l 3
+                     else go (substring rest (i + 1) (str_len rest)) in
+                 go idx) in
+      let _ = write_file (index_path store)
+                (idx ++ id ++ "\t" ++ tag ++ "\t" ++ dir_for ++ "\t" ++ szx ++ "\n") in
       tag
     else
       let sz = size () in
@@ -602,8 +631,14 @@ let cread = fn (store: str) -> fn (id: str) -> fn (f: str) ->
   let p = cdir store id ++ "/" ++ f in
   if file_exists p then read_file p else "";
 
+// THE SAME SHAPE AS read_file_or, ON THE WRITE SIDE. A container can be
+// removed while something is still watching it -- the supervisor waiting on
+// its process, the health loop between two probes -- and write_file into a
+// directory that has gone RAISES, which in Mere ends the DAEMON rather than
+// the write. `docker container prune` beside a running check was enough.
 let cwrite = fn (store: str) -> fn (id: str) -> fn (f: str) -> fn (v: str) ->
-  write_file (cdir store id ++ "/" ++ f) v;
+  if not (file_exists (cdir store id)) then ()
+  else write_file (cdir store id ++ "/" ++ f) v;
 
 // Resolve a name or a (possibly abbreviated) id to a full id.
 let resolve = fn (store: str) -> fn (want: str) ->
@@ -650,7 +685,7 @@ let header_int = fn (req: str) -> fn (name: str) ->
 // container's command, environment and working directory in it.
 let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
                  fn (hostname: str) -> fn (host_net: bool) -> fn (binds: str) ->
-                 fn (netns: str) ->
+                 fn (netns: str) -> fn (cgpath: str) -> fn (res: str) ->
   let ns = fn (t: str) -> obj [("type", s t)] in
   let m = fn (dest: str) -> fn (ty: str) -> fn (src: str) -> fn (opts: str) ->
     obj [("destination", s dest), ("type", s ty), ("source", s src), ("options", raw opts)] in
@@ -680,6 +715,11 @@ let oci_config = fn (args_json: str) -> fn (env_json: str) -> fn (cwd: str) ->
         m "/sys" "sysfs" "sysfs" "[\"nosuid\",\"noexec\",\"nodev\",\"ro\"]" ++
       "]")),
     ("linux", obj [
+        // Its OWN cgroup. Without one a container is in whoever started it,
+        // and then a limit cannot be applied, usage cannot be attributed and
+        // there is nothing to freeze -- three things that are one directory.
+        ("cgroupsPath", s cgpath),
+        ("resources", raw (if str_len res == 0 then "\{}" else res)),
         // --network host means share the machine's network namespace, which is
         // expressed by leaving it out of the list rather than by a flag.
         //
@@ -2065,7 +2105,33 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
                  let _ = cwrite store id "net" netname in
                  let _ = cwrite store id "ip" (net_lease store netname id) in ())
               else () in
-      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj netns in
+      // What the client asked to limit. compose spells these mem_limit,
+      // cpus and pids_limit; ignoring them is a container that runs without
+      // the bound somebody wrote down.
+      let hcfg = jget spec "HostConfig" in
+      let memb = jint (jget hcfg "Memory") in
+      let nano = jint (jget hcfg "NanoCpus") in
+      let pidl = jint (jget hcfg "PidsLimit") in
+      // Built as a list of parts and wrapped once, rather than as objects
+      // glued together: two sets of braces in one object is a config the
+      // runtime cannot read, and it would read as "no limits".
+      let parts = vec_new () in
+      let _ = if memb > 0 then
+                (let _ = vec_push parts ("\"memory\":\{\"limit\":" ++ show memb ++ "}") in ()) else () in
+      let _ = if nano > 0 then
+                (let _ = vec_push parts ("\"cpu\":\{\"quota\":" ++ show (nano / 10000)
+                                      ++ ",\"period\":100000}") in ()) else () in
+      let _ = if pidl > 0 then
+                (let _ = vec_push parts ("\"pids\":\{\"limit\":" ++ show pidl ++ "}") in ()) else () in
+      let res = (let rec go = fn (i: int) -> fn (acc: str) ->
+                   if i >= vec_len parts then acc
+                   else go (i + 1) (if str_len acc == 0 then (vec_get parts i : str)
+                                    else acc ++ "," ++ (vec_get parts i : str)) in
+                 let body = go 0 "" in
+                 if str_len body == 0 then "" else "\{" ++ body ++ "}") in
+      let _ = cwrite store id "cgroup" ("mengd/" ++ substring id 0 12) in
+      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj netns
+                           ("mengd/" ++ substring id 0 12) res in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
       let _ = cwrite store id "image" (norm_tag img) in
@@ -2742,6 +2808,218 @@ let c_logs = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
           ++ frame_of 2 (cread store id "log.err") in
   respond fd "200 OK" "application/vnd.docker.multiplexed-stream" body;
 
+// ---- removing things -------------------------------------------------------
+//
+// An image store that only grows is a machine that fills up, and `docker rmi`
+// is how a person stops that. A tag is removed from the index; the directory
+// goes only when NO OTHER TAG points at it -- two tags on one image are one
+// image, and deleting the directory under the second one would leave a name
+// pointing at nothing.
+let c_image_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
+  let want = norm_tag name in
+  let dir = image_dir store want in
+  if str_len dir == 0 then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such image: " ++ name))])
+  else
+    let rec rebuild = fn (rest: str) -> fn (acc: str) -> fn (others: int) ->
+      let i = str_index_of rest "\n" in
+      if i < 0 then (acc, others)
+      else
+        let l = substring rest 0 i in
+        let tl = substring rest (i + 1) (str_len rest) in
+        if field l 1 == want then rebuild tl acc others
+        else rebuild tl (acc ++ l ++ "\n") (if field l 2 == dir then others + 1 else others) in
+    let (idx, others) = rebuild (read_index store) "" 0 in
+    let _ = write_file (index_path store) idx in
+    let _ = if others == 0 then (let _ = st_rmtree dir in ()) else () in
+    respond fd "200 OK" "application/json"
+      ("[" ++ obj [("Untagged", s want)]
+           ++ (if others == 0 then "," ++ obj [("Deleted", s want)] else "") ++ "]");
+
+let c_rename = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (q: str) ->
+  let nm = url_decode (query_param q "name") in
+  if str_len nm == 0 then
+    respond fd "400 Bad Request" "application/json"
+      (obj [("message", s "mengd: rename needs a name")])
+  else
+    let _ = cwrite store id "name" (if substring nm 0 1 == "/" then substring nm 1 (str_len nm) else nm) in
+    respond fd "204 No Content" "text/plain" "";
+
+// Pruning is one shape asked four times: list what is not in use, remove it,
+// say what went. The route is what was wrong before -- /containers/prune fell
+// into the /containers/<id> table and answered "No such container: prune",
+// which reads like a client bug and is a daemon one.
+let c_prune_containers = fn (fd: int) -> fn (store: str) ->
+  let d = store ++ "/containers" in
+  let gone = vec_new () in
+  let _ = if not (file_exists d) then ()
+          else
+            let rec go = fn (xs: str list) ->
+              match xs with
+              | [] -> ()
+              | [h, ...t] ->
+                  let _ = if cread store h "state" == "exited" then
+                            (let _ = net_down store h in
+                             let _ = net_release store (cread store h "net") h in
+                             let _ = st_rmtree (cdir store h) in
+                             let _ = vec_push gone h in ()) else () in
+                  go t in
+            go (list_dir d) in
+  let rec join = fn (i: int) -> fn (acc: str) ->
+    if i >= vec_len gone then acc
+    else join (i + 1) (if str_len acc == 0 then s (vec_get gone i : str)
+                       else acc ++ "," ++ s (vec_get gone i : str)) in
+  respond fd "200 OK" "application/json"
+    (obj [("ContainersDeleted", raw ("[" ++ join 0 "" ++ "]")), ("SpaceReclaimed", raw "0")]);
+
+let c_prune_volumes = fn (fd: int) -> fn (store: str) ->
+  let d = store ++ "/volumes" in
+  let gone = vec_new () in
+  // In use by WHOM: a volume a stopped container still refers to is not
+  // unused, which is what docker means and what stops a prune from taking a
+  // database out from under a container that is about to start again.
+  let used = (let cd2 = store ++ "/containers" in
+              if not (file_exists cd2) then ""
+              else
+                let rec go = fn (xs: str list) -> fn (acc: str) ->
+                  match xs with
+                  | [] -> acc
+                  | [h, ...t] -> go t (acc ++ read_file_or (cdir store h ++ "/mounts") "" ++ ",") in
+                go (list_dir cd2) "") in
+  let _ = if not (file_exists d) then ()
+          else
+            let rec go = fn (xs: str list) ->
+              match xs with
+              | [] -> ()
+              | [h, ...t] ->
+                  let _ = if str_index_of used ("/volumes/" ++ h ++ "/_data") < 0 then
+                            (let _ = st_rmtree (vdir store h) in
+                             let _ = vec_push gone h in ()) else () in
+                  go t in
+            go (list_dir d) in
+  let rec join = fn (i: int) -> fn (acc: str) ->
+    if i >= vec_len gone then acc
+    else join (i + 1) (if str_len acc == 0 then s (vec_get gone i : str)
+                       else acc ++ "," ++ s (vec_get gone i : str)) in
+  respond fd "200 OK" "application/json"
+    (obj [("VolumesDeleted", raw ("[" ++ join 0 "" ++ "]")), ("SpaceReclaimed", raw "0")]);
+
+let c_prune_networks = fn (fd: int) -> fn (store: str) ->
+  let d = store ++ "/networks" in
+  let gone = vec_new () in
+  let used = (let cd2 = store ++ "/containers" in
+              if not (file_exists cd2) then ""
+              else
+                let rec go = fn (xs: str list) -> fn (acc: str) ->
+                  match xs with
+                  | [] -> acc
+                  | [h, ...t] -> go t (acc ++ read_file_or (cdir store h ++ "/net") "" ++ ",") in
+                go (list_dir cd2) "") in
+  let _ = if not (file_exists d) then ()
+          else
+            let rec go = fn (xs: str list) ->
+              match xs with
+              | [] -> ()
+              | [h, ...t] ->
+                  // The pre-defined ones are never pruned, the same reason
+                  // they cannot be removed.
+                  let _ = if h != "bridge" && h != "host" && h != "none"
+                             && str_index_of used (h ++ ",") < 0 then
+                            (let _ = nw_bridge_del (net_bridge_of (read_file_or (ndir store h ++ "/id") "")) in
+                             let _ = st_rmtree (ndir store h) in
+                             let _ = vec_push gone h in ()) else () in
+                  go t in
+            go (list_dir d) in
+  let rec join = fn (i: int) -> fn (acc: str) ->
+    if i >= vec_len gone then acc
+    else join (i + 1) (if str_len acc == 0 then s (vec_get gone i : str)
+                       else acc ++ "," ++ s (vec_get gone i : str)) in
+  respond fd "200 OK" "application/json"
+    (obj [("NetworksDeleted", raw ("[" ++ join 0 "" ++ "]"))]);
+
+// ---- what a container is using, and holding it still -----------------------
+//
+// Both come from the cgroup, which is why the cgroup had to exist first: a
+// container in the daemon's own cgroup can only report the daemon's usage, and
+// has nothing of its own to freeze.
+let cg_file = fn (store: str) -> fn (id: str) -> fn (name: str) ->
+  let p = cread store id "cgroup" in
+  if str_len p == 0 then "" else "/sys/fs/cgroup/" ++ p ++ "/" ++ name;
+
+// NOT read_file: everything under /sys/fs/cgroup reports a size of zero and
+// then hands over bytes when read, so a reader that asks how big it is first
+// gets nothing -- which is what `docker stats` reported, from files that were
+// right there with the numbers in them.
+let cg_read = fn (store: str) -> fn (id: str) -> fn (name: str) ->
+  let f = cg_file store id name in
+  if str_len f == 0 then "" else str_trim (st_read_small f);
+
+// "usage_usec 12345" out of cpu.stat.
+let cg_stat_field = fn (text: str) -> fn (key: str) ->
+  let rec go = fn (rest: str) ->
+    if str_len rest == 0 then 0
+    else
+      let i = str_index_of rest "\n" in
+      let line = if i < 0 then rest else substring rest 0 i in
+      if str_index_of line (key ++ " ") == 0 then
+        int_or (str_trim (substring line (str_len key + 1) (str_len line))) 0
+      else if i < 0 then 0
+      else go (substring rest (i + 1) (str_len rest)) in
+  go text;
+
+let c_stats = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (q: str) ->
+  let mem = int_or (cg_read store id "memory.current") 0 in
+  let lim = (let l = cg_read store id "memory.max" in
+             if l == "max" || str_len l == 0 then 0 else int_or l 0) in
+  let cpu = cg_stat_field (cg_read store id "cpu.stat") "usage_usec" in
+  let pids = int_or (cg_read store id "pids.current") 0 in
+  // One reading, not a stream. `docker stats --no-stream` is one; the live
+  // form would be the same numbers on a timer, and saying so is better than
+  // a stream that never updates.
+  let body = obj [("read", s (st_rfc3339 (unix_time ()))),
+                  ("name", s (cread store id "name")), ("id", s id),
+                  ("pids_stats", obj [("current", raw (show pids))]),
+                  ("memory_stats", obj [("usage", raw (show mem)),
+                                        ("limit", raw (show lim))]),
+                  // Microseconds in cgroup v2, nanoseconds in the API.
+                  ("cpu_stats", obj [("cpu_usage", obj [("total_usage", raw (show (cpu * 1000)))]),
+                                     ("system_cpu_usage", raw (show (unix_time () * 1000000000)))]),
+                  ("precpu_stats", obj [("cpu_usage", obj [("total_usage", raw "0")]),
+                                        ("system_cpu_usage", raw "0")]),
+                  ("blkio_stats", raw "\{}"), ("networks", raw "\{}")] in
+  // ONE READING, whether or not the client asked for a stream. `docker stats`
+  // without --no-stream wants to be told again and again; this answers once
+  // and closes, which the client shows as a single line and then exits.
+  // Holding the connection open and saying nothing more would look like a
+  // daemon that had stopped measuring.
+  let _ = query_param q "stream" in
+  respond fd "200 OK" "application/json" body;
+
+let c_freeze = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (on: bool) ->
+  let f = cg_file store id "cgroup.freeze" in
+  if str_len f == 0 || not (file_exists f) then
+    respond fd "500 Internal Server Error" "application/json"
+      (obj [("message", s "mengd: this container has no cgroup to freeze")])
+  else
+    let _ = write_file f (if on then "1" else "0") in
+    let _ = cwrite store id "paused" (if on then "1" else "0") in
+    respond fd "204 No Content" "text/plain" "";
+
+// The processes in the container, read from the HOST's process table: the
+// image may have no `ps` in it, and a container with nothing to run `ps` with
+// still has processes.
+let c_top = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
+  let cpid = int_or (cread store id "cpid") 0 in
+  if cpid <= 0 then
+    respond fd "409 Conflict" "application/json"
+      (obj [("message", s "Container is not running")])
+  else
+    let rows = st_top cpid in
+    respond fd "200 OK" "application/json"
+      (obj [("Titles", raw "[\"PID\",\"CMD\"]"),
+            ("Processes", raw (if str_len rows == 0 then "[]" else "[" ++ rows ++ "]"))]);
+
 // ---- docker exec -----------------------------------------------------------
 //
 // A second process inside a container that is already running. The namespaces
@@ -3374,7 +3652,7 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
                                else if base == "[]" then "[" ++ pe ++ "]"
                                else "[" ++ pe ++ "," ++ substring base 1 (str_len base) in
                  let cfg = oci_config (shell_argv arg) stepenv
-                                      (vec_get st2 2 : str) "builder" true "" "" in
+                                      (vec_get st2 2 : str) "builder" true "" "" "" "" in
                  let _ = write_file (bundle ++ "/config.json") cfg in
                  let pidf = work ++ "/step.pid" in
                  let _ = write_file pidf "" in
@@ -3847,6 +4125,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
      if i >= 0 then c_image_inspect fd store (substring rest 0 i)
      else if p >= 0 && p + 5 == str_len rest then
        (let _ = c_push fd store (substring rest 0 p) q in ())
+     else if m == "DELETE" then c_image_delete fd store rest
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/containers/json" then
@@ -3855,6 +4134,15 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     let clen = header_int req "Content-Length: " in
     let body = read_body fd buf cap st clen in
     c_create fd store body q
+  // BEFORE the id table: "prune" is not an id, and falling through to it
+  // answered "No such container: prune" -- which reads like the client asked
+  // for something silly and was the route being wrong.
+  else if path == "/containers/prune" then c_prune_containers fd store
+  else if path == "/volumes/prune" then c_prune_volumes fd store
+  else if path == "/networks/prune" then c_prune_networks fd store
+  else if path == "/images/prune" then
+    respond fd "200 OK" "application/json"
+      (obj [("ImagesDeleted", raw "[]"), ("SpaceReclaimed", raw "0")])
   else if str_index_of path "/containers/" == 0 then
     let rest = seg_after path "/containers/" in
     let pair = split_slash rest in
@@ -3872,6 +4160,11 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
     else if verb == "restart" then c_stop fd store id 15
     else if verb == "json" then
       respond fd "200 OK" "application/json" (c_inspect_body store id)
+    else if verb == "stats" then c_stats fd store id q
+    else if verb == "top" then c_top fd store id
+    else if verb == "rename" then c_rename fd store id q
+    else if verb == "pause" then c_freeze fd store id true
+    else if verb == "unpause" then c_freeze fd store id false
     else if verb == "exec" then
       (let clen = header_int req "Content-Length: " in
        let body = read_body fd buf cap st clen in

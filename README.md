@@ -983,3 +983,50 @@ counted lines in the container's log and got "1" however many times it had run
 — the log is truncated on each start. Counted through a bind mount, the same
 container had run four times. A feature that looks broken is sometimes a
 question asked through a broken instrument.
+
+## A cgroup of its own
+
+A container in the daemon's cgroup cannot be limited, cannot be measured and
+cannot be frozen. Those are not three features — they are **one missing
+directory**, and mrun makes it now: `mengd/<id>` under `/sys/fs/cgroup`, with
+`memory.max`, `pids.max` and `cpu.max` from what the client asked for, joined
+before the cgroup namespace is unshared (afterwards the path that would have to
+be written is not the path that can be seen).
+
+**A child only has the controllers its parent delegates.** A new cgroup gets
+`cgroup.freeze` and `cgroup.procs` whatever happens, but `memory.max` exists
+only if the parent lists `memory` in its `cgroup.subtree_control`. Without
+that the cgroup was made, freezing worked, and every limit was *silently
+absent* — the files were not there to write.
+
+On top of it: `docker stats` (usage, limit, pids), `docker pause` / `unpause`
+(`cgroup.freeze`), and `mem_limit` / `pids_limit` from a compose file actually
+bounding the container.
+
+**A file whose size is a lie.** Everything under `/sys/fs/cgroup` reports
+`st_size` 0 and then hands over bytes when read, so a reader that asks how big
+a file is and then reads that many gets nothing. `docker stats` reported zero
+memory and zero pids from files that were right there with the numbers in them.
+
+## Removing things, and one row per image and tag
+
+`docker rmi`, `docker container prune`, `docker volume prune`, `docker network
+prune`, `docker rename`, `docker top`.
+
+`/containers/prune` used to fall into the `/containers/{id}` table and answer
+**"No such container: prune"** — which reads like the client asked for
+something silly and was the route being wrong.
+
+Removing a tag removes a row. The **directory** goes only when no other tag
+points at it: two tags on one image are one image. And loading an image that is
+already present under a *different* tag now adds the tag — the check was on the
+digest alone, so after `docker rmi alpine:latest` on a machine where another
+tag pointed at the same content, loading it again reported success and the tag
+never came back.
+
+**`cwrite` cannot raise.** A container can be removed while something is still
+watching it — the supervisor waiting on its process, the health loop between
+two probes — and `write_file` into a directory that has gone raises, which in
+Mere ends the **daemon** rather than the write. `docker container prune` beside
+a running check was enough to find it. It is the same shape as `read_file_or`,
+on the other side.

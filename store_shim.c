@@ -420,3 +420,81 @@ int ex_spawn(int cpid, const char *argvfile, const char *envfile,
     }
     return (int)pid;
 }
+
+/* The processes in a container, read from the HOST's process table.
+ *
+ * `docker top` in a container whose image has no `ps` still has to answer, and
+ * running something inside it to find out would be a different question. Two
+ * processes are in the same container when they are in the same pid
+ * namespace, and /proc says which that is.
+ */
+static _Thread_local char ST_TOP[16384];
+const char *st_top(int cpid) {
+    ST_TOP[0] = 0;
+    char want[64];
+    struct stat ns;
+    char p[256];
+    snprintf(p, sizeof p, "/proc/%d/ns/pid", cpid);
+    if (stat(p, &ns) != 0) return ST_TOP;
+    snprintf(want, sizeof want, "%llu", (unsigned long long)ns.st_ino);
+
+    DIR *d = opendir("/proc");
+    if (!d) return ST_TOP;
+    struct dirent *e;
+    size_t o = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        struct stat s2;
+        snprintf(p, sizeof p, "/proc/%s/ns/pid", e->d_name);
+        if (stat(p, &s2) != 0) continue;
+        char got[64];
+        snprintf(got, sizeof got, "%llu", (unsigned long long)s2.st_ino);
+        if (strcmp(got, want) != 0) continue;
+        snprintf(p, sizeof p, "/proc/%s/cmdline", e->d_name);
+        FILE *f = fopen(p, "r");
+        char cmd[512] = {0};
+        if (f) {
+            size_t n = fread(cmd, 1, sizeof cmd - 1, f);
+            fclose(f);
+            for (size_t i = 0; i + 1 < n; i++) if (cmd[i] == 0) cmd[i] = ' ';
+            cmd[n > 0 ? n : 0] = 0;
+        }
+        /* JSON, escaped the little that can appear in a command line here. */
+        char row[768];
+        size_t ri = 0;
+        ri += (size_t)snprintf(row + ri, sizeof row - ri, "%s[\"%s\",\"", o ? "," : "", e->d_name);
+        for (const char *c = cmd; *c && ri + 8 < sizeof row; c++) {
+            if (*c == '"' || *c == '\\') row[ri++] = '\\';
+            else if ((unsigned char)*c < 32) continue;
+            row[ri++] = *c;
+        }
+        ri += (size_t)snprintf(row + ri, sizeof row - ri, "\"]");
+        if (o + ri + 1 >= sizeof ST_TOP) break;
+        memcpy(ST_TOP + o, row, ri);
+        o += ri;
+        ST_TOP[o] = 0;
+    }
+    closedir(d);
+    return ST_TOP;
+}
+
+/* A file whose SIZE IS A LIE.
+ *
+ * Everything under /sys/fs/cgroup reports st_size 0 and then hands over bytes
+ * when read. A reader that asks stat how big it is and then reads that many
+ * gets nothing at all -- which is what `docker stats` reported: zero memory,
+ * zero pids, from files that were right there with the numbers in them.
+ * Read until EOF instead. */
+static _Thread_local char ST_SMALL[8192];
+const char *st_read_small(const char *path) {
+    ST_SMALL[0] = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return ST_SMALL;
+    size_t o = 0;
+    ssize_t n;
+    while (o + 1 < sizeof ST_SMALL && (n = read(fd, ST_SMALL + o, sizeof ST_SMALL - 1 - o)) > 0)
+        o += (size_t)n;
+    ST_SMALL[o] = 0;
+    close(fd);
+    return ST_SMALL;
+}

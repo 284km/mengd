@@ -484,6 +484,63 @@ n=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^m
 b=\$(timeout 20 docker network ls --format '{{.Name}}' 2>/dev/null | grep -c "^bridge\$" || true)
 [ "\$b" = 1 ]; say \$? "and not the default bridge (\$b)"
 
+# A CGROUP OF ITS OWN. A container in the daemon's cgroup cannot be limited,
+# cannot be measured and cannot be frozen -- three things that are one missing
+# directory.
+timeout 60 docker run -d --name cg --memory 64m --pids-limit 50 alpine:latest \
+  sh -c 'sleep 120' >/dev/null 2>&1
+sleep 3
+# From the container's OWN id, not by catting every container's field: the
+# store has more than one container in it and those files have no trailing
+# newline, so the glob ran them together into one path that does not exist.
+cgp="mengd/\$(timeout 20 docker inspect -f '{{.Id}}' cg 2>/dev/null | cut -c1-12)"
+mm=\$(cat /sys/fs/cgroup/\$cgp/memory.max 2>/dev/null)
+[ "\$mm" = 67108864 ]; say \$? "the limit the client asked for is on the cgroup (\$mm)"
+pm=\$(cat /sys/fs/cgroup/\$cgp/pids.max 2>/dev/null)
+[ "\$pm" = 50 ]; say \$? "and so is the process limit (\$pm)"
+
+# Read through the API, which is the part a person uses -- and the part that
+# read zero from files that had the numbers in them, because everything under
+# /sys/fs/cgroup reports a size of zero and then hands over bytes.
+o=\$(timeout 20 docker stats --no-stream --format '{{.MemUsage}} {{.PIDs}}' cg 2>/dev/null | tr -d '\\r\\n')
+echo "\$o" | grep -q "64MiB"; say \$? "docker stats reports the limit (\$o)"
+echo "\$o" | grep -qv "^0B"; say \$? "and a usage that is not zero"
+
+timeout 20 docker pause cg >/dev/null 2>&1
+f=\$(cat /sys/fs/cgroup/\$cgp/cgroup.freeze 2>/dev/null)
+[ "\$f" = 1 ]; say \$? "docker pause freezes it (\$f)"
+timeout 20 docker unpause cg >/dev/null 2>&1
+f=\$(cat /sys/fs/cgroup/\$cgp/cgroup.freeze 2>/dev/null)
+[ "\$f" = 0 ]; say \$? "and unpause lets it go (\$f)"
+
+# top reads the HOST's process table, because the image may have no ps in it.
+t=\$(timeout 20 docker top cg 2>/dev/null | tail -1)
+echo "\$t" | grep -q "sleep 120"; say \$? "docker top lists the container's own process (\$t)"
+
+timeout 20 docker rename cg cg2 >/dev/null 2>&1
+timeout 20 docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^cg2\$"
+say \$? "docker rename"
+timeout 20 docker rm -f cg2 >/dev/null 2>&1
+
+# PRUNING. /containers/prune fell into the id table and answered "No such
+# container: prune", which reads like the client asked for something silly.
+timeout 60 docker run --name gone alpine:latest true >/dev/null 2>&1
+timeout 30 docker container prune -f > /var/tmp/prune.log 2>&1
+say \$? "docker container prune"
+timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^gone\$"
+[ \$? != 0 ]; say \$? "and the exited container is gone"
+
+# rmi. An image store that only grows is a machine that fills up.
+DOCKER_HOST= docker save alpine:latest -o /var/tmp/again.tar 2>/dev/null
+timeout 60 docker load -i /var/tmp/again.tar >/dev/null 2>&1
+timeout 30 docker rmi alpine:latest > /var/tmp/rmi.log 2>&1
+say \$? "docker rmi"
+grep -q "Untagged: alpine:latest" /var/tmp/rmi.log; say \$? "it said what it untagged"
+timeout 20 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^alpine:latest\$"
+[ \$? != 0 ]; say \$? "and the image is not listed any more"
+timeout 60 docker load -i /var/tmp/again.tar >/dev/null 2>&1
+say \$? "it can be loaded again afterwards"
+
 # HEALTHCHECKS. A container says whether it is WELL by answering a command
 # inside itself. compose waits on it -- depends_on: condition:
 # service_healthy is how a file says "not until the database is up" -- and a
