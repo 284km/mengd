@@ -188,14 +188,45 @@ DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v1 /var/tmp/bctx > /var/tmp/bu
 grep -q "returned 3" /var/tmp/build2.log; say \$? "and says what the command returned"
 
 # An instruction this does not implement is refused BY NAME, not ignored. A
-# Dockerfile whose COPY was skipped builds an image missing files and says so
-# nowhere.
+# Dockerfile whose instruction was skipped builds an image that is missing
+# something and says so nowhere.
 cat > /var/tmp/bctx/Dockerfile <<'DF'
 FROM alpine:latest
-COPY . /app
+ADD x.tar /app
 DF
 DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v2 /var/tmp/bctx > /var/tmp/build3.log 2>&1
-grep -q "COPY is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+grep -q "ADD is not implemented" /var/tmp/build3.log; say \$? "an instruction it cannot do is refused by name"
+
+# COPY. A directory's CONTENTS go to the destination; a single file may be
+# renamed; the mode comes with it.
+rm -rf /var/tmp/cctx && mkdir -p /var/tmp/cctx/app/sub
+printf 'hello from a file\\n' > /var/tmp/cctx/app/hello.txt
+printf '#!/bin/sh\\necho script ran\\n' > /var/tmp/cctx/app/run.sh
+chmod 755 /var/tmp/cctx/app/run.sh
+printf 'deep\\n' > /var/tmp/cctx/app/sub/deep.txt
+printf 'single\\n' > /var/tmp/cctx/one.txt
+cat > /var/tmp/cctx/Dockerfile <<'DF'
+FROM alpine:latest
+WORKDIR /srv
+COPY app /srv/app
+COPY one.txt /srv/renamed.txt
+CMD ["sh", "-c", "cat /srv/app/hello.txt /srv/app/sub/deep.txt /srv/renamed.txt; /srv/app/run.sh"]
+DF
+DOCKER_BUILDKIT=0 timeout 180 docker build -t copied:v1 /var/tmp/cctx > /var/tmp/build4.log 2>&1
+say \$? "docker build with COPY"
+co=\$(timeout 60 docker run --rm --network host copied:v1 2>/dev/null | tr '\\n' ' ')
+[ "\$co" = "hello from a file deep single script ran " ]
+say \$? "the files are there, nested, renamed, and still executable (\$co)"
+
+# The context comes off the wire. A source that climbs out of it would copy
+# this machine's files into an image somebody else runs.
+cat > /var/tmp/cctx/Dockerfile <<'DF'
+FROM alpine:latest
+COPY ../../etc/hostname /x
+DF
+DOCKER_BUILDKIT=0 timeout 120 docker build -t bad:v3 /var/tmp/cctx > /var/tmp/build5.log 2>&1
+[ \$? != 0 ]; say \$? "a COPY that climbs out of the context fails the build"
+grep -q "outside the build context" /var/tmp/build5.log; say \$? "and says that is what it was"
 
 # docker compose. Two services so the network is listed as well as created,
 # and one that fails so the exit codes have to come back separately.

@@ -2060,6 +2060,86 @@ let df_lines = fn (text: str) ->
   let _ = go text "" in
   v;
 
+// ---- COPY -------------------------------------------------------------------
+
+// Words, on spaces. Quoting and globs are not handled and are refused by name
+// where they would matter: a COPY whose pattern was taken literally copies
+// nothing and says nothing.
+let df_words = fn (arg: str) ->
+  let v = vec_new () in
+  let rec go = fn (rest: str) ->
+    let t = str_trim rest in
+    if str_len t == 0 then ()
+    else
+      let i = str_index_of t " " in
+      if i < 0 then (let _ = vec_push v t in ())
+      else
+        let _ = vec_push v (substring t 0 i) in
+        go (substring t (i + 1) (str_len t)) in
+  let _ = go arg in
+  v;
+
+// A path that stays inside the context. The context comes off the wire; a
+// source of "../../etc/shadow" would copy this machine's files into an image
+// somebody else gets to run.
+let inside_ctx = fn (rel: str) ->
+  if str_len rel == 0 then false
+  else if substring rel 0 1 == "/" then false
+  else
+    let parts = split_on rel "/" in
+    let rec go = fn (xs: str list) ->
+      match xs with
+      | [] -> true
+      | [h, ...t] -> if h == ".." then false else go t in
+    go parts;
+
+// One file's bytes, in blocks, with its mode.
+let copy_file = fn (src: str) -> fn (dst: str) ->
+  let size = file_size src in
+  let sh = file_openrw src in
+  let _ = write_bytes dst (bytes_of_bytebuf (bytebuf_new 0)) in
+  let dh = file_openrw dst in
+  let chunk = 65536 in
+  let rec go = fn (done: int) ->
+    if done >= size then ()
+    else
+      let want = if size - done < chunk then size - done else chunk in
+      let _ = region R { file_pwrite_bytes dh done (file_pread_bytes sh done want) } in
+      go (done + want) in
+  let _ = go 0 in
+  let _ = file_close sh in
+  let _ = file_close dh in
+  let _ = if fs_lstat src == 0 then (let _ = fs_chmod dst (fs_st_mode ()) in ()) else () in
+  0;
+
+// A tree, the way COPY means it.
+let rec copy_tree = fn (src: str) -> fn (dst: str) ->
+  if fs_lstat src != 0 then let _ = refuse "cannot stat" src in 0 - 1
+  else
+    let kind = fs_st_kind () in
+    let mode = fs_st_mode () in
+    if kind == 2 then
+      let _ = fs_unlink dst in
+      let target = fs_readlink src in
+      if fs_symlink target dst != 0 then let _ = refuse "cannot create the symlink" dst in 0 - 1 else 0
+    else if kind == 0 then copy_file src dst
+    else if kind == 1 then
+      let _ = mkdir_p dst in
+      let _ = fs_chmod dst mode in
+      let names = dir_names src in
+      let rec each = fn (i: int) ->
+        if i >= vec_len names then 0
+        else
+          let n = (vec_get names i : str) in
+          let r = copy_tree (src ++ "/" ++ n) (dst ++ "/" ++ n) in
+          if r < 0 then r else each (i + 1) in
+      each 0
+    else
+      // Not a file, a directory or a symlink: refused by name rather than
+      // skipped, because an image quietly missing a device node is an image
+      // that behaves differently and says nothing.
+      let _ = refuse "not a file, a directory or a symlink" src in 0 - 1;
+
 // A shell form becomes the same argv the runtime is given everywhere else.
 let shell_argv = fn (cmd: str) -> "[\"/bin/sh\",\"-c\"," ++ s cmd ++ "]";
 
@@ -2167,6 +2247,75 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
             else if ins == "CMD" then
               (let _ = vec_set st2 3 (if str_len arg > 0 && substring arg 0 1 == "["
                                       then arg else shell_argv arg) in ())
+            else if ins == "COPY" then
+              (if str_len (vec_get st2 0 : str) == 0 then
+                 (let _ = vec_set st2 4 "mengd: COPY before FROM" in ())
+               else
+                 let ws = df_words arg in
+                 let n = vec_len ws in
+                 if n < 2 then
+                   (let _ = vec_set st2 4 ("mengd: COPY wants a source and a destination: " ++ arg) in ())
+                 else
+                   let flagged = (let rec any = fn (i: int) ->
+                                    if i >= n then false
+                                    else if str_len (vec_get ws i : str) > 2
+                                            && substring (vec_get ws i : str) 0 2 == "--" then true
+                                    else any (i + 1) in
+                                  any 0) in
+                   let globbed = (let rec any = fn (i: int) ->
+                                    if i >= n - 1 then false
+                                    else if str_index_of (vec_get ws i : str) "*" >= 0
+                                            || str_index_of (vec_get ws i : str) "?" >= 0 then true
+                                    else any (i + 1) in
+                                  any 0) in
+                   if flagged then
+                     (let _ = vec_set st2 4 ("mengd: COPY takes no flags here: " ++ arg) in ())
+                   else if globbed then
+                     // Named rather than taken literally: a pattern copied as
+                     // a filename copies nothing and reports success.
+                     (let _ = vec_set st2 4 ("mengd: COPY does not expand patterns: " ++ arg) in ())
+                   else
+                     let dest0 = (vec_get ws (n - 1) : str) in
+                     // Relative to WORKDIR, the way docker reads it.
+                     let wd = let w = (vec_get st2 2 : str) in if str_len w == 0 then "/" else w in
+                     let dest = if substring dest0 0 1 == "/" then dest0
+                                else (if substring wd (str_len wd - 1) (str_len wd) == "/"
+                                      then wd ++ dest0 else wd ++ "/" ++ dest0) in
+                     let dir_dest = n > 2 || substring dest0 (str_len dest0 - 1) (str_len dest0) == "/" in
+                     let rec each = fn (i: int) ->
+                       if i >= n - 1 then 0
+                       else
+                         let srel = (vec_get ws i : str) in
+                         if not (inside_ctx srel) then
+                           (let _ = vec_set st2 4 ("mengd: COPY refuses a source outside the"
+                                                ++ " build context: " ++ srel) in 0 - 1)
+                         else
+                           let sabs = work ++ "/ctx/" ++ srel in
+                           if not (file_exists sabs) then
+                             (let _ = vec_set st2 4 ("mengd: COPY: no " ++ srel
+                                                  ++ " in the build context") in 0 - 1)
+                           else
+                             let _ = fs_lstat sabs in
+                             let is_dir = fs_st_kind () == 1 in
+                             let target =
+                               if is_dir then
+                                 // A directory's CONTENTS go into the
+                                 // destination, which is what docker means and
+                                 // is easy to get backwards.
+                                 (rootfs ++ dest)
+                               else if dir_dest then
+                                 rootfs ++ dest ++ "/" ++ (let sl = last_index_of_str srel "/" in
+                                                           if sl < 0 then srel
+                                                           else substring srel (sl + 1) (str_len srel))
+                               else rootfs ++ dest in
+                             let _ = mkdir_p (if is_dir || dir_dest then
+                                                (if is_dir then rootfs ++ dest else rootfs ++ dest)
+                                              else dirname target) in
+                             let r = copy_tree sabs target in
+                             if r < 0 then
+                               (let _ = vec_set st2 4 ("mengd: COPY failed: " ++ fs_last_error ()) in r)
+                             else each (i + 1) in
+                     let _ = each 0 in ())
             else if ins == "LABEL" || ins == "MAINTAINER" then ()
             else
               // Refused by name. A Dockerfile whose COPY was ignored builds an

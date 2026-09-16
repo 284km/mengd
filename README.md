@@ -621,9 +621,15 @@ image was asked for.
 DOCKER_BUILDKIT=0 docker build -t mine:v1 .
 ```
 
-`FROM`, `RUN`, `ENV`, `WORKDIR`, `CMD`, and `LABEL` ignored. Anything else is
-**refused by name**: a Dockerfile whose `COPY` was skipped builds an image that
-is missing files and says so nowhere.
+`FROM`, `RUN`, `COPY`, `ENV`, `WORKDIR`, `CMD`, and `LABEL` ignored. Anything
+else is **refused by name**: a Dockerfile whose instruction was skipped builds
+an image that is missing something and says so nowhere. So is a `COPY` with a
+flag, and one with a `*` in it — a pattern taken literally copies nothing and
+reports success.
+
+**A `COPY` may not climb out of the build context.** The context arrives over
+the wire, and a source of `../../etc/shadow` would copy this machine's files
+into an image somebody else gets to run.
 
 `DOCKER_BUILDKIT=0` because buildx does not use `POST /build` at all — it wants
 a BuildKit container, which is a different daemon feature and not this one.
