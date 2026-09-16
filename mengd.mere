@@ -791,8 +791,17 @@ let last_index_of_str = fn (hay: str) -> fn (needle: str) ->
     else go (i + 1) (if substring hay i (i + m) == needle then i else best) in
   go 0 (0 - 1);
 
+// A header by name, without minding the case of the name.
+//
+// HTTP says header names are case-insensitive and servers take that seriously:
+// Docker Hub answers `www-authenticate:` in lower case. Looking for
+// "WWW-Authenticate:" found nothing, and the daemon then reported that the
+// registry had asked for authentication and named an empty challenge -- which
+// is exactly what a missing header looks like when the search is the thing
+// that is wrong.
 let header_str_of = fn (req: str) -> fn (name: str) ->
-  let i = str_index_of req name in
+  let lower = to_lower req in
+  let i = str_index_of lower (to_lower name) in
   if i < 0 then ""
   else
     let rest = substring req (i + str_len name) (str_len req) in
@@ -831,12 +840,22 @@ let split_host = fn (ref: str) ->
   let hostpart = if slash < 0 then "" else substring ref 0 slash in
   let rest = if slash < 0 then ref else substring ref (slash + 1) (str_len ref) in
   // A first segment is a registry only if it looks like one: a colon or a dot.
-  let is_host = str_index_of hostpart ":" >= 0 in
+  // The comment said that from the beginning and the code only checked the
+  // colon, which is why `docker.io/library/alpine` was read as a repository
+  // called "docker.io".
+  let is_host = str_index_of hostpart ":" >= 0 || str_index_of hostpart "." >= 0 in
   let host0 = if is_host then hostpart else "" in
   let name_ref = if is_host then rest else ref in
   let colon = last_index_of_str name_ref ":" in
   let name = if colon < 0 then name_ref else substring name_ref 0 colon in
   let tag = if colon < 0 then "latest" else substring name_ref (colon + 1) (str_len name_ref) in
+  // Docker Hub is spelt "docker.io" in a reference and answers somewhere else,
+  // and a name with no slash in it lives under library/. Both are conventions
+  // of that registry rather than of the protocol, so they are written down
+  // here where the reference is read and nowhere else.
+  let hub = host0 == "docker.io" || host0 == "index.docker.io" || host0 == "registry-1.docker.io" in
+  let name = if hub && str_index_of name "/" < 0 then "library/" ++ name else name in
+  let host0 = if hub then "registry-1.docker.io" else host0 in
   let hc = str_index_of host0 ":" in
   let h = if hc < 0 then host0 else substring host0 0 hc in
   // 443 when a host is named without a port -- which cannot happen while a
@@ -858,6 +877,27 @@ let rec split_on = fn (text: str) -> fn (sep: str) ->
     if i < 0 then [text]
     else substring text 0 i :: split_on (substring text (i + str_len sep) (str_len text)) sep;
 
+// Where to DIAL a registry, as opposed to what name to verify it as.
+//
+// "<registry host:port>=<dial host:port>[,...]". They are the same thing
+// almost always -- and they cannot be inside a guest with no resolver and no
+// route, which reaches the outside through a port on its own loopback. The
+// socket goes to the second; the certificate is checked against the first,
+// because that is the name the image was asked for.
+let dial_for = fn (host: str) -> fn (port: int) ->
+  let want = host ++ ":" ++ show port ++ "=" in
+  let rec go = fn (xs: str list) ->
+    match xs with
+    | [] -> (host, port)
+    | [one, ...t] ->
+        if str_len one > str_len want && substring one 0 (str_len want) == want then
+          let v = substring one (str_len want) (str_len one) in
+          let c = last_index_of_str v ":" in
+          if c < 0 then (v, port)
+          else (substring v 0 c, int_or (substring v (c + 1) (str_len v)) port)
+        else go t in
+  go (split_on (env_or "MENGD_DIAL") ",");
+
 // Which registries may be spoken to in the clear.
 //
 // HTTPS is the default and plaintext is opt-in, by host and port, the way
@@ -873,18 +913,21 @@ let insecure_registry = fn (host: str) -> fn (port: int) ->
   go (split_on (env_or "MENGD_INSECURE") ",");
 
 // One GET, body straight to a file. Returns the Content-Type, or "" on failure.
-let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
-                       fn (dest: str) ->
-  let fd = tcp_connect host port in
+// Connect to a registry and, unless it was named as a plaintext one, verify
+// it. The socket goes where MENGD_DIAL says; the certificate is checked
+// against the name the image was asked for, which are the same thing except
+// inside a machine with no resolver and no route.
+let reg_dial = fn (host: str) -> fn (port: int) ->
+  let (dh, dp) = dial_for host port in
+  let fd = tcp_connect dh dp in
   if fd < 0 then
     // Named, because the two ways this fails look identical to the client:
     // nothing is listening there, or this machine cannot turn that name into
-    // an address. A guest with no resolver -- which is where this daemon runs
-    // inside mvm -- only ever meets the second, and "cannot fetch the
-    // manifest" says nothing about either.
-    let _ = fs_fail ("mengd: cannot reach a registry at " ++ host ++ ":" ++ show port
+    // an address. A guest with no resolver only ever meets the second, and
+    // "cannot fetch the manifest" says nothing about either.
+    let _ = fs_fail ("mengd: cannot reach a registry at " ++ dh ++ ":" ++ show dp
                   ++ " (nothing listening, or this machine cannot resolve that name)") "" in
-    ""
+    0 - 1
   else if insecure_registry host port == false
           && tcp_starttls_verified fd host (env_or "MENGD_CA") != 0 then
     // A refusal, not a fallback. Falling back to plaintext when the
@@ -895,11 +938,143 @@ let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
                   ++ " over TLS. Set MENGD_CA to the certificate authority that"
                   ++ " signed it, or MENGD_INSECURE to " ++ host ++ ":" ++ show port
                   ++ " to speak to it in the clear") "" in
-    ""
+    0 - 1
+  else fd;
+
+let reg_request = fn (host: str) -> fn (port: int) -> fn (path: str) -> fn (bearer: str) ->
+  "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
+  ++ "\r\nAccept: " ++ accept_types
+  ++ (if str_len bearer == 0 then "" else "\r\nAuthorization: Bearer " ++ bearer)
+  ++ "\r\nUser-Agent: mengd/" ++ mengd_version
+  ++ "\r\nConnection: close\r\n\r\n";
+
+// A quoted value out of a challenge: realm="..." and friends.
+let quoted_of = fn (text: str) -> fn (key: str) ->
+  let k = key ++ "=\"" in
+  let i = str_index_of text k in
+  if i < 0 then ""
   else
-    let req = "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
-           ++ "\r\nAccept: " ++ accept_types ++ "\r\nConnection: close\r\n\r\n" in
-    let _ = write_str fd req in
+    let rest = substring text (i + str_len k) (str_len text) in
+    let e = str_index_of rest "\"" in
+    if e < 0 then "" else substring rest 0 e;
+
+// A chunked body. Registries send manifests and blobs with a Content-Length,
+// so nothing here needed this until a TOKEN endpoint answered
+// `Transfer-Encoding: chunked` -- and a reader that only knows Content-Length
+// reads zero bytes and reports an empty document, which looks exactly like a
+// server that said nothing.
+let hex_size = fn (line: str) ->
+  let n = str_len line in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == n then acc
+    else
+      let c = ord (char_at line i) in
+      if c >= 48 && c <= 57 then go (i + 1) (acc * 16 + (c - 48))
+      else if c >= 97 && c <= 102 then go (i + 1) (acc * 16 + (c - 87))
+      else if c >= 65 && c <= 70 then go (i + 1) (acc * 16 + (c - 55))
+      else acc in                      // a chunk extension after ";" ends it
+  go 0 0;
+
+let read_chunked = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+  let rec line = fn (acc: str) ->
+    let c = rd_byte fd buf cap st in
+    if c < 0 then acc
+    else if c == 10 then acc
+    else if c == 13 then line acc
+    else line (acc ++ chr c) in
+  let rec go = fn (acc: str) -> fn (guard: int) ->
+    if guard == 0 then acc
+    else
+      let n = hex_size (line "") in
+      if n <= 0 then acc
+      else
+        let piece = read_body fd buf cap st n in
+        let _ = line "" in              // the CRLF that closes the chunk
+        go (acc ++ piece) (guard - 1) in
+  go "" 4096;
+
+// A small GET whose body is a string -- the token endpoint, not a blob.
+let http_get_body = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+  let fd = reg_dial host port in
+  if fd < 0 then ""
+  else
+    let _ = write_str fd (reg_request host port path "") in
+    let buf = mem_alloc 65536 in
+    let n0 = tcp_read fd buf 65535 in
+    if n0 <= 0 then let _ = tcp_close fd in ""
+    else
+      let head = mem_to_str buf n0 in
+      let hend = str_index_of head "\r\n\r\n" in
+      if hend < 0 then let _ = tcp_close fd in ""
+      else
+        let st = rd_new n0 (hend + 4) in
+        let body = if str_index_of (to_lower (header_str_of head "Transfer-Encoding:")) "chunked" >= 0
+                   then read_chunked fd buf 65535 st
+                   else read_body fd buf 65535 st (int_or (header_str_of head "Content-Length:") 0) in
+        let _ = tcp_close fd in
+        body;
+
+// A URL split into what a request needs. https only: the rest of this refuses
+// to speak in the clear unless told to, and a redirect is not a place to make
+// an exception.
+let split_url = fn (u: str) ->
+  let pre = "https://" in
+  if str_len u <= str_len pre || substring u 0 (str_len pre) != pre then ("", 0, "")
+  else
+    let rest = substring u (str_len pre) (str_len u) in
+    let sl = str_index_of rest "/" in
+    let hostport = if sl < 0 then rest else substring rest 0 sl in
+    let path = if sl < 0 then "/" else substring rest sl (str_len rest) in
+    let hc = str_index_of hostport ":" in
+    if hc < 0 then (hostport, 443, path)
+    else (substring hostport 0 hc, int_or (substring hostport (hc + 1) (str_len hostport)) 443, path);
+
+// A bearer token for one challenge. The challenge names the realm, the service
+// and the scope, so nothing here has to know what Docker Hub wants -- which is
+// the point of the challenge existing.
+let bearer_for = fn (challenge: str) ->
+  let realm = quoted_of challenge "realm" in
+  let service = quoted_of challenge "service" in
+  let scope = quoted_of challenge "scope" in
+  if str_len realm == 0 then ""
+  else
+    // realm is a URL. Only https is accepted: a token handed over in the clear
+    // is a token anyone on the path can take and use.
+    let pre = "https://" in
+    if str_len realm <= str_len pre || substring realm 0 (str_len pre) != pre then
+      let _ = fs_fail ("mengd: refusing a token realm that is not https: " ++ realm) "" in ""
+    else
+      let rest = substring realm (str_len pre) (str_len realm) in
+      let sl = str_index_of rest "/" in
+      let hostport = if sl < 0 then rest else substring rest 0 sl in
+      let path0 = if sl < 0 then "/" else substring rest sl (str_len rest) in
+      let hc = str_index_of hostport ":" in
+      let h = if hc < 0 then hostport else substring hostport 0 hc in
+      let p = if hc < 0 then 443 else int_or (substring hostport (hc + 1) (str_len hostport)) 443 in
+      let q = path0 ++ "?service=" ++ service
+            ++ (if str_len scope == 0 then "" else "&scope=" ++ scope) in
+      let body = http_get_body h p q in
+      let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                print_err ("reg: token from " ++ h ++ ":" ++ show p ++ q
+                        ++ " -> " ++ show (str_len body) ++ " bytes: "
+                        ++ (if str_len body > 120 then substring body 0 120 else body)) else () in
+      let t = jstr (jget (jparse body) "token") in
+      if str_len t > 0 then t else jstr (jget (jparse body) "access_token");
+
+// One GET, body straight to a file. Returns the Content-Type, or "" on failure.
+//
+// Two things can make it ask again -- a 401 with a Bearer challenge, and a
+// redirect to a content network -- and they are NOT the same permission. One
+// flag for both meant that answering the challenge spent the right to follow
+// the redirect that came next, which is exactly the shape of a blob fetch at
+// Docker Hub: 401, token, 307. A budget instead, so each step costs one and a
+// loop still cannot run away.
+let rec http_get_bearer = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+                          fn (dest: str) -> fn (bearer: str) -> fn (budget: int) ->
+  let fd = reg_dial host port in
+  if fd < 0 then ""
+  else
+    let _ = write_str fd (reg_request host port path bearer) in
     let buf = mem_alloc 65536 in
     let n0 = tcp_read fd buf 65535 in
     let _ = if str_len (env_or "MENGD_TRACE") > 0 then
@@ -916,17 +1091,49 @@ let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
         let status = substring head 9 12 in
         let _ = if str_len (env_or "MENGD_TRACE") > 0 then
                   print_err ("reg: status " ++ status ++ " type " ++ header_str_of head "Content-Type:") else () in
-        let ctype = header_str_of head "Content-Type:" in
-        let clen = int_or (header_str_of head "Content-Length:") 0 in
-        let st = rd_new n0 (hend + 4) in
-        let _ = st_rmtree dest in
-        let fh = file_openrw dest in
-        let missing = rd_copy fd buf 65535 st fh clen in
-        let _ = if str_len (env_or "MENGD_TRACE") > 0 then
-                  print_err ("reg: body " ++ show clen ++ " bytes, " ++ show missing ++ " missing") else () in
-        let _ = file_close fh in
-        let _ = tcp_close fd in
-        if status != "200" then "" else if missing > 0 then "" else ctype;
+        if (status == "307" || status == "302" || status == "301" || status == "308")
+           && budget > 0 then
+          // Registries redirect blobs to a content network. The token is NOT
+          // carried across: it was issued for this registry, and handing it to
+          // whoever a Location header names is handing it to a third party.
+          let loc = header_str_of head "Location:" in
+          let _ = tcp_close fd in
+          let (rh, rp, rpath) = split_url loc in
+          if str_len rh == 0 then
+            let _ = fs_fail ("mengd: " ++ host ++ " redirected somewhere this daemon"
+                          ++ " will not follow: " ++ loc) "" in ""
+          else
+            let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                      print_err ("reg: " ++ status ++ " to " ++ rh ++ ":" ++ show rp) else () in
+            http_get_bearer rh rp rpath dest "" (budget - 1)
+        else if status == "401" && budget > 0 then
+          let ch = header_str_of head "WWW-Authenticate:" in
+          let _ = tcp_close fd in
+          let t = bearer_for ch in
+          if str_len t == 0 then
+            let _ = fs_fail ("mengd: " ++ host ++ " asked for authentication and"
+                          ++ " no token could be obtained: " ++ ch) "" in ""
+          else
+            let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                      print_err "reg: got a bearer token, asking again" else () in
+            http_get_bearer host port path dest t (budget - 1)
+        else
+          let ctype = header_str_of head "Content-Type:" in
+          let clen = int_or (header_str_of head "Content-Length:") 0 in
+          let st = rd_new n0 (hend + 4) in
+          let _ = st_rmtree dest in
+          let fh = file_openrw dest in
+          let missing = rd_copy fd buf 65535 st fh clen in
+          let _ = if str_len (env_or "MENGD_TRACE") > 0 then
+                    print_err ("reg: body " ++ show clen ++ " bytes, " ++ show missing ++ " missing") else () in
+          let _ = file_close fh in
+          let _ = tcp_close fd in
+          if status != "200" then "" else if missing > 0 then "" else ctype;
+
+let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+                       fn (dest: str) ->
+  // Three: a challenge, a redirect, and one to spare.
+  http_get_bearer host port path dest "" 3;
 
 let hex_of_dig = fn (d: str) ->
   let i = str_index_of d ":" in
@@ -1017,7 +1224,10 @@ let pull_image = fn (store: str) -> fn (ref: str) ->
         else
           // The same manifest.json `docker save` writes, so the loader path and
           // the rootfs builder do not need to know where this came from.
-          let full_tag = host ++ ":" ++ show port ++ "/" ++ name ++ ":" ++ tag in
+          // What was ASKED for, not where it was found. "docker.io" is a name
+          // for a registry that answers as registry-1.docker.io, and recording
+          // the second means the image comes back under a tag nobody typed.
+          let full_tag = ref in
           let mj = "[\{\"Config\":\"blobs/sha256/" ++ hex_of_dig cfg_dig ++ "\","
                 ++ "\"RepoTags\":[" ++ s full_tag ++ "],"
                 ++ "\"Layers\":[" ++ llist ++ "]}]" in

@@ -549,3 +549,56 @@ anything.
 Declaring the TLS primitives is what makes the C backend link OpenSSL. A static
 build wants zlib and zstd with it, which the linker only mentions once it is
 looking for `inflate` and `ZSTD_decompressStream`.
+
+
+## Docker Hub
+
+```sh
+docker -H unix://... pull docker.io/library/alpine:latest
+```
+
+Three things had to be there and none of them was:
+
+**The challenge.** A registry answers `401` with
+`WWW-Authenticate: Bearer realm=...,service=...,scope=...`; the token comes
+from that realm and the request goes again with it. The challenge names the
+scope, so nothing here has to know what Hub wants — which is the point of the
+challenge existing. The realm must be `https`: a token handed over in the clear
+is a token anyone on the path can use.
+
+**The redirect.** Blobs are served from a content network, as `307` with a
+`Location`. The token is **not** carried across — it was issued for the
+registry, and handing it to whoever a `Location` names is handing it to a third
+party.
+
+**Chunked.** The token endpoint answers `Transfer-Encoding: chunked` with no
+`Content-Length`, and a reader that only knows `Content-Length` reads zero
+bytes and reports an empty document — which looks exactly like a server that
+said nothing.
+
+Two smaller ones, both found the same way:
+
+- Header names are case-insensitive and Hub means it: `www-authenticate:` in
+  lower case. Searching for `WWW-Authenticate:` found nothing, and the daemon
+  reported an empty challenge, which is what a missing header looks like when
+  the *search* is the thing that is wrong.
+- A 401 and a redirect are not the same permission. One flag for both meant
+  answering the challenge spent the right to follow the redirect that came
+  next — which is exactly the shape of a blob fetch at Hub: 401, token, 307.
+  There is a budget now, so each step costs one and a loop still cannot run
+  away.
+
+`test/hub.sh` checks it against an oracle that is not this client: the config
+digest of the arm64 manifest out of what `docker` downloaded for the same
+reference. It needs the internet, and **fails rather than skips** without it —
+a check that cannot run is not a check that passed, and the authentication
+path, the redirect and the chunked response are only reachable against the real
+thing.
+
+## Where to dial, and what to verify
+
+`MENGD_DIAL=<registry host:port>=<host:port>` separates the socket from the
+name. They are the same thing almost always — and they cannot be inside a
+machine with no resolver and no route, which reaches the outside through a port
+on its own loopback. The certificate is still checked against the name the
+image was asked for.
