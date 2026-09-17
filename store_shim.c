@@ -594,3 +594,76 @@ int st_shutdown(void) {
 #else
 int st_shutdown(void) { sync(); return -1; }
 #endif
+
+/* base64, the other way. `docker login` and every pull that carries
+ * credentials send X-Registry-Auth: base64 of a small JSON object. Encoding
+ * was already here for the archive routes; this is its counterpart. */
+static int st_b64v(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+static _Thread_local char ST_UNB64[8192];
+const char *st_unb64(const char *in) {
+    size_t o = 0;
+    int acc = 0, bits = 0;
+    for (const char *p = in; *p && o + 1 < sizeof ST_UNB64; p++) {
+        int v = st_b64v((unsigned char)*p);
+        if (v < 0) continue;                 /* padding and whitespace */
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            ST_UNB64[o++] = (char)((acc >> bits) & 0xFF);
+        }
+    }
+    ST_UNB64[o] = 0;
+    return ST_UNB64;
+}
+
+/* A monotonic millisecond, for asking WHICH STEP is slow rather than which
+ * step ran. unix_time is seconds and a create takes less than one. */
+#include <time.h>
+int st_mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int)((t.tv_sec % 1000000) * 1000 + t.tv_nsec / 1000000);
+}
+
+/* Has this child finished, and with what?
+ *
+ * -1 means it is still running; anything else is its exit status. WNOHANG, so
+ * one thread can ask about many children without blocking on any of them --
+ * which is the difference between one supervisor for the whole daemon and one
+ * thread per container. A thread per container is not a small cost: the accept
+ * loop creates a thread per connection too, and when the runtime would not
+ * make another the daemon stopped accepting anything at all. */
+int st_reap_pid(int pid) {
+    int st = 0;
+    pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
+    if (r == 0) return -1;                       /* still running */
+    if (r < 0) return -2;                        /* not ours, or already reaped */
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return -2;
+}
+
+/* A write that reports failure instead of ending the process.
+ *
+ * Mere's write_file raises, and in a daemon a raise is not an error return: it
+ * is the end of the program. Store writes happen while other requests are
+ * removing the very directories they write into -- a lease taken while
+ * thirty-six containers are being deleted -- and the daemon died mid-removal
+ * with a path as its last word, twice, once after a file_exists guard that the
+ * race simply stepped through. */
+int st_write_str(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    size_t n = strlen(text);
+    ssize_t w = n == 0 ? 0 : write(fd, text, n);
+    close(fd);
+    return w < 0 ? -1 : 0;
+}

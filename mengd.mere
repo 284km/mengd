@@ -35,6 +35,11 @@ extern fn ex_spawn_in: int -> str -> str -> str -> str -> str -> str -> int;
 extern fn st_top: int -> str;
 extern fn st_read_small: str -> str;
 extern fn st_shutdown: unit -> int;
+extern fn st_mono_ms: unit -> int;
+extern fn st_reap_pid: int -> int;
+extern fn st_write_str: str -> str -> int;
+extern fn st_unb64: str -> str;
+
 extern fn st_mount_overlay: str -> str -> int;
 extern fn st_umount: str -> int;
 // The network a compose file describes: a bridge per network, a veth pair per
@@ -641,8 +646,7 @@ let cread = fn (store: str) -> fn (id: str) -> fn (f: str) ->
 // directory that has gone RAISES, which in Mere ends the DAEMON rather than
 // the write. `docker container prune` beside a running check was enough.
 let cwrite = fn (store: str) -> fn (id: str) -> fn (f: str) -> fn (v: str) ->
-  if not (file_exists (cdir store id)) then ()
-  else write_file (cdir store id ++ "/" ++ f) v;
+  let _ = st_write_str (cdir store id ++ "/" ++ f) v in ();
 
 // Resolve a name or a (possibly abbreviated) id to a full id.
 let resolve = fn (store: str) -> fn (want: str) ->
@@ -1210,10 +1214,14 @@ let reg_dial = fn (host: str) -> fn (port: int) ->
     0 - 1
   else fd;
 
-let reg_request = fn (host: str) -> fn (port: int) -> fn (path: str) -> fn (bearer: str) ->
+// The Authorization value WHOLE, not just a token. Two kinds of registry live
+// behind the same protocol -- one hands out bearer tokens, one takes the
+// password on every request -- and a function that can only say "Bearer" can
+// only talk to half of them.
+let reg_request = fn (host: str) -> fn (port: int) -> fn (path: str) -> fn (authz: str) ->
   "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
   ++ "\r\nAccept: " ++ accept_types
-  ++ (if str_len bearer == 0 then "" else "\r\nAuthorization: Bearer " ++ bearer)
+  ++ (if str_len authz == 0 then "" else "\r\nAuthorization: " ++ authz)
   ++ "\r\nUser-Agent: mengd/" ++ mengd_version
   ++ "\r\nConnection: close\r\n\r\n";
 
@@ -1263,11 +1271,15 @@ let read_chunked = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
   go "" 4096;
 
 // A small GET whose body is a string -- the token endpoint, not a blob.
-let http_get_body = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+let http_get_body_auth = fn (host: str) -> fn (port: int) -> fn (path: str) -> fn (basic: str) ->
   let fd = reg_dial host port in
   if fd < 0 then ""
   else
-    let _ = write_str fd (reg_request host port path "") in
+    let _ = write_str fd (if str_len basic == 0 then reg_request host port path ""
+                          else "GET " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
+                               ++ "\r\nAuthorization: Basic " ++ basic
+                               ++ "\r\nUser-Agent: mengd/" ++ mengd_version
+                               ++ "\r\nConnection: close\r\n\r\n") in
     let buf = mem_alloc 65536 in
     let n0 = tcp_read fd buf 65535 in
     if n0 <= 0 then let _ = tcp_close fd in ""
@@ -1282,6 +1294,9 @@ let http_get_body = fn (host: str) -> fn (port: int) -> fn (path: str) ->
                    else read_body fd buf 65535 st (int_or (header_str_of head "Content-Length:") 0) in
         let _ = tcp_close fd in
         body;
+
+let http_get_body = fn (host: str) -> fn (port: int) -> fn (path: str) ->
+  http_get_body_auth host port path "";
 
 // A URL split into what a request needs. https only: the rest of this refuses
 // to speak in the clear unless told to, and a redirect is not a place to make
@@ -1301,7 +1316,23 @@ let split_url = fn (u: str) ->
 // A bearer token for one challenge. The challenge names the realm, the service
 // and the scope, so nothing here has to know what Docker Hub wants -- which is
 // the point of the challenge existing.
-let bearer_for = fn (challenge: str) ->
+// ---- credentials -----------------------------------------------------------
+//
+// `docker login` and every pull or push that needs one carry
+// X-Registry-Auth: base64 of {"username":...,"password":...,"serveraddress":...}.
+// Nothing is stored: the client sends it every time, and keeping it would mean
+// deciding where, for how long, and with what permission -- questions worth
+// answering when something actually needs them answered.
+let auth_of = fn (req: str) ->
+  let h = header_str_of req "X-Registry-Auth:" in
+  if str_len h == 0 then Json.JNull else jparse (st_unb64 h);
+
+let basic_of = fn (a: Json.json) ->
+  let u = jstr (jget a "username") in
+  let p = jstr (jget a "password") in
+  if str_len u == 0 && str_len p == 0 then "" else st_b64_of (u ++ ":" ++ p);
+
+let bearer_for = fn (challenge: str) -> fn (basic: str) ->
   let realm = quoted_of challenge "realm" in
   let service = quoted_of challenge "service" in
   let scope = quoted_of challenge "scope" in
@@ -1322,7 +1353,10 @@ let bearer_for = fn (challenge: str) ->
       let p = if hc < 0 then 443 else int_or (substring hostport (hc + 1) (str_len hostport)) 443 in
       let q = path0 ++ "?service=" ++ service
             ++ (if str_len scope == 0 then "" else "&scope=" ++ scope) in
-      let body = http_get_body h p q in
+      // The credentials go to the TOKEN endpoint, not to the registry: that is
+      // what the challenge means -- "ask this realm, it decides what you may
+      // have". A registry that wants none simply does not challenge.
+      let body = http_get_body_auth h p q basic in
       let _ = if str_len (env_or "MENGD_TRACE") > 0 then
                 print_err ("reg: token from " ++ h ++ ":" ++ show p ++ q
                         ++ " -> " ++ show (str_len body) ++ " bytes: "
@@ -1339,11 +1373,12 @@ let bearer_for = fn (challenge: str) ->
 // Docker Hub: 401, token, 307. A budget instead, so each step costs one and a
 // loop still cannot run away.
 let rec http_get_bearer = fn (host: str) -> fn (port: int) -> fn (path: str) ->
-                          fn (dest: str) -> fn (bearer: str) -> fn (budget: int) ->
+                          fn (dest: str) -> fn (authz: str) -> fn (budget: int) ->
+                          fn (basic: str) ->
   let fd = reg_dial host port in
   if fd < 0 then ""
   else
-    let _ = write_str fd (reg_request host port path bearer) in
+    let _ = write_str fd (reg_request host port path authz) in
     let buf = mem_alloc 65536 in
     let n0 = tcp_read fd buf 65535 in
     let _ = if str_len (env_or "MENGD_TRACE") > 0 then
@@ -1374,18 +1409,28 @@ let rec http_get_bearer = fn (host: str) -> fn (port: int) -> fn (path: str) ->
           else
             let _ = if str_len (env_or "MENGD_TRACE") > 0 then
                       print_err ("reg: " ++ status ++ " to " ++ rh ++ ":" ++ show rp) else () in
-            http_get_bearer rh rp rpath dest "" (budget - 1)
+            // The credential does NOT follow the redirect: a Location header
+            // names a third party, and handing somebody's password to whoever
+            // it points at is not a thing to do by default.
+            http_get_bearer rh rp rpath dest "" (budget - 1) ""
         else if status == "401" && budget > 0 then
           let ch = header_str_of head "WWW-Authenticate:" in
           let _ = tcp_close fd in
-          let t = bearer_for ch in
+          // Bearer or Basic: the challenge says which, and a registry that
+          // takes the password directly is not a broken one.
+          let t = if str_index_of ch "Bearer" >= 0 then
+                    (let b = bearer_for ch basic in
+                     if str_len b == 0 then "" else "Bearer " ++ b)
+                  else if str_index_of ch "Basic" >= 0 && str_len basic > 0 then
+                    "Basic " ++ basic
+                  else "" in
           if str_len t == 0 then
             let _ = fs_fail ("mengd: " ++ host ++ " asked for authentication and"
                           ++ " no token could be obtained: " ++ ch) "" in ""
           else
             let _ = if str_len (env_or "MENGD_TRACE") > 0 then
                       print_err "reg: got a bearer token, asking again" else () in
-            http_get_bearer host port path dest t (budget - 1)
+            http_get_bearer host port path dest t (budget - 1) basic
         else
           let ctype = header_str_of head "Content-Type:" in
           let clen = int_or (header_str_of head "Content-Length:") 0 in
@@ -1400,9 +1445,9 @@ let rec http_get_bearer = fn (host: str) -> fn (port: int) -> fn (path: str) ->
           if status != "200" then "" else if missing > 0 then "" else ctype;
 
 let http_get_to_file = fn (host: str) -> fn (port: int) -> fn (path: str) ->
-                       fn (dest: str) ->
+                       fn (dest: str) -> fn (basic: str) ->
   // Three: a challenge, a redirect, and one to spare.
-  http_get_bearer host port path dest "" 3;
+  http_get_bearer host port path dest "" 3 basic;
 
 let hex_of_dig = fn (d: str) ->
   let i = str_index_of d ":" in
@@ -1431,7 +1476,7 @@ let is_index = fn (ct: str) ->
 // Returns the repo tag on success, "" on failure. `why` carries the reason.
 // The reason for a failure goes into the shim's error slot, the same one
 // mtar uses, so the route can report it without a second mechanism.
-let pull_image = fn (store: str) -> fn (ref: str) ->
+let pull_image = fn (store: str) -> fn (ref: str) -> fn (basic: str) ->
   let parts = split_host ref in
   let (host, port, name, tag) = parts in
   if str_len host == 0 then
@@ -1442,7 +1487,7 @@ let pull_image = fn (store: str) -> fn (ref: str) ->
     let dir = store ++ "/images/.pull-" ++ uniq in
     let _ = mkdir_p (dir ++ "/blobs/sha256") in
     let mtmp = dir ++ "/manifest.raw" in
-    let ct1 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ tag) mtmp in
+    let ct1 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ tag) mtmp basic in
     if str_len ct1 == 0 then
       let _ = st_rmtree dir in
       // Whatever was recorded on the way down says more than this does.
@@ -1458,7 +1503,7 @@ let pull_image = fn (store: str) -> fn (ref: str) ->
           if str_len d == 0 then ""
           else
             let m2 = dir ++ "/manifest2.raw" in
-            let ct2 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ d) m2 in
+            let ct2 = http_get_to_file host port ("/v2/" ++ name ++ "/manifests/" ++ d) m2 basic in
             if str_len ct2 == 0 then "" else m2 in
       if str_len man_path == 0 then
         let _ = st_rmtree dir in
@@ -1469,7 +1514,7 @@ let pull_image = fn (store: str) -> fn (ref: str) ->
         let cfg_dig = jstr (jget (jget man "config") "digest") in
         let get_blob = fn (d: str) ->
           http_get_to_file host port ("/v2/" ++ name ++ "/blobs/" ++ d)
-                           (dir ++ "/blobs/sha256/" ++ hex_of_dig d) in
+                           (dir ++ "/blobs/sha256/" ++ hex_of_dig d) basic in
         let okc = get_blob cfg_dig in
         let rec layers = fn (xs: Json.json list) -> fn (acc: str) -> fn (good: bool) ->
           match xs with
@@ -1659,7 +1704,16 @@ let net_lease = fn (store: str) -> fn (name: str) -> fn (id: str) ->
   let rec go = fn (n: int) ->
     if n > 254 then ""
     else if st_mkdir_excl (ld ++ "/" ++ show n) == 0 then
-      let _ = write_file (ld ++ "/" ++ show n ++ "/id") id in
+      // The directory is the lease and the file inside it only says whose. A
+      // release running at the same moment can take the directory away between
+      // those two lines, and write_file into a directory that has gone RAISES
+      // -- which in Mere ends the daemon, not the write. It died in the middle
+      // of removing thirty-six containers, with the path as its last word.
+      // st_write_str, not write_file: a raise here is the end of the daemon,
+      // and the directory this writes into can be removed by a release running
+      // at the same moment. A file_exists guard in front of it was not enough
+      // -- the race stepped through the gap between the two calls.
+      let _ = st_write_str (ld ++ "/" ++ show n ++ "/id") id in
       net_prefix store name ++ "." ++ show n
     else go (n + 1) in
   go 2;
@@ -2041,7 +2095,10 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
   let _ = if str_len (env_or "MENGD_TRACE") > 0 then
             print_err ("mengd: create body " ++ show (str_len body) ++ " bytes")
           else () in
-  let tc = fn (m: str) -> if str_len (env_or "MENGD_TRACE") > 0 then print_err ("mengd: create " ++ m) else () in
+  // With the clock, because "which step" and "which step is slow" are
+  // different questions and only one of them was answerable.
+  let tc = fn (m: str) -> if str_len (env_or "MENGD_TRACE") > 0 then
+                            print_err ("mengd: create " ++ m ++ " @" ++ show (st_mono_ms ())) else () in
   let _ = tc "parse body" in
   let spec = jparse body in
   let _ = tc "parsed" in
@@ -2391,12 +2448,31 @@ let reg_send_file = fn (host: str) -> fn (port: int) -> fn (verb: str) -> fn (pa
     let sz = if str_len body == 0 then 0 else file_size body in
     let _ = write_str fd (verb ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
                        ++ "\r\nUser-Agent: mengd/" ++ mengd_version
-                       ++ (if str_len bearer == 0 then "" else "\r\nAuthorization: Bearer " ++ bearer)
+                       ++ (if str_len bearer == 0 then "" else "\r\nAuthorization: " ++ bearer)
                        ++ (if str_len ctype == 0 then "" else "\r\nContent-Type: " ++ ctype)
                        ++ "\r\nContent-Length: " ++ show sz
                        ++ "\r\nConnection: close\r\n\r\n") in
     let buf = mem_alloc 65536 in
     let _ = if sz > 0 then (let _ = send_file fd buf 65536 body in ()) else () in
+    let n0 = tcp_read fd buf 65535 in
+    let head = if n0 <= 0 then "" else mem_to_str buf n0 in
+    let _ = tcp_close fd in
+    let code = (let i = str_index_of head " " in
+                if i < 0 then 0 else int_or (substring head (i + 1) (i + 4)) 0) in
+    (code, head);
+
+// Some registries take Basic directly rather than handing out a token. Both
+// shapes exist and the challenge says which.
+let reg_send_basic = fn (host: str) -> fn (port: int) -> fn (verb: str) -> fn (path: str) ->
+                     fn (basic: str) ->
+  let fd = reg_dial host port in
+  if fd < 0 then (0, "")
+  else
+    let _ = write_str fd (verb ++ " " ++ path ++ " HTTP/1.1\r\nHost: " ++ host ++ ":" ++ show port
+                       ++ "\r\nAuthorization: Basic " ++ basic
+                       ++ "\r\nUser-Agent: mengd/" ++ mengd_version
+                       ++ "\r\nConnection: close\r\n\r\n") in
+    let buf = mem_alloc 65536 in
     let n0 = tcp_read fd buf 65535 in
     let head = if n0 <= 0 then "" else mem_to_str buf n0 in
     let _ = tcp_close fd in
@@ -2413,10 +2489,39 @@ let push_blob = fn (host: str) -> fn (port: int) -> fn (name: str) -> fn (bearer
                                  bearer "" "" in
   if have == 200 then 200
   else
-    let (code, _r) = reg_send_file host port "POST"
-                       ("/v2/" ++ name ++ "/blobs/uploads/?digest=" ++ digest)
-                       bearer "application/octet-stream" path in
-    code;
+    // TWO STEPS, because one is not enough for a real registry. The monolithic
+    // form -- POST with the digest in the query and the whole blob as the body
+    // -- is in the specification and registry:2 answers 202 to it, meaning "I
+    // have opened an upload session", and stores nothing. The push then said
+    // it had worked and the manifest came back 400: "blob unknown".
+    //
+    // mreg accepted the monolithic form, which is why this was not found until
+    // something else was asked. Agreeing with one implementation is not
+    // conforming.
+    let (code0, head0) = reg_send_file host port "POST"
+                           ("/v2/" ++ name ++ "/blobs/uploads/") bearer "" "" in
+    if code0 != 202 then code0
+    else
+      let loc = str_trim (header_str_of head0 "Location:") in
+      if str_len loc == 0 then 0
+      else
+        // The location can be a path or a whole URL, and it usually carries a
+        // query of the registry's own that must be kept.
+        let lp = (let pre = "http://" in
+                  let pres = "https://" in
+                  if str_len loc > str_len pres && substring loc 0 (str_len pres) == pres then
+                    (let r = substring loc (str_len pres) (str_len loc) in
+                     let sl = str_index_of r "/" in
+                     if sl < 0 then "/" else substring r sl (str_len r))
+                  else if str_len loc > str_len pre && substring loc 0 (str_len pre) == pre then
+                    (let r = substring loc (str_len pre) (str_len loc) in
+                     let sl = str_index_of r "/" in
+                     if sl < 0 then "/" else substring r sl (str_len r))
+                  else loc) in
+        let sep = if str_index_of lp "?" >= 0 then "&" else "?" in
+        let (code, _r) = reg_send_file host port "PUT" (lp ++ sep ++ "digest=" ++ digest)
+                           bearer "application/octet-stream" path in
+        code;
 
 // What the registry is told a blob IS. Read from the blob, not remembered from
 // somewhere: a layer this daemon compressed and one it carried across from a
@@ -2426,10 +2531,13 @@ let media_of_layer = fn (path: str) ->
              let b = bytebuf_of_bytes (read_bytes path) in
              if bytebuf_len b >= 2 && bytebuf_get b 0 == 0x1f && bytebuf_get b 1 == 0x8b then 1 else 0
            } in
-  if gz == 1 then "application/vnd.docker.image.rootfs.diff.tar.gzip"
+  // The OCI spelling of a gzipped layer, which an OCI manifest requires and a
+  // Docker v2 manifest also accepts in practice -- registries map the two.
+  if gz == 1 then "application/vnd.oci.image.layer.v1.tar+gzip"
   else "application/vnd.oci.image.layer.v1.tar";
 
 let c_push = fn (fd: int) -> fn (store: str) -> fn (ref0: str) -> fn (q: str) ->
+             fn (basic: str) ->
   let tag0 = url_decode (query_param q "tag") in
   let ref = if str_len tag0 == 0 then ref0 else ref0 ++ ":" ++ tag0 in
   let dir = image_dir store ref in
@@ -2455,7 +2563,12 @@ let c_push = fn (fd: int) -> fn (store: str) -> fn (ref0: str) -> fn (q: str) ->
         // The challenge, asked for once. A registry that wants nothing says so
         // by not challenging, which is what the local one does.
         let (probe, phead) = reg_send_file host port "GET" ("/v2/") "" "" "" in
-        let bearer = if probe == 401 then bearer_for (header_str_of phead "WWW-Authenticate:") else "" in
+        let ch = header_str_of phead "WWW-Authenticate:" in
+        let bearer = if probe != 401 then ""
+                     else if str_index_of ch "Bearer" >= 0 then
+                       (let b = bearer_for ch basic in if str_len b == 0 then "" else "Bearer " ++ b)
+                     else if str_index_of ch "Basic" >= 0 && str_len basic > 0 then "Basic " ++ basic
+                     else "" in
         let _ = say ("The push refers to repository ["
                   ++ (let i = str_index_of ref "/" in
                       if i < 0 then host else substring ref 0 i)
@@ -2495,9 +2608,24 @@ let c_push = fn (fd: int) -> fn (store: str) -> fn (ref0: str) -> fn (q: str) ->
               if i >= vec_len descs then acc
               else join (i + 1) (if str_len acc == 0 then (vec_get descs i : str)
                                  else acc ++ "," ++ (vec_get descs i : str)) in
+            // THE MANIFEST TYPE FOLLOWS THE LAYERS. A Docker v2 manifest may
+            // only describe gzipped layers; an image whose layers are stored
+            // as they are -- a `docker save` that was loaded, or a layer this
+            // daemon left uncompressed because it was large -- has to be an
+            // OCI manifest, which allows both. A real registry checks: mreg
+            // accepted the mixture and registry:2 answered 400.
+            let anyplain = (let rec go = fn (i: int) ->
+                              if i >= vec_len descs then false
+                              else if str_index_of (vec_get descs i : str) "+gzip" < 0 then true
+                              else go (i + 1) in
+                            go 0) in
+            let mtype = if anyplain then "application/vnd.oci.image.manifest.v1+json"
+                        else "application/vnd.docker.distribution.manifest.v2+json" in
+            let ctype = if anyplain then "application/vnd.oci.image.config.v1+json"
+                        else "application/vnd.docker.container.image.v1+json" in
             let mj = obj [("schemaVersion", raw "2"),
-                          ("mediaType", s "application/vnd.docker.distribution.manifest.v2+json"),
-                          ("config", obj [("mediaType", s "application/vnd.docker.container.image.v1+json"),
+                          ("mediaType", s mtype),
+                          ("config", obj [("mediaType", s ctype),
                                           ("size", raw (show (file_size cp))),
                                           ("digest", s cd)]),
                           ("layers", raw ("[" ++ join 0 "" ++ "]"))] in
@@ -2505,7 +2633,7 @@ let c_push = fn (fd: int) -> fn (store: str) -> fn (ref0: str) -> fn (q: str) ->
             let _ = write_file mpath mj in
             let (mcode, _mh) = reg_send_file host port "PUT"
                                  ("/v2/" ++ name ++ "/manifests/" ++ tag) bearer
-                                 "application/vnd.docker.distribution.manifest.v2+json" mpath in
+                                 mtype mpath in
             let _ = st_rmtree mpath in
             if mcode != 200 && mcode != 201 && mcode != 202 then
               bail ("mengd: the registry answered " ++ show mcode ++ " for the manifest")
@@ -2758,46 +2886,26 @@ let c_start = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (runtime: st
     // 204 goes out BEFORE the wait: docker's start returns when the container
     // has started, not when it has finished. The reaping happens on this
     // thread afterwards, which is free once the response is written.
+    let _ = cwrite store id "tries" "0" in
     let _ = respond fd "204 No Content" "text/plain" "" in
     // The health loop runs beside the container, not inside this wait: the
     // wait ends when the container does and the probe has to happen while it
     // is alive.
     let _ = if str_len (cread store id "hctest") > 2 then
-              (let _ = spawn (fn (u: unit) -> hc_watch store id) in ()) else () in
+              (let _ = detach (spawn (fn (u: unit) -> hc_watch store id)) in ()) else () in
     // Then the container, again and again for as long as its policy says. Each
     // turn is a fresh run of the same bundle: a new process, a new namespace,
     // a new forwarder.
-    let rec supervise = fn (p: int) -> fn (tries: int) ->
-      let code = st_wait p in
-      let _ = cwrite store id "exit" (show code) in
-      let _ = fwd_stop store id in
-      if not (restart_wanted store id code tries) then
-        (let _ = cwrite store id "state" "exited" in ())
-      else
-        // A container that dies instantly would spin this loop as fast as the
-        // machine can fork. One second, which is what a person watching
-        // `docker ps` expects and what docker itself starts at.
-        let _ = cwrite store id "state" "restarting" in
-        let _ = sleep_ms 1000 in
-        if cread store id "stopwanted" == "1" then
-          (let _ = cwrite store id "state" "exited" in ())
-        else
-          let _ = write_file pidfile "" in
-          let neterr2 = if str_len netname > 0 then net_up store id netname else "" in
-          let _ = if str_len neterr2 > 0 then
-                    (let _ = print_err neterr2 in ()) else () in
-          let p2 = st_spawn_logged runtime "run" id pidfile (cd ++ "/bundle")
-                                   (cd ++ "/log.out") (cd ++ "/log.err") in
-          if p2 < 0 then (let _ = cwrite store id "state" "exited" in ())
-          else
-            let _ = cwrite store id "state" "running" in
-            let cp2 = wait_pid 0 in
-            let _ = if cp2 > 0 then (let _ = cwrite store id "cpid" (show cp2) in ()) else () in
-            let _ = if str_len (cread store id "ports") > 0 && cp2 > 0 then
-                      (let _ = cwrite store id "fwdpids"
-                                 (fwd_start store id cp2 (fwd_path ())) in ()) else () in
-            supervise p2 (tries + 1) in
-    let _ = supervise pid 0 in
+    // NOBODY WAITS HERE. Supervising a container takes as long as the
+    // container lives; doing it on the request's own thread held that thread
+    // and its buffer slot, and doing it on a thread of its own is a thread per
+    // running container -- which is worse, because the accept loop ALSO makes
+    // a thread per connection, and when the runtime would not make another one
+    // the daemon stopped accepting anything at all. Thirty containers were
+    // enough: compose then produced no output, and the trace showed the daemon
+    // had not seen a single request.
+    //
+    // One watcher for all of them instead, in `serve`.
     ();
 
 // Stop and kill. A container that has already exited is a 304 in the real API
@@ -2809,19 +2917,47 @@ let c_stop = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (sig: int) ->
     // Recorded before the signal: `unless-stopped` and `always` differ on
     // exactly this, and without it they are the same policy.
     let _ = cwrite store id "stopwanted" "1" in
+    // THE CONTAINER'S PID, not the runtime's. The runtime is the parent; its
+    // child is the container's init, and killing a parent does not kill a
+    // child -- it orphans it. Signalling the init of a pid namespace takes
+    // everything in that namespace with it, which is what stopping a container
+    // means. Killing only the runtime left the container running with nobody
+    // who knew about it, and the machine collected one per stop.
+    let cpid = int_or (cread store id "cpid") 0 in
     let pid = int_or (cread store id "pid") 0 in
-    let _ = if pid > 0 then st_kill pid sig else 0 in
+    let _ = if cpid > 0 then st_kill cpid sig else 0 in
+    // The runtime after it, and only if it is still there: it exits on its own
+    // once the thing it was supervising is gone.
+    let _ = if pid > 0 then
+              (let rec wait_gone = fn (n: int) ->
+                 if st_kill pid 0 != 0 then ()
+                 else if n > 20 then (let _ = st_kill pid sig in ())
+                 else let _ = sleep_ms 50 in wait_gone (n + 1) in
+               wait_gone 0) else () in
     respond fd "204 No Content" "text/plain" "";
 
 let c_wait = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
   // Headers first, before the container has even been started: the client
   // sends /start only after these arrive.
   let _ = respond_chunked_head fd "application/json" in
+  // AND NOTICE WHEN THE CLIENT GOES AWAY. `docker run -d` opens a wait before
+  // it starts the container and then leaves; this polled for five minutes
+  // regardless, holding a thread and a buffer slot the whole time. One per
+  // container, and at about thirty of them the daemon had no thread left to
+  // accept with -- it looked dead and was full.
+  //
+  // A read of 0 on a non-blocking socket is the peer closing; -1 is "nothing
+  // yet", which is the normal case. c_events already reads it this way.
+  let _ = io_set_nonblocking fd in
+  let probe = mem_alloc 16 in
   let rec poll = fn (n: int) ->
     if cread store id "state" == "exited" then int_or (cread store id "exit") 0
+    else if tcp_read fd probe 16 == 0 then 0 - 2      // the client hung up
     else if n > 3000 then 0 - 1            // five minutes, then answer anyway
     else let _ = sleep_ms 100 in poll (n + 1) in
   let code = poll 0 in
+  if code == 0 - 2 then ()
+  else
   let _ = send_chunk fd (obj [("StatusCode", n_ code)] ++ "\n") in
   end_chunks fd;
 
@@ -2871,6 +3007,46 @@ let c_image_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
     respond fd "200 OK" "application/json"
       ("[" ++ obj [("Untagged", s want)]
            ++ (if others == 0 then "," ++ obj [("Deleted", s want)] else "") ++ "]");
+
+// A second name for the same image. One row per (image, tag), all pointing at
+// the one directory -- two tags on one image are one image, which is what
+// makes `docker tag` free and `docker rmi` careful.
+let c_image_tag = fn (fd: int) -> fn (store: str) -> fn (name: str) -> fn (q: str) ->
+  let dir = image_dir store name in
+  if str_len dir == 0 then
+    respond fd "404 Not Found" "application/json"
+      (obj [("message", s ("No such image: " ++ name))])
+  else
+    let repo = url_decode (query_param q "repo") in
+    let tg = url_decode (query_param q "tag") in
+    if str_len repo == 0 then
+      respond fd "400 Bad Request" "application/json"
+        (obj [("message", s "mengd: tag needs a repo")])
+    else
+      let full = repo ++ ":" ++ (if str_len tg == 0 then "latest" else tg) in
+      let idx = read_index store in
+      let id = (let rec go = fn (rest: str) ->
+                  let i = str_index_of rest "\n" in
+                  if i < 0 then ""
+                  else
+                    let l = substring rest 0 i in
+                    if field l 2 == dir then field l 0
+                    else go (substring rest (i + 1) (str_len rest)) in
+                go idx) in
+      let sz = (let rec go = fn (rest: str) ->
+                  let i = str_index_of rest "\n" in
+                  if i < 0 then "0"
+                  else
+                    let l = substring rest 0 i in
+                    if field l 2 == dir then field l 3
+                    else go (substring rest (i + 1) (str_len rest)) in
+                go idx) in
+      if str_index_of idx (id ++ "\t" ++ full ++ "\t") >= 0 then
+        respond fd "201 Created" "text/plain" ""
+      else
+        let _ = write_file (index_path store)
+                  (idx ++ id ++ "\t" ++ full ++ "\t" ++ dir ++ "\t" ++ sz ++ "\n") in
+        respond fd "201 Created" "text/plain" "";
 
 let c_rename = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (q: str) ->
   let nm = url_decode (query_param q "name") in
@@ -3185,9 +3361,9 @@ let c_exec_start = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
         // The wait happens beside the pump, not before it: a command that
         // reads its input and answers as it goes would otherwise be waited for
         // by a daemon that is not yet listening to it.
-        let _ = spawn (fn (u: unit) ->
+        let _ = detach (spawn (fn (u: unit) ->
                   let code = st_wait pid in
-                  write_file (d ++ "/exit") (show code)) in
+                  write_file (d ++ "/exit") (show code))) in
         let _ = go 0 in
         // The pipe closes whatever happened: a child still waiting on input
         // nobody will send would hold this exec open forever.
@@ -4111,6 +4287,39 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
 let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
              fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
              fn (m: str) -> fn (path: str) ->
+  // `docker login`. The answer comes from THE REGISTRY, not from whether the
+  // fields look filled in: a daemon that says "Login Succeeded" without asking
+  // has told the person something it does not know, and they will find out at
+  // the next pull.
+  if path == "/auth" then
+    (let clen = header_int req "Content-Length: " in
+     let body = read_body fd buf cap st clen in
+     let a = jparse body in
+     let addr = jstr (jget a "serveraddress") in
+     let basic = basic_of a in
+     let (h, p, _n, _t) = split_host (if str_index_of addr "/" >= 0 then addr else addr ++ "/x") in
+     if str_len h == 0 then
+       respond fd "400 Bad Request" "application/json"
+         (obj [("message", s ("mengd: " ++ addr ++ " does not name a registry"))])
+     else
+       // /v2/ is the endpoint whose whole job is to say whether you may.
+       let (code, head) = reg_send_file h p "GET" "/v2/" "" "" "" in
+       let ch = header_str_of head "WWW-Authenticate:" in
+       let t = if code == 401 && str_index_of ch "Bearer" >= 0 then
+                 (let b = bearer_for ch basic in if str_len b == 0 then "" else "Bearer " ++ b)
+               else "" in
+       let (code2, _h2) = if str_len t > 0 then reg_send_file h p "GET" "/v2/" t "" ""
+                          else if code == 401 && str_len basic > 0 then
+                            reg_send_basic h p "GET" "/v2/" basic
+                          else (code, "") in
+       if code2 == 200 then
+         respond fd "200 OK" "application/json"
+           (obj [("Status", s "Login Succeeded"), ("IdentityToken", s "")])
+       else
+         respond fd "401 Unauthorized" "application/json"
+           (obj [("message", s ("mengd: " ++ h ++ " did not accept those credentials ("
+                             ++ show code2 ++ ")"))]))
+  else
   // NOT PART OF THE DOCKER API, and spelt with an underscore like /_ping so it
   // cannot be mistaken for one. Killing the VMM from outside loses whatever
   // the guest has not committed yet -- a machine stopped a second after a
@@ -4201,7 +4410,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
               else if str_index_of tail ":" >= 0 then from
               else from ++ ":" ++ t in
     let _ = fs_clear_error () in
-    let got = pull_image store ref in
+    let got = pull_image store ref (basic_of (auth_of req)) in
     if str_len got == 0 then
       respond fd "404 Not Found" "application/json"
         (obj [("message", s (let w = fs_last_error () in
@@ -4248,8 +4457,10 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
      let p = last_index_of_str rest "/push" in
      if i >= 0 then c_image_inspect fd store (substring rest 0 i)
      else if p >= 0 && p + 5 == str_len rest then
-       (let _ = c_push fd store (substring rest 0 p) q in ())
+       (let _ = c_push fd store (substring rest 0 p) q (basic_of (auth_of req)) in ())
      else if m == "DELETE" then c_image_delete fd store rest
+     else if (let t = last_index_of_str rest "/tag" in t >= 0 && t + 4 == str_len rest) then
+       (let t = last_index_of_str rest "/tag" in c_image_tag fd store (substring rest 0 t) q)
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/containers/json" then
@@ -4298,6 +4509,26 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
        else c_archive_out fd buf cap store id q (m == "HEAD"))
     else if str_len verb == 0 then
       (if m == "DELETE" then
+         // STOP IT FIRST. Removing the directory of a container that is still
+         // running leaves its runtime -- and everything inside it -- with
+         // nobody left who knows about them: `docker rm -f` did that every
+         // time, and a machine collected one orphaned process per removal
+         // until it had 23 of them and no container to show for any.
+         let _ = cwrite store id "stopwanted" "1" in
+         // `docker rm -f` means NOW: the kill is SIGKILL and the wait is
+         // short. A three-second grace per container turned removing forty of
+         // them into two minutes, and the client asking for force has already
+         // said it does not want the grace.
+         let _ = (let cpid = int_or (cread store id "cpid") 0 in
+                  let pid = int_or (cread store id "pid") 0 in
+                  let _ = if cpid > 0 then st_kill cpid 9 else 0 in
+                  let _ = if pid > 0 then st_kill pid 9 else 0 in
+                  let rec wait_gone = fn (n: int) ->
+                    if pid <= 0 || st_kill pid 0 != 0 then ()
+                    else if n > 20 then ()
+                    else let _ = sleep_ms 50 in wait_gone (n + 1) in
+                  wait_gone 0) in
+         let _ = fwd_stop store id in
          // The namespace goes with the container. Left behind it would hold
          // the address, and the next container on that network would be given
          // one that is already taken.
@@ -4370,9 +4601,95 @@ let reconcile = fn (store: str) ->
           go t in
     go (list_dir d);
 
+// ---- one watcher for all of them -------------------------------------------
+//
+// A container that ends has to be noticed: its exit status recorded, its
+// forwarders stopped, and its restart policy applied. Waiting for it takes as
+// long as it lives, so where that waiting happens decides what the daemon can
+// carry.
+//
+// On the request's thread, it held a connection and a buffer slot for the
+// container's whole life. On a thread of its own, it is a thread per running
+// container -- and the accept loop makes a thread per connection too, so at
+// about thirty containers the runtime would not make another and the daemon
+// STOPPED ACCEPTING ANYTHING. compose produced no output and the trace showed
+// not one request arriving: a daemon that looks dead because it is full.
+//
+// One thread, polling. It costs a pass over the container directory every
+// fifth of a second and nothing per container.
+let watch_containers = fn (store: str) -> fn (runtime: str) ->
+  let rec go = fn (u: unit) ->
+    let d = store ++ "/containers" in
+    let _ = if not (file_exists d) then ()
+            else
+              let rec each = fn (xs: str list) ->
+                match xs with
+                | [] -> ()
+                | [h, ...t] ->
+                    let st = cread store h "state" in
+                    let pid = int_or (cread store h "pid") 0 in
+                    let _ =
+                      if st != "running" || pid <= 0 then ()
+                      else
+                        // WNOHANG: asking about one child must not stop us
+                        // asking about the next.
+                        let code = st_reap_pid pid in
+                        if code == 0 - 1 then ()          // still running
+                        else
+                          let c = if code < 0 then 0 else code in
+                          let _ = cwrite store h "exit" (show c) in
+                          let _ = fwd_stop store h in
+                          let tries = int_or (cread store h "tries") 0 in
+                          if not (restart_wanted store h c tries) then
+                            (let _ = cwrite store h "state" "exited" in ())
+                          else
+                            // A container that dies instantly would spin this
+                            // as fast as the machine can fork, so a turn of
+                            // the loop is the soonest it can come back.
+                            (let _ = cwrite store h "state" "restarting" in ()) in
+                    // A restart happens on the NEXT pass, which is also the
+                    // pause: one state, one place that acts on it.
+                    let _ =
+                      if cread store h "state" != "restarting" then ()
+                      else if cread store h "stopwanted" == "1" then
+                        (let _ = cwrite store h "state" "exited" in ())
+                      else
+                        let cd = cdir store h in
+                        let pidfile = cd ++ "/container.pid" in
+                        let _ = write_file pidfile "" in
+                        let netname = cread store h "net" in
+                        let _ = if str_len netname > 0 then
+                                  (let e = net_up store h netname in
+                                   if str_len e > 0 then (let _ = print_err e in ()) else ())
+                                else () in
+                        let p2 = st_spawn_logged runtime "run" h pidfile (cd ++ "/bundle")
+                                                 (cd ++ "/log.out") (cd ++ "/log.err") in
+                        if p2 < 0 then (let _ = cwrite store h "state" "exited" in ())
+                        else
+                          let _ = cwrite store h "pid" (show p2) in
+                          let _ = cwrite store h "tries" (show (int_or (cread store h "tries") 0 + 1)) in
+                          let _ = cwrite store h "state" "running" in
+                          let rec wait_pid = fn (n: int) ->
+                            let t = read_file_or pidfile "" in
+                            if str_len t > 0 then int_or t 0
+                            else if n > 100 then 0
+                            else let _ = sleep_ms 10 in wait_pid (n + 1) in
+                          let cp2 = wait_pid 0 in
+                          let _ = if cp2 > 0 then (let _ = cwrite store h "cpid" (show cp2) in ()) else () in
+                          let _ = if str_len (cread store h "ports") > 0 && cp2 > 0 then
+                                    (let _ = cwrite store h "fwdpids"
+                                               (fwd_start store h cp2 (fwd_path ())) in ()) else () in
+                          () in
+                    each t in
+              each (list_dir d) in
+    let _ = sleep_ms 200 in
+    go () in
+  go ();
+
 let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
   let _ = st_ignore_sigpipe () in
   let _ = reconcile store in
+  let _ = detach (spawn (fn (u: unit) -> watch_containers store runtime)) in
   let srv = listen_on sock in
   let _ = if srv < 0 then
             let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1
@@ -4396,7 +4713,7 @@ let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
       // probe/run_threads.sh before any of this was written. The buffer has to
       // be per-connection for the same reason: one shared arena slice would be
       // two threads writing over each other's request.
-      let _ = spawn (fn (u: unit) ->
+      let _ = detach (spawn (fn (u: unit) ->
       let slot = st_slot_acquire () in
       let buf = pool_base + slot * bufsz in
       let nread = tcp_read c buf (bufsz - 1) in
@@ -4415,7 +4732,13 @@ let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
                        (req_method line) (req_path line) in
       let _ = tcp_close c in
       let _ = st_slot_release slot in
-      ()) in
+      // DETACHED, or the thread is never reclaimed. A spawn handle that is
+      // thrown away leaves a joinable thread behind: the runtime says so where
+      // `detach` is defined, and a daemon that makes one per connection and
+      // one per container runs out -- at about thirty containers it stopped
+      // accepting anything at all, and compose produced no output with not one
+      // request in the trace.
+      ())) in
       loop () in
   loop ();
 

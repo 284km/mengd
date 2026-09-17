@@ -1120,3 +1120,66 @@ guess at how late a write can be, and a check watching for a service's output
 lost it about one run in five. It stops now when the container has exited *and*
 two consecutive passes saw nothing new: a write landing after that had 100 ms
 of silence in front of it.
+
+## docker login, and a registry that checks
+
+`POST /auth` asks **the registry**, not the shape of the credentials: a daemon
+that says "Login Succeeded" without asking has told the person something it
+does not know, and they find out at the next pull. `X-Registry-Auth` — base64
+of a small JSON object — is decoded on pull and push, and **nothing is stored**:
+the client sends it every time, and keeping it would mean deciding where, for
+how long and with what permission.
+
+**Bearer or Basic: the challenge says which.** One kind of registry hands out
+tokens and another takes the password on every request, and a client that can
+only say "Bearer" can only talk to half of them. The credential does **not**
+follow a redirect — a `Location` names a third party.
+
+**Two steps, because one is not enough for a real registry.** The monolithic
+upload — POST with the digest in the query and the blob as the body — is in the
+specification, and `registry:2` answers **202** to it, meaning "I have opened a
+session", and stores nothing. The push said it had worked and the manifest came
+back `400: blob unknown`. mreg accepted the monolithic form, which is why this
+was only found when something else was asked: **agreeing with one
+implementation is not conforming.**
+
+**The manifest type follows the layers.** A Docker v2 manifest may only
+describe gzipped layers; an image whose layers are stored as they are needs an
+OCI manifest, which allows both. A real registry checks.
+
+`docker tag` came with it: one row per (image, tag), all pointing at one
+directory.
+
+## What thirty containers found
+
+A gate that starts more containers than there are connection slots turned up
+four defects, none of which a smaller number could show:
+
+**A spawn handle that is thrown away leaks a joinable thread.** The runtime
+says so where `detach` is defined. This daemon made one per connection and, for
+a while, one per container: at about thirty containers the runtime would not
+make another and **the daemon stopped accepting anything at all** — compose
+produced no output and the trace showed not one request arriving. A daemon that
+looks dead because it is full.
+
+**`/wait` held a thread and a slot for five minutes after the client left.**
+`docker run -d` opens one before it starts the container and then goes away. It
+notices the hangup now, the way `/events` already did. Forty containers went
+from **304 seconds to 14**.
+
+**One watcher for all containers, not a thread each.** Waiting for a container
+takes as long as it lives; where that waiting happens decides what the daemon
+can carry. One thread polling costs a pass over a directory every fifth of a
+second and nothing per container.
+
+**Removing a container has to take its processes with it.** The runtime is the
+parent and the container's init is its child: killing a parent orphans a child.
+Every `docker rm -f` left one behind until the machine had more runtimes than
+containers — and `docker stop` had the same hole, because it signalled the
+runtime rather than the container.
+
+**A store write cannot be allowed to raise.** `write_file` into a directory
+another request is removing ends the *daemon*, not the write. It died
+mid-removal with a path as its last word — twice, the second time after a
+`file_exists` guard that the race stepped straight through. Store writes go
+through a shim that returns a failure instead.

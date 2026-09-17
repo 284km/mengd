@@ -61,7 +61,7 @@ rm -rf /var/lib/mengd /var/run/mengd.sock; mkdir -p /var/lib/mengd
 # HTTPS is the default, by host and port, the way docker does it. Naming it
 # here is the whole of the opt-in, and the default refusing is what makes it
 # worth having.
-(setsid env MENGD_INSECURE=localhost:5000 /usr/local/bin/mengd /var/run/mengd.sock /var/lib/mengd /usr/local/bin/mrun >/var/log/mengd.log 2>&1 &)
+(setsid env MENGD_INSECURE=localhost:5000,localhost:5100 /usr/local/bin/mengd /var/run/mengd.sock /var/lib/mengd /usr/local/bin/mrun >/var/log/mengd.log 2>&1 &)
 sleep 1
 DOCKER_HOST= docker save alpine:latest -o /var/tmp/mengd-test.tar 2>/dev/null
 export DOCKER_HOST=unix:///var/run/mengd.sock
@@ -194,6 +194,58 @@ WHDF
   o=\$(DOCKER_HOST= timeout 60 docker run --rm localhost:5000/gate/pushed:v1 2>/dev/null | tr -d '\\r\\n')
   [ "\$o" = "pushed-by-mengd" ]; say \$? "and runs it (\$o)"
   DOCKER_HOST= docker rmi localhost:5000/gate/pushed:v1 >/dev/null 2>&1
+
+  # A REGISTRY THAT ASKS WHO YOU ARE. mreg has no authentication at all, so
+  # every check above passes whether or not this daemon can send a credential.
+  # The oracle has to be a registry that refuses: registry:2 with htpasswd.
+  DOCKER_HOST= docker rm -f authreg >/dev/null 2>&1
+  rm -rf /var/tmp/regauth && mkdir -p /var/tmp/regauth
+  DOCKER_HOST= docker run --rm --entrypoint htpasswd httpd:2 -Bbn tester secret \
+    > /var/tmp/regauth/htpasswd 2>/dev/null
+  DOCKER_HOST= docker run -d --name authreg -p 5100:5000 -v /var/tmp/regauth:/auth \
+    -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=Registry \
+    -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2 >/dev/null 2>&1
+  sleep 3
+  if [ -s /var/tmp/regauth/htpasswd ] && curl -s -o /dev/null -w '%{http_code}' http://localhost:5100/v2/ 2>/dev/null | grep -q 401; then
+    rm -f /root/.docker/config.json ~/.docker/config.json
+    echo secret | timeout 30 docker login -u tester --password-stdin localhost:5100 > /var/tmp/login.log 2>&1
+    grep -q "Login Succeeded" /var/tmp/login.log; say \$? "docker login against a registry that checks"
+    # ASKED, not assumed: a daemon that says "Login Succeeded" without asking
+    # has told the person something it does not know.
+    echo wrong | timeout 30 docker login -u tester --password-stdin localhost:5100 > /var/tmp/login2.log 2>&1
+    grep -q "did not accept those credentials" /var/tmp/login2.log
+    say \$? "and a wrong password is refused"
+
+    rm -f /root/.docker/config.json ~/.docker/config.json
+    timeout 30 docker tag alpine:latest localhost:5100/priv/app:v1 >/dev/null 2>&1
+    say \$? "docker tag"
+    timeout 60 docker push localhost:5100/priv/app:v1 > /var/tmp/push0.log 2>&1
+    grep -q "401" /var/tmp/push0.log; say \$? "push without a credential is refused by the registry"
+    echo secret | timeout 30 docker login -u tester --password-stdin localhost:5100 >/dev/null 2>&1
+    timeout 120 docker push localhost:5100/priv/app:v1 > /var/tmp/push1.log 2>&1
+    grep -q "digest: sha256:" /var/tmp/push1.log; say \$? "and with one it goes"
+
+    # The strongest oracle again: the real docker takes it back out.
+    DOCKER_HOST= docker rmi localhost:5100/priv/app:v1 >/dev/null 2>&1
+    DOCKER_HOST= timeout 120 docker pull localhost:5100/priv/app:v1 >/dev/null 2>&1
+    say \$? "the real docker pulls it out of the private registry"
+    o=\$(DOCKER_HOST= timeout 60 docker run --rm localhost:5100/priv/app:v1 echo through-a-private-registry 2>/dev/null | tr -d '\\r\\n')
+    [ "\$o" = "through-a-private-registry" ]; say \$? "and runs it (\$o)"
+
+    timeout 30 docker rmi localhost:5100/priv/app:v1 >/dev/null 2>&1
+    rm -f /root/.docker/config.json ~/.docker/config.json
+    timeout 60 docker pull localhost:5100/priv/app:v1 > /var/tmp/pull0.log 2>&1
+    grep -q "asked for authentication" /var/tmp/pull0.log
+    say \$? "pulling without a credential is refused BY NAME"
+    echo secret | timeout 30 docker login -u tester --password-stdin localhost:5100 >/dev/null 2>&1
+    timeout 120 docker pull localhost:5100/priv/app:v1 >/dev/null 2>&1
+    say \$? "and with one it arrives"
+    o=\$(timeout 60 docker run --rm localhost:5100/priv/app:v1 echo pulled-with-credentials 2>/dev/null | tr -d '\\r\\n')
+    [ "\$o" = "pulled-with-credentials" ]; say \$? "and runs (\$o)"
+  else
+    echo "  SKIP  no authenticated registry available (needs registry:2 and httpd:2)"
+  fi
+  DOCKER_HOST= docker rm -f authreg >/dev/null 2>&1
 
   pkill mreg 2>/dev/null || true
 else
@@ -615,6 +667,29 @@ say \$? "docker ps lists the running one and not the finished one (\$r)"
 echo "\$a" | grep -q pssrun && echo "\$a" | grep -q psgone
 say \$? "docker ps -a lists both (\$a)"
 timeout 20 docker rm -f pssrun psgone >/dev/null 2>&1
+
+# MORE RUNNING CONTAINERS THAN THERE ARE CONNECTION SLOTS. Supervising a
+# container used to happen on the request's own thread, so every running
+# container held one of the 32 buffer slots -- and the next connection blocked
+# waiting for one. The symptom was an attach that produced nothing, which reads
+# as a container that printed nothing, and it only appeared on a busy machine.
+i=0
+while [ "\$i" -lt 36 ]; do
+  timeout 90 docker run -d --name slot\$i alpine:latest sh -c 'sleep 600' >/dev/null 2>&1
+  i=\$((i + 1))
+done
+n=\$(timeout 20 docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+[ "\$n" -ge 33 ]; say \$? "36 containers, \$n running at once -- more than there are slots"
+o=\$(timeout 30 docker run --rm alpine:latest echo still-answering 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "still-answering" ]; say \$? "and the daemon still answers a new client (\$o)"
+
+# REMOVING ONE MUST TAKE ITS PROCESSES WITH IT. The runtime is the parent and
+# the container's init is its child: killing a parent orphans a child. Removing
+# a container used to leave one behind every time, and a machine collected them
+# until it had more runtimes than containers.
+timeout 300 docker rm -f \$(timeout 20 docker ps -aq --filter name=slot 2>/dev/null) >/dev/null 2>&1
+left=\$(pgrep -f 'sleep 600' 2>/dev/null | wc -l | tr -d ' ')
+[ "\$left" = 0 ]; say \$? "and removing them leaves no process behind (\$left)"
 
 # docker exec. A second process inside a container that is already running,
 # which is three requests: one to say what to run, one to run it, one to ask
