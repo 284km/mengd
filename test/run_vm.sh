@@ -598,6 +598,49 @@ say \$? "docker container prune"
 timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^gone\$"
 [ \$? != 0 ]; say \$? "and the exited container is gone"
 
+# AN IMAGE SOMETHING IS USING IS NOT DELETED -- and the precondition for that
+# sentence is that it is the LAST NAME the image has. Removing one of several
+# tags is not removing the image, and docker allows that however many
+# containers are running: the refusal belongs to the delete, not to the untag.
+#
+# So this makes its own one-name image rather than using alpine, whose tags
+# this script has been adding to all along. Written after the first version
+# failed against a daemon that was behaving correctly -- alpine still had a
+# second tag here, the untag succeeded, and the check called that a missing
+# refusal.
+timeout 30 docker tag alpine:latest inuse:1 >/dev/null 2>&1
+# EVERY other name of that image, removed -- not just alpine:latest. This
+# script has been tagging all along and the precondition is "the last one",
+# which the check has to MAKE rather than hope for: the version that removed
+# only alpine:latest was reading a leftover tag from the registry section as a
+# missing refusal.
+iid=\$(timeout 20 docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | awk '\$2=="inuse:1"{print \$1}' | head -1)
+for t in \$(timeout 20 docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | awk -v i="\$iid" '\$1==i && \$2!="inuse:1"{print \$2}'); do
+  timeout 30 docker rmi "\$t" >/dev/null 2>&1
+done
+n=\$(timeout 20 docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | awk -v i="\$iid" '\$1==i' | wc -l | tr -d ' ')
+[ "\$n" = 1 ]; say \$? "the image has exactly one name left (\$n)"
+timeout 60 docker run -d --name holder inuse:1 sh -c 'sleep 120' >/dev/null 2>&1
+say \$? "and a container on it"
+timeout 30 docker rmi inuse:1 > /var/tmp/rmi-inuse.log 2>&1
+[ \$? != 0 ]; say \$? "docker rmi refuses it while that container exists"
+grep -qi "being used by" /var/tmp/rmi-inuse.log
+say \$? "and says what is using it (\$(head -c 80 /var/tmp/rmi-inuse.log | tr -d '\r\n'))"
+timeout 20 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^inuse:1\$"
+say \$? "the image is still there"
+timeout 60 docker rm -f holder >/dev/null 2>&1
+o=\$(timeout 30 docker run --rm --name probe inuse:1 echo still-usable 2>/dev/null | tr -d '\r\n')
+[ "\$o" = "still-usable" ]; say \$? "and once the container is gone the image still works (\$o)"
+# WAIT FOR THE CLIENT'S CLEANUP. --rm is the CLIENT deleting the container
+# after it exits, which lands a moment after the run returns: asking to delete
+# the image in that moment is asking while a container still references it, and
+# the refusal is then correct and the check wrong.
+pi=0
+while [ "\$(timeout 20 docker ps -aq --filter name=probe 2>/dev/null | wc -l | tr -d ' ')" != 0 ] && [ "\$pi" -lt 20 ]; do
+  sleep 0.5; pi=\$((pi + 1))
+done
+timeout 30 docker rmi inuse:1 >/dev/null 2>&1; say \$? "and then it deletes"
+
 # rmi. An image store that only grows is a machine that fills up.
 DOCKER_HOST= docker save alpine:latest -o /var/tmp/again.tar 2>/dev/null
 timeout 60 docker load -i /var/tmp/again.tar >/dev/null 2>&1
@@ -675,6 +718,20 @@ say \$? "docker ps lists the running one and not the finished one (\$r)"
 echo "\$a" | grep -q pssrun && echo "\$a" | grep -q psgone
 say \$? "docker ps -a lists both (\$a)"
 timeout 20 docker rm -f pssrun psgone >/dev/null 2>&1
+
+# --rm IS THE DAEMON'S JOB. Modern docker sets HostConfig.AutoRemove and lets
+# the daemon delete the container after it exits; a daemon that does not read
+# it leaves one behind every time, and no count notices because every check
+# removes its containers by name first.
+before=\$(timeout 20 docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+timeout 60 docker run --rm --name gonesoon alpine:latest echo rm-me >/dev/null 2>&1
+ri=0
+while [ "\$(timeout 20 docker ps -aq --filter name=gonesoon 2>/dev/null | wc -l | tr -d ' ')" != 0 ] && [ "\$ri" -lt 20 ]; do
+  sleep 0.5; ri=\$((ri + 1))
+done
+after=\$(timeout 20 docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+[ "\$before" = "\$after" ]; say \$? "docker run --rm leaves no container behind (\$before then \$after)"
+
 
 # MORE RUNNING CONTAINERS THAN THERE ARE CONNECTION SLOTS. Supervising a
 # container used to happen on the request's own thread, so every running

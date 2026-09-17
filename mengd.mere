@@ -773,8 +773,29 @@ let jstrs = fn (v: Json.json) ->
         go t (if str_len acc == 0 then one else acc ++ "," ++ one) in
   "[" ++ go (jarr v) "" ++ "]";
 
+// A prefix, removed if it is there. Not str_replace: "docker.io/" in the
+// middle of a name is part of the name.
+let strip_pre = fn (t: str) -> fn (p: str) ->
+  if str_len t > str_len p && substring t 0 (str_len p) == p
+  then substring t (str_len p) (str_len t) else t;
+
+// THE SAME IMAGE UNDER TWO SPELLINGS. `docker tag a b:1` arrives as
+// repo=docker.io/library/b, because the client qualifies a short name; the
+// `docker run b:1` that follows arrives as Image=b:1. An index that stores one
+// and is asked for the other answers "No such image" -- and `docker images`
+// listed it the whole time, because the listing strips the prefix and the
+// lookup did not. A tagged image could not be run by the name it was given.
+//
+// Undone here, at the one place a LOCAL name is made canonical. The registry
+// side is untouched: split_host puts library/ and registry-1.docker.io back
+// when it reads a reference, which is where those conventions belong.
+//
+// library/ is only removed when a hub prefix came off in front of it, so an
+// image somebody really called library/x keeps its name.
 let norm_tag = fn (name: str) ->
-  if str_index_of name ":" >= 0 then name else name ++ ":latest";
+  let a = strip_pre (strip_pre name "index.docker.io/") "docker.io/" in
+  let b = if a != name then strip_pre a "library/" else a in
+  if str_index_of b ":" >= 0 then b else b ++ ":latest";
 
 // Find the image directory for a tag, from the same index /images/json reads.
 let image_dir = fn (store: str) -> fn (tag: str) ->
@@ -2157,8 +2178,15 @@ let fwd_stop = fn (store: str) -> fn (id: str) ->
 // rather than assumed, because an overlay cannot be stacked on an overlay --
 // which is what a store inside a container is -- and the answer decides
 // between two correct shapes rather than between working and not.
+//
+// ASKED ONCE, AT STARTUP, not per container: it makes and removes a directory,
+// and forty `docker run` at the same moment had forty threads making and
+// removing THE SAME ONE. mkdir_p raises when the path is being deleted under
+// it, and in Mere a raise ends the daemon -- which is exactly what happened,
+// three times over, with /var/lib/mengd/.ovlprobe/l as its last word.
 let ovl_usable_at = fn (base: str) ->
   let d = base ++ "/.ovlprobe" in
+  let _ = st_rmtree d in
   let m = d ++ "/m" in
   let _ = mkdir_p (d ++ "/l") in
   let _ = mkdir_p (d ++ "/u") in
@@ -2290,7 +2318,8 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
     // The overlay first, and the old way when the machine cannot mount one:
     // a store on top of another overlay cannot be an upper directory, and
     // that is a smaller machine rather than a broken one.
-    let ovl = if ovl_usable_at store then str_len (ctr_mount store id dir) == 0 else false in
+    let ovl = if read_file_or (store ++ "/.ovlusable") "" == "1"
+              then str_len (ctr_mount store id dir) == 0 else false in
     let _ = if ovl then (let _ = cwrite store id "ovl" "1" in ()) else () in
     let n = if ovl then 1 else build_rootfs dir (cd ++ "/bundle/rootfs") in
     let _ = tc "rootfs done" in
@@ -2392,6 +2421,12 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
       let _ = cwrite store id "cmd" (jstrs (jget spec "Cmd")) in
       let _ = cwrite store id "labels" (jobj_raw (jget spec "Labels")) in
       let _ = cwrite store id "netmode" (if str_len netmode == 0 then "default" else netmode) in
+      // --rm. The CLIENT used to delete the container after it exited; modern
+      // docker sets this and the DAEMON does it. Not reading it meant every
+      // `docker run --rm` left a container behind -- and nothing noticed,
+      // because every check counted containers after removing them by name.
+      let _ = if jbool (jget hcfg "AutoRemove") then
+                (let _ = cwrite store id "autoremove" "1" in ()) else () in
       // The names the client wants this container known by on that network.
       // compose puts the service name here, which is the name the other
       // services in the file actually use.
@@ -2591,6 +2626,20 @@ let net_down = fn (store: str) -> fn (id: str) ->
   // pair dies together -- so the host side goes too and there is nothing else
   // to unpick.
   let _ = nw_netns_del (netns_path id) in ();
+
+// Everything that has to happen when a container stops existing, in one place.
+// Three callers ask for it -- DELETE, prune, and a container started with
+// --rm that has exited -- and three copies of a list of five steps is three
+// chances to forget the one that matters.
+//
+// Returns 0, or -1 when the mount would not come off: the directory is then
+// left alone rather than half-removed.
+let ctr_purge = fn (store: str) -> fn (id: str) ->
+  let _ = fwd_stop store id in
+  let _ = net_down store id in
+  let _ = net_release store (cread store id "net") id in
+  if ctr_unmount store id != 0 then 0 - 1
+  else let _ = st_rmtree (cdir store id) in 0;
 
 // The body of a response that is a FILE. The same shape mreg uses: one buffer,
 // refilled, so a layer-sized answer does not become a layer-sized string.
@@ -3244,6 +3293,8 @@ let c_image_tag = fn (fd: int) -> fn (store: str) -> fn (name: str) -> fn (q: st
                     if field l 2 == dir then field l 3
                     else go (substring rest (i + 1) (str_len rest)) in
                 go idx) in
+      // Stored canonically, because that is how it will be asked for.
+      let full = norm_tag full in
       if str_index_of idx (id ++ "\t" ++ full ++ "\t") >= 0 then
         respond fd "201 Created" "text/plain" ""
       else
@@ -3276,14 +3327,10 @@ let c_prune_containers = fn (fd: int) -> fn (store: str) ->
                   // Same rule as DELETE: a container still mounted is left
                   // alone rather than deleted through its mount.
                   let _ = if cread store h "state" == "exited" then
-                            (let _ = net_down store h in
-                             let _ = net_release store (cread store h "net") h in
-                             if ctr_unmount store h != 0 then
+                            (if ctr_purge store h != 0 then
                                (let _ = print_err ("mengd: " ++ substring h 0 12
                                      ++ " is still mounted; not pruning it") in ())
-                             else
-                             let _ = st_rmtree (cdir store h) in
-                             let _ = vec_push gone h in ()) else () in
+                             else (let _ = vec_push gone h in ())) else () in
                   go t in
             go (list_dir d) in
   let rec join = fn (i: int) -> fn (acc: str) ->
@@ -4734,23 +4781,17 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
                     else if n > 40 then ()
                     else let _ = sleep_ms 50 in wait_gone (n + 1) in
                   wait_gone 0) in
-         let _ = fwd_stop store id in
          // The namespace goes with the container. Left behind it would hold
          // the address, and the next container on that network would be given
-         // one that is already taken.
-         let _ = net_down store id in
-         let _ = net_release store (cread store id "net") id in
-         // THE MOUNT COMES OFF FIRST, and if it will not, nothing is deleted
-         // and the client is told. A directory with a mount point inside it
-         // cannot be removed: the delete half-succeeds, the container stays
-         // listed, and the mount is left for the next thing that tries to
-         // clean the store to trip over.
-         if ctr_unmount store id != 0 then
+         // one that is already taken. And THE MOUNT COMES OFF FIRST: a
+         // directory with a mount point inside it cannot be removed, so the
+         // delete would half-succeed, the container would stay listed, and the
+         // mount would be left for the next thing that cleans the store.
+         if ctr_purge store id != 0 then
            respond fd "500 Internal Server Error" "application/json"
              (obj [("message", s ("mengd: " ++ substring id 0 12
                               ++ " is still mounted; refusing to delete it"))])
          else
-         let _ = st_rmtree (cdir store id) in
          respond fd "204 No Content" "text/plain" ""
        else respond fd "404 Not Found" "application/json"
               (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
@@ -4878,6 +4919,20 @@ let watch_containers = fn (store: str) -> fn (runtime: str) ->
                             // as fast as the machine can fork, so a turn of
                             // the loop is the soonest it can come back.
                             (let _ = cwrite store h "state" "restarting" in ()) in
+                    // --rm, ON THE NEXT PASS, like a restart and for the
+                    // same reason: the pass that noticed the exit has just
+                    // written the exit status, and a client on /wait is about
+                    // to read it. `docker run --rm` wants the code of the thing
+                    // it ran, and a container removed before that is a run with
+                    // no answer. One turn of this loop is the grace, and it
+                    // costs nothing -- sleeping here would stall the
+                    // supervision of every OTHER container.
+                    let _ =
+                      if cread store h "autoremove" != "1"
+                         || cread store h "state" != "exited" then ()
+                      else if cread store h "rmpending" != "1" then
+                        (let _ = cwrite store h "rmpending" "1" in ())
+                      else (let _ = ctr_purge store h in ()) in
                     // A restart happens on the NEXT pass, which is also the
                     // pause: one state, one place that acts on it.
                     let _ =
@@ -4919,6 +4974,17 @@ let watch_containers = fn (store: str) -> fn (runtime: str) ->
 
 let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
   let _ = st_ignore_sigpipe () in
+  let _ = mkdir_p store in
+  // WHAT SHAPE A CONTAINER'S ROOTFS WILL HAVE, decided here and said out loud.
+  // It is a property of the filesystem the store is on, so it is asked once --
+  // and asking it per container meant forty threads making and removing one
+  // probe directory, which killed the daemon. Recorded in the store because
+  // the answer is about the store.
+  let _ = (let ok = ovl_usable_at store in
+           let _ = st_write_str (store ++ "/.ovlusable") (if ok then "1" else "0") in
+           let _ = print_err (if ok then "mengd: containers get an overlay over the image"
+                              else "mengd: this filesystem cannot hold an overlay upper directory;"
+                                ++ " every container gets its own copy of the image") in ()) in
   let _ = reconcile store in
   let _ = detach (spawn (fn (u: unit) -> watch_containers store runtime)) in
   let srv = listen_on sock in
