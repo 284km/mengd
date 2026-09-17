@@ -1574,6 +1574,15 @@ let pull_image = fn (store: str) -> fn (ref: str) -> fn (basic: str) ->
           // for a registry that answers as registry-1.docker.io, and recording
           // the second means the image comes back under a tag nobody typed.
           let full_tag = ref in
+          // WHAT GOES IN THE INDEX IS THE CANONICAL NAME, and what goes back
+          // to the client is what it asked for. A pull of
+          // docker.io/library/alpine:latest is answered with that string --
+          // the client printed it and is comparing -- while the row it leaves
+          // has to be the spelling every later lookup uses. Writing the
+          // qualified name here and canonicalising in image_dir meant a pull
+          // that worked, an image that `docker images` listed, and a
+          // `docker run` of the same reference answering "No such image".
+          let index_tag = norm_tag full_tag in
           let mj = "[\{\"Config\":\"blobs/sha256/" ++ hex_of_dig cfg_dig ++ "\","
                 ++ "\"RepoTags\":[" ++ s full_tag ++ "],"
                 ++ "\"Layers\":[" ++ llist ++ "]}]" in
@@ -1601,7 +1610,7 @@ let pull_image = fn (store: str) -> fn (ref: str) -> fn (basic: str) ->
               if str_len d0 == 0 then full_tag
               else
                 let _ = write_file (index_path store)
-                          (idx ++ id ++ "\t" ++ full_tag ++ "\t" ++ d0 ++ "\t0\n") in
+                          (idx ++ id ++ "\t" ++ index_tag ++ "\t" ++ d0 ++ "\t0\n") in
                 full_tag
           else
             let final = store ++ "/images/" ++ substring id 7 19 in
@@ -1616,7 +1625,7 @@ let pull_image = fn (store: str) -> fn (ref: str) -> fn (basic: str) ->
                     go t (acc + (if file_exists f then file_size f else 0)) in
               go (jarr (jget man "layers")) 0 in
             let _ = write_file (index_path store)
-                      (idx ++ id ++ "\t" ++ full_tag ++ "\t" ++ final ++ "\t" ++ show (sz ()) ++ "\n") in
+                      (idx ++ id ++ "\t" ++ index_tag ++ "\t" ++ final ++ "\t" ++ show (sz ()) ++ "\n") in
             full_tag;
 
 // ---- images: inspect -----------------------------------------------------
