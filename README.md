@@ -1087,3 +1087,36 @@ here and nobody else can hold the address, so detection has nothing to find.
 
 A kernel built without IPv6 is a smaller machine, not a broken one: the v6 part
 says so and the rest still works.
+
+## What survives a restart, and what only looks like it does
+
+The store is on disk and outlives this daemon — that is the point. What does
+**not** survive is anything that was running, and the store still said
+"running" about it, with a pid from a process table that no longer exists.
+`docker ps` listed a container that was not there; `docker stop` would have
+signalled whatever owns that number now.
+
+So the first thing this daemon does is ask, about each container, whether it is
+still true. A pid that **is** alive is left alone: within one boot the daemon
+can be restarted under its own containers, and killing them because the daemon
+blinked would be worse than the thing being fixed. Pid reuse can make that
+answer wrong and nothing here can tell those apart — a machine that has
+rebooted has an empty process table, which is the case this actually fixes.
+
+**`POST /_shutdown`** — not part of the Docker API, and spelt with an
+underscore like `/_ping` so it cannot be mistaken for one. It flushes and
+powers the machine off. Killing the VMM from outside loses whatever the guest
+has not committed yet: a machine stopped a second after a container was created
+came back without it. Anybody who can reach this socket can do it, which is not
+a new power — the same socket starts containers.
+
+**`docker ps` means the ones that are running.** The `all` parameter was
+ignored, so both `ps` and `ps -a` got the same answer and one of them was
+always wrong.
+
+**Exited is not the same as finished writing.** `attach` stopped pumping when
+the state said exited, with one more pass for the runtime's last write — a
+guess at how late a write can be, and a check watching for a service's output
+lost it about one run in five. It stops now when the container has exited *and*
+two consecutive passes saw nothing new: a write landing after that had 100 ms
+of silence in front of it.

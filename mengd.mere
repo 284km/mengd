@@ -34,6 +34,7 @@ extern fn ex_spawn: int -> str -> str -> str -> str -> str -> int;
 extern fn ex_spawn_in: int -> str -> str -> str -> str -> str -> str -> int;
 extern fn st_top: int -> str;
 extern fn st_read_small: str -> str;
+extern fn st_shutdown: unit -> int;
 extern fn st_mount_overlay: str -> str -> int;
 extern fn st_umount: str -> int;
 // The network a compose file describes: a bridge per network, a veth pair per
@@ -3244,20 +3245,26 @@ let c_attach = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (req: str) 
                 print_err ("attach: framing " ++ show (n - sent) ++ " bytes of " ++ f) else () in
       let _ = write_str fd (frame_of stream (substring body sent n)) in
       n in
-  let rec pump = fn (o: int) -> fn (e: int) -> fn (n: int) ->
+  // EXITED IS NOT THE SAME AS FINISHED WRITING. The old condition was "the
+  // state says exited", with one more pass for the runtime's last write; that
+  // was a guess at how late a write could be, and a check that watched for a
+  // service's output lost it about one run in five.
+  //
+  // The condition now is structural: stop when the container has exited AND
+  // two consecutive passes saw nothing new. A write that lands after that had
+  // 100 ms of silence in front of it.
+  let rec pump = fn (o: int) -> fn (e: int) -> fn (n: int) -> fn (quiet: int) ->
     let o2 = tail "log.out" 1 o in
     let e2 = tail "log.err" 2 e in
-    if cread store id "state" == "exited" then
-      // One more pass after the exit: the runtime's last write can land
-      // between the poll and the state file being updated.
-      let _ = tail "log.out" 1 o2 in
-      let _ = tail "log.err" 2 e2 in
+    let grew = o2 != o || e2 != e in
+    let q2 = if grew then 0 else quiet + 1 in
+    if cread store id "state" == "exited" && q2 >= 2 then
       let _ = if str_len (env_or "MENGD_TRACE") > 0 then
                 print_err ("attach: done after " ++ show n ++ " polls") else () in
       ()
     else if n > 3000 then ()
-    else let _ = sleep_ms 50 in pump o2 e2 (n + 1) in
-  pump 0 0 0;
+    else let _ = sleep_ms 50 in pump o2 e2 (n + 1) q2 in
+  pump 0 0 0 0;
 
 // `docker ps` prints a COMMAND column, which is the argv as one string.
 let cmd_line = fn (store: str) -> fn (id: str) ->
@@ -3340,7 +3347,15 @@ let c_list_body = fn (store: str) -> fn (q: str) ->
       match xs with
       | [] -> acc
       | [h, ...t] ->
-          if not (matches_all (cread store h "labels") (filter_labels q)) then go t acc else
+          // `docker ps` means the ones that are RUNNING; `docker ps -a` means
+          // all of them, and says so with all=true. Ignoring it listed every
+          // container that had ever run as though it still were -- which is
+          // the same answer for both commands, so one of them was always
+          // wrong.
+          if not (matches_all (cread store h "labels") (filter_labels q)) then go t acc
+          else if query_param q "all" != "true" && query_param q "all" != "1"
+                  && cread store h "state" != "running"
+                  && cread store h "state" != "restarting" then go t acc else
           let e = obj [("Id", s h), ("Names", raw ("[" ++ s ("/" ++ cread store h "name") ++ "]")),
                        ("Image", s (cread store h "image")), ("ImageID", s ""),
                        ("Command", s (cmd_line store h)),
@@ -4096,7 +4111,17 @@ let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
 let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
              fn (store: str) -> fn (runtime: str) -> fn (req: str) -> fn (q: str) ->
              fn (m: str) -> fn (path: str) ->
-  if path == "/build" then
+  // NOT PART OF THE DOCKER API, and spelt with an underscore like /_ping so it
+  // cannot be mistaken for one. Killing the VMM from outside loses whatever
+  // the guest has not committed yet -- a machine stopped a second after a
+  // container was created came back without it. This flushes and powers the
+  // machine off, and the VMM sees the same PSCI SYSTEM_OFF a guest sends when
+  // its init finishes.
+  if path == "/_shutdown" then
+    let _ = respond fd "200 OK" "application/json"
+              (obj [("status", s "mengd: syncing and powering off")]) in
+    let _ = st_shutdown () in ()
+  else if path == "/build" then
     let uniq = gen_request_id () in
     let ctx = store ++ "/build-ctx-" ++ uniq ++ ".tar" in
     let _ = st_rmtree ctx in
@@ -4305,8 +4330,49 @@ let listen_on = fn (sock: str) ->
     else vsock_listen port
   else unix_listen sock;
 
+// ---- what survived, and what only looks like it did -------------------------
+//
+// The store is on disk and outlives the daemon, which is the point: a machine
+// that is stopped and started again still has its images, its containers, its
+// volumes and its networks. What does NOT survive is anything that was
+// running -- and the store still says "running" about it, with a pid from a
+// process table that no longer exists.
+//
+// Left alone, `docker ps` lists a container that is not there and `docker
+// stop` sends a signal to whatever owns that number now. So the first thing
+// this daemon does is ask, about each one, whether it is still true.
+//
+// A pid that IS alive is left alone: within one boot the daemon can be
+// restarted under its own running containers, and killing them because the
+// daemon blinked would be worse than the thing being fixed. Pid reuse can make
+// that answer wrong, and the honest note is that nothing here can tell those
+// apart -- a machine that has rebooted has an empty process table, which is
+// the case this actually fixes.
+let reconcile = fn (store: str) ->
+  let d = store ++ "/containers" in
+  if not (file_exists d) then ()
+  else
+    let rec go = fn (xs: str list) ->
+      match xs with
+      | [] -> ()
+      | [h, ...t] ->
+          let st = cread store h "state" in
+          let pid = int_or (cread store h "pid") 0 in
+          let _ = if (st == "running" || st == "restarting")
+                     && (pid <= 0 || st_kill pid 0 != 0) then
+                    (let _ = cwrite store h "state" "exited" in
+                     let _ = cwrite store h "cpid" "" in
+                     let _ = cwrite store h "fwdpids" "" in
+                     let _ = cwrite store h "health" "" in
+                     let _ = print_err ("mengd: " ++ substring h 0 12
+                                     ++ " was recorded as running and is not") in ())
+                  else () in
+          go t in
+    go (list_dir d);
+
 let serve = fn (sock: str) -> fn (store: str) -> fn (runtime: str) ->
   let _ = st_ignore_sigpipe () in
+  let _ = reconcile store in
   let srv = listen_on sock in
   let _ = if srv < 0 then
             let _ = print_err ("mengd: cannot listen on " ++ sock) in exit 1

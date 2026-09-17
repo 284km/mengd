@@ -569,3 +569,28 @@ int ex_spawn_in(int cpid, const char *argvfile, const char *envfile,
  * a Mere program holds is an OFFSET into the runtime's own buffer, and only the
  * runtime knows where that buffer is. A shim that took it for an address wrote
  * from whatever happened to be there -- and read as success. */
+
+/* Put the machine away, from inside it.
+ *
+ * Killing the VMM loses whatever the guest had not written yet: its root
+ * filesystem commits on its own schedule, and a machine stopped a second after
+ * a container was created came back without it. A stop has to be a stop, not
+ * an interruption.
+ *
+ * So the daemon flushes and powers the machine off, and the VMM sees PSCI
+ * SYSTEM_OFF -- the same path a guest takes when its init finishes, which is
+ * already the one this project tests.
+ *
+ * Anybody who can reach this socket can do this. That is not a new power: the
+ * same socket starts containers, and a container can be given the machine. */
+#ifdef __linux__
+#include <sys/reboot.h>
+int st_shutdown(void) {
+    sync();
+    sync();
+    reboot(RB_POWER_OFF);
+    return -1;                 /* only reached if it was refused */
+}
+#else
+int st_shutdown(void) { sync(); return -1; }
+#endif

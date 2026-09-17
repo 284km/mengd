@@ -42,6 +42,14 @@ docker run --rm -v "$here:/w" -w /w "$BUILD_IMG" \
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" \
   cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c || { echo "FAIL: cc mrun"; exit 1; }
 
+# BACKTICKS IN A COMMENT ARE A COMMAND. Everything below goes into an unquoted
+# heredoc, so the shell runs whatever a comment quotes -- this has bitten twice,
+# and the second time the output of one was parsed as a redirection three
+# checks later. Caught here rather than in the middle of a run.
+if awk 'f && /^#/ && /`/ {bad=1} /^\$RUNNER sudo sh -s <<EOF/ {f=1} END {exit !bad}' "$0"; then
+  echo "FAIL: a comment inside the runner heredoc contains a backtick" >&2; exit 1
+fi
+
 echo "== run on linux =="
 $RUNNER sudo sh -s <<EOF
 set -u
@@ -594,6 +602,19 @@ sleep 6
 n0=\$(wc -l < /var/tmp/rstate2/runs 2>/dev/null | tr -d ' ')
 [ "\$n0" = 1 ]; say \$? "a container with no policy runs once (\$n0)"
 timeout 20 docker rm -f rp0 >/dev/null 2>&1
+
+# docker ps means the ones that are RUNNING. Ignoring the all= parameter
+# gives both commands the same answer, so one of them is always wrong.
+timeout 60 docker run --name pssrun -d alpine:latest sh -c 'sleep 60' >/dev/null 2>&1
+timeout 60 docker run --name psgone alpine:latest true >/dev/null 2>&1
+sleep 1
+r=\$(timeout 20 docker ps --format '{{.Names}}' 2>/dev/null | tr '\\n' ' ')
+a=\$(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | tr '\\n' ' ')
+echo "\$r" | grep -q pssrun && ! echo "\$r" | grep -q psgone
+say \$? "docker ps lists the running one and not the finished one (\$r)"
+echo "\$a" | grep -q pssrun && echo "\$a" | grep -q psgone
+say \$? "docker ps -a lists both (\$a)"
+timeout 20 docker rm -f pssrun psgone >/dev/null 2>&1
 
 # docker exec. A second process inside a container that is already running,
 # which is three requests: one to say what to run, one to run it, one to ask
