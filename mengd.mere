@@ -31,6 +31,7 @@ extern fn st_rmtree: str -> int;
 extern fn st_mkdir_excl: str -> int;
 extern fn st_b64_of: str -> str;
 extern fn ex_spawn: int -> str -> str -> str -> str -> str -> int;
+extern fn ex_spawn_in: int -> str -> str -> str -> str -> str -> str -> int;
 extern fn st_top: int -> str;
 extern fn st_read_small: str -> str;
 extern fn st_mount_overlay: str -> str -> int;
@@ -3099,7 +3100,8 @@ let c_exec_create = fn (fd: int) -> fn (store: str) -> fn (id: str) -> fn (body:
     let _ = write_file (d ++ "/exit") "" in
     respond fd "201 Created" "application/json" (obj [("Id", s xid)]);
 
-let c_exec_start = fn (fd: int) -> fn (store: str) -> fn (xid: str) -> fn (req: str) ->
+let c_exec_start = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
+                   fn (store: str) -> fn (xid: str) -> fn (req: str) ->
   let d = xdir store xid in
   if not (file_exists (d ++ "/argv")) then
     respond fd "404 Not Found" "application/json"
@@ -3123,17 +3125,74 @@ let c_exec_start = fn (fd: int) -> fn (store: str) -> fn (xid: str) -> fn (req: 
              "HTTP/1.1 200 OK\r\n"
              ++ "Content-Type: application/vnd.docker.multiplexed-stream\r\n"
              ++ "Connection: close\r\n\r\n") in
-      let pid = ex_spawn cpid (d ++ "/argv") (d ++ "/env") (read_file_or (d ++ "/cwd") "")
-                              (d ++ "/out") (d ++ "/err") in
-      if pid < 0 then
+      // The child's stdin is a pipe and this end of it is ours: `docker exec
+      // -i` sends the command's input as RAW BYTES on this very connection
+      // after the 101, and with nowhere to put them the daemon finished,
+      // closed the socket, and the client -- still writing -- got "connection
+      // reset by peer".
+      let wfd = ex_spawn_in cpid (d ++ "/argv") (d ++ "/env") (read_file_or (d ++ "/cwd") "")
+                                 (d ++ "/out") (d ++ "/err") (d ++ "/pid") in
+      let pid = int_or (read_file_or (d ++ "/pid") "") 0 in
+      if wfd < 0 || pid <= 0 then
         let _ = write_str fd (frame_of 2 "mengd: cannot enter the container\n") in ()
       else
-        let code = st_wait pid in
-        let _ = write_file (d ++ "/exit") (show code) in
-        // The output goes out after it is all there. Live interleaving is what
-        // a terminal is for, and this says it does not do terminals.
-        let _ = write_str fd (frame_of 1 (read_file_or (d ++ "/out") "")) in
-        let _ = write_str fd (frame_of 2 (read_file_or (d ++ "/err") "")) in ();
+        // ONE LOOP, BOTH DIRECTIONS. The same shape attach uses for output --
+        // poll what the child has written and frame it -- with the client's
+        // bytes going the other way in the same turn. Two threads would need
+        // the socket to be safe to use from both, and there is nothing here
+        // that needs them.
+        // WHAT IS ALREADY IN THE BUFFER IS ALREADY READ. The body and the
+        // first bytes of stdin can arrive in one packet, and then those bytes
+        // are sitting in this connection's reader -- a fresh tcp_read would
+        // wait for bytes that have already been delivered.
+        let _ = (let have = (vec_get st rd_have : int) in
+                 let pos = (vec_get st rd_pos : int) in
+                 if have > pos then
+                   (let _ = tcp_write wfd (buf + pos) (have - pos) in
+                    let _ = vec_set st rd_pos have in ())
+                 else ()) in
+        let _ = io_set_nonblocking fd in
+        let sent = vec_new () in
+        let _ = vec_push sent 0 in
+        let _ = vec_push sent 0 in
+        let _ = vec_push sent 1 in           // 2: is the client's side still open
+        let tail = fn (name: str) -> fn (stream: int) -> fn (slot: int) ->
+          let body = read_file_or (d ++ "/" ++ name) "" in
+          let n = str_len body in
+          let seen = (vec_get sent slot : int) in
+          let _ = if n > seen then
+                    (let _ = write_str fd (frame_of stream (substring body seen n)) in
+                     let _ = vec_set sent slot n in ()) else () in
+          () in
+        let rec go = fn (turns: int) ->
+          // The client's stdin, as much as is there. 0 means it closed its
+          // write side -- which is how `echo x | docker exec -i` says "that
+          // was all of it" -- and -1 means nothing yet, which is the normal
+          // case and not a reason to stop.
+          let _ = if (vec_get sent 2 : int) == 1 then
+                    (let r = tcp_read fd buf 65536 in
+                     if r > 0 then (let _ = tcp_write wfd buf r in ())
+                     else if r == 0 then
+                       (let _ = tcp_close wfd in let _ = vec_set sent 2 0 in ())
+                     else ())
+                  else () in
+          let _ = tail "out" 1 0 in
+          let _ = tail "err" 2 1 in
+          if file_exists (d ++ "/exit") && str_len (read_file_or (d ++ "/exit") "") > 0 then ()
+          else if turns > 6000 then ()
+          else let _ = sleep_ms 20 in go (turns + 1) in
+        // The wait happens beside the pump, not before it: a command that
+        // reads its input and answers as it goes would otherwise be waited for
+        // by a daemon that is not yet listening to it.
+        let _ = spawn (fn (u: unit) ->
+                  let code = st_wait pid in
+                  write_file (d ++ "/exit") (show code)) in
+        let _ = go 0 in
+        // The pipe closes whatever happened: a child still waiting on input
+        // nobody will send would hold this exec open forever.
+        let _ = if (vec_get sent 2 : int) == 1 then (let _ = tcp_close wfd in ()) else () in
+        let _ = tail "out" 1 0 in
+        let _ = tail "err" 2 1 in ();
 
 let c_exec_json = fn (fd: int) -> fn (store: str) -> fn (xid: str) ->
   let d = xdir store xid in
@@ -4142,7 +4201,7 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
        // finished sending gets a broken pipe at the client.
        (let clen = header_int req "Content-Length: " in
         let _ = read_body fd buf cap st clen in
-        c_exec_start fd store xid req)
+        c_exec_start fd buf cap st store xid req)
      else if verb == "json" then c_exec_json fd store xid
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))

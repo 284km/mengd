@@ -617,6 +617,21 @@ n=\$(timeout 30 docker exec exc sh -c 'ls /proc | grep -c "^[0-9]*\$"' 2>/dev/nu
 a=\$(timeout 30 docker exec exc sh -c 'ip -o addr show eth0 | grep -c "10\\.88\\."' 2>/dev/null | tr -d '\\r\\n')
 [ "\$a" = 1 ]; say \$? "and on the container's network (\$a)"
 
+# STDIN. docker exec -i sends the command's input as RAW BYTES on the upgraded
+# connection, after the 101. With nowhere to put them the daemon finished,
+# closed the socket, and the client -- still writing -- got "connection reset
+# by peer": the failure looked like a network fault and was a missing pipe.
+o=\$(echo hello-stdin | timeout 30 docker exec -i exc cat 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "hello-stdin" ]; say \$? "docker exec -i feeds the command its input (\$o)"
+
+# Big enough that it cannot arrive in one read, and cannot sit in one buffer.
+n=\$(head -c 300000 /dev/urandom | base64 | timeout 60 docker exec -i exc wc -c 2>/dev/null | tr -d ' \\r\\n')
+[ -n "\$n" ] && [ "\$n" -gt 400000 ]; say \$? "a large input arrives whole (\$n bytes)"
+
+# The shape people actually use: a script down the pipe.
+o=\$(printf 'echo one\necho two\n' | timeout 30 docker exec -i exc sh 2>/dev/null | tr '\\n' ' ')
+[ "\$o" = "one two " ]; say \$? "a script piped into a shell runs (\$o)"
+
 # A terminal is a pty in the container and a bidirectional stream. Refused by
 # name rather than half-answered.
 timeout 30 docker exec -t exc echo x >/var/tmp/tty.log 2>&1

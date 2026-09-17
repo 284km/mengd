@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <stdint.h>
 
 int st_rename(const char *from, const char *to) { return rename(from, to) == 0 ? 0 : -1; }
 
@@ -381,6 +382,23 @@ static char **ex_read_argv(const char *path) {
     return n > 0 ? v : (free(v), NULL);
 }
 
+/* ---- stdin for an exec ----------------------------------------------------
+ *
+ * `docker exec -i` sends the command's standard input as RAW BYTES on the
+ * upgraded connection, after the 101. Without somewhere to put them the daemon
+ * finished, closed the socket, and the client -- still writing -- got
+ * "connection reset by peer".
+ *
+ * So the child's stdin is a pipe, and the caller gets its write end. TWO
+ * VALUES OUT OF ONE CALL is the awkward part, and the answer is the one this
+ * project already uses for exactly this: the pid goes in a FILE, the way mrun
+ * writes the container's pid, and the return value is the fd. Hiding one of
+ * them in a static would work until two execs ran at once.
+ */
+int ex_spawn_in(int cpid, const char *argvfile, const char *envfile,
+                const char *cwd, const char *outfile, const char *errfile,
+                const char *pidfile);
+
 /* Returns the child's pid, or -1. The caller waits for it with st_wait. */
 int ex_spawn(int cpid, const char *argvfile, const char *envfile,
              const char *cwd, const char *outfile, const char *errfile) {
@@ -498,3 +516,56 @@ const char *st_read_small(const char *path) {
     close(fd);
     return ST_SMALL;
 }
+
+/* The same, with a pipe for stdin: returns the WRITE END of that pipe and
+ * writes the child's pid into `pidfile`. -1 on failure, and then the pidfile
+ * is left empty rather than holding a pid that never existed. */
+int ex_spawn_in(int cpid, const char *argvfile, const char *envfile,
+                const char *cwd, const char *outfile, const char *errfile,
+                const char *pidfile) {
+    FILE *pf = fopen(pidfile, "w");
+    if (pf) { fputs("", pf); fclose(pf); }
+    char **argv = ex_read_argv(argvfile);
+    if (!argv) return -1;
+    char **envp = ex_read_argv(envfile);
+    int p[2];
+    if (pipe(p) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (pid == 0) {
+        close(p[1]);
+        int o = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int e = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (o < 0 || e < 0) _exit(125);
+        if (ex_enter(cpid, "ipc") != 0) _exit(126);
+        if (ex_enter(cpid, "uts") != 0) _exit(126);
+        if (ex_enter(cpid, "net") != 0) _exit(126);
+        if (ex_enter(cpid, "pid") != 0) _exit(126);
+        if (ex_enter(cpid, "mnt") != 0) _exit(126);
+        pid_t inner = fork();
+        if (inner < 0) _exit(125);
+        if (inner > 0) {
+            int st = 0;
+            if (waitpid(inner, &st, 0) < 0) _exit(125);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+        }
+        dup2(p[0], 0); dup2(o, 1); dup2(e, 2);
+        close(p[0]); close(o); close(e);
+        if (cwd && cwd[0]) { if (chdir(cwd) != 0) chdir("/"); } else chdir("/");
+        if (envp) for (char **v = envp; *v; v++) {
+            char *eq = strchr(*v, '=');
+            if (eq) { *eq = 0; setenv(*v, eq + 1, 1); *eq = '='; }
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(p[0]);
+    pf = fopen(pidfile, "w");
+    if (pf) { fprintf(pf, "%d", (int)pid); fclose(pf); }
+    return p[1];
+}
+
+/* Writing the arena to the pipe is tcp_write's job, not a shim's: the "pointer"
+ * a Mere program holds is an OFFSET into the runtime's own buffer, and only the
+ * runtime knows where that buffer is. A shim that took it for an address wrote
+ * from whatever happened to be there -- and read as success. */

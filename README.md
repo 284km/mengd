@@ -400,10 +400,17 @@ cannot report "serial" would not be a measurement.
 foreground `docker run`. Then `/networks/*`, `/volumes/*` and `/events`, which is
 what `docker compose up` needs.
 
-Known gaps: the interleaving between stdout and stderr is not preserved (they
-are separate files, so each stream's own order survives and the order between
-them does not); no cgroup accounting, no `--rm`, no ports, and no networking
-beyond the namespace mrun creates.
+Known gaps *as of that section being written*, kept here because the list is
+worth reading against what came after: the interleaving between stdout and
+stderr is not preserved (they are separate files, so each stream's own order
+survives and the order between them does not); no cgroup accounting, no
+`--rm`, no ports, and no networking beyond the namespace mrun creates.
+
+Of those, only the first is still true. Ports, networking, cgroups and their
+consequences — stats, pause, limits — arrived later and have their own sections
+below. A list of gaps that is not revisited becomes a list of lies; this one is
+dated instead of deleted, because what a daemon could not do in its first week
+is part of how it was built.
 
 ### The denial of service that was in the README before it was in the code
 
@@ -872,8 +879,34 @@ Recording the container's pid only for containers with **published ports** —
 which is how it was — made exec answer "container is not running" about a
 container that was.
 
-**No TTY and no stdin**, said here rather than discovered. `docker exec -it`
-wants a pty in the container and a bidirectional stream; it is refused by name.
+**`docker exec -i` feeds the command its input.** The client sends it as **raw
+bytes on the upgraded connection**, after the 101 — no framing, unlike the
+output coming back. With nowhere to put them the daemon finished, closed the
+socket, and the client, still writing, got *"connection reset by peer"*: the
+failure looked like a network fault and was a missing pipe.
+
+The child's stdin is now a pipe and the daemon holds the write end. **Two
+values out of one call** is the awkward part of that, and the answer is the one
+this project already uses: the pid goes in a **file**, the way mrun writes the
+container's pid, and the return value is the fd. Hiding one of them in a static
+would work until two execs ran at once.
+
+One loop carries both directions — the shape `attach` already uses for output,
+with the client's bytes going the other way in the same turn. Two threads would
+need the socket to be safe to use from both, and nothing here needs them.
+
+**What is already in the buffer is already read.** The body and the first bytes
+of stdin can arrive in one packet, and then those bytes are sitting in this
+connection's reader; a fresh `tcp_read` would wait for bytes that had already
+been delivered.
+
+**`tcp_write`, not a shim of our own.** The "pointer" a Mere program holds is an
+*offset* into the runtime's own buffer, and only the runtime knows where that
+buffer is. A shim that took it for an address wrote from whatever happened to
+be there — and reported success.
+
+**No TTY**, said here rather than discovered. `docker exec -it` wants a pty in
+the container, which is a different thing again; it is refused by name.
 
 **`docker cp`** is tar out and tar in, which this already had in both
 directions, plus the path checking that keeps the destination inside. It works
