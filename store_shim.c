@@ -51,6 +51,43 @@ int st_rmtree(const char *path) { return rmtree(path); }
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
+/* EVERY DESCRIPTOR THIS CHILD DID NOT ASK FOR.
+ *
+ * A container's process is a child of this daemon, and a child inherits what
+ * was open at the moment of the fork: the listening socket, and every client
+ * connection being served right then. It holds them for as long as it runs --
+ * which for a container is forever.
+ *
+ * The witness is the container's own view of itself:
+ *
+ *     $ docker run --rm alpine ls -l /proc/self/fd
+ *     3 -> socket:[756]     <- it opened none of these
+ *     4 -> socket:[1522]
+ *     5 -> socket:[1523]
+ *     7 -> socket:[1521]
+ *
+ * Inside a VM the symptom appears in a different layer entirely: the VMM's
+ * vsock table fills, new connections are refused, and the daemon -- which is
+ * innocent -- says nothing at all. Sixteen containers was the ceiling.
+ *
+ * Called in the child AFTER its own dup2s, so 0, 1 and 2 are already the
+ * child's. Everything above them belongs to the daemon.
+ */
+static void ex_close_inherited(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* One call, whatever the limit is. Through syscall() rather than the
+     * wrapper: the wrapper is glibc 2.34+, the kernel call is 5.9+, and the
+     * guest's kernel is the one that has to have it. */
+    if (syscall(SYS_close_range, 3, ~0U, 0) == 0) return;
+#endif
+    long m = sysconf(_SC_OPEN_MAX);
+    if (m < 3 || m > 65536) m = 65536;      /* a limit of a million is not a loop */
+    for (int fd = 3; fd < (int)m; fd++) close(fd);
+}
 
 /* Fork, point stdout AND stderr at one log file, chdir into the bundle, and
  * exec the runtime. The parent gets the pid back.
@@ -77,6 +114,7 @@ int st_spawn_logged(const char *path, const char *a1, const char *a2, const char
     if (o > 2) close(o);
     if (e > 2) close(e);
     if (cwd && cwd[0] && chdir(cwd) != 0) _exit(126);
+    ex_close_inherited();
     char *argv[5] = { (char *)path, (char *)a1, (char *)a2, NULL, NULL };
     if (a3 && a3[0]) argv[3] = (char *)a3;
     execv(path, argv);
@@ -203,6 +241,7 @@ int st_px_spawn_log(const char *errfile) {
     if (z >= 0) { dup2(z, 0); if (z > 2) close(z); }
     int e = open(errfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (e >= 0) { dup2(e, 1); dup2(e, 2); if (e > 2) close(e); }
+    ex_close_inherited();
     execvp(PXV[0], PXV);
     _exit(127);
 }
@@ -214,6 +253,7 @@ int st_px_spawn(int fd) {
     if (p > 0) return (int)p;
     dup2(fd, 0); dup2(fd, 1);
     if (fd > 2) close(fd);
+    ex_close_inherited();
     execvp(PXV[0], PXV);
     _exit(127);
 }
@@ -325,6 +365,55 @@ int st_b64(const char *in, char *out, int outcap) {
     out[o] = 0;
     return (int)o;
 }
+/* A READ THAT CANNOT RAISE.
+ *
+ * read_file raises when the path is missing, and in Mere a raise ends the
+ * PROCESS. The Mere-side guard for that was `if file_exists p then read_file p`
+ * -- two calls with a gap between them, and a store field is exactly the thing
+ * another thread is deleting: removing thirty-six containers at once stepped
+ * through the gap and the daemon's last word was the path,
+ * /var/lib/mengd/networks/bridge/leases/21/id.
+ *
+ * st_write_str is this on the write side and says so; this is the half that
+ * was still spelled as a guard. One call: open, read, or "".
+ *
+ * The buffer is per thread and grows to the largest file that thread has read,
+ * because a store field can be a JSON object of unknown size and a fixed
+ * buffer would silently truncate one. The pointer is valid until this thread
+ * calls this again -- the same contract as st_b64_of.
+ */
+static _Thread_local char *ST_RD;
+static _Thread_local size_t ST_RDCAP;
+const char *st_read_str(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return "";
+    struct stat st;
+    size_t want = 4096;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) want = (size_t)st.st_size + 1;
+    if (want > ST_RDCAP) {
+        char *n = realloc(ST_RD, want);
+        if (!n) { close(fd); return ""; }
+        ST_RD = n; ST_RDCAP = want;
+    }
+    size_t o = 0;
+    for (;;) {
+        if (o + 1 >= ST_RDCAP) {            /* sysfs reports 0 and still has bytes */
+            size_t grow = ST_RDCAP ? ST_RDCAP * 2 : 4096;
+            char *n = realloc(ST_RD, grow);
+            if (!n) break;
+            ST_RD = n; ST_RDCAP = grow;
+        }
+        ssize_t r = read(fd, ST_RD + o, ST_RDCAP - o - 1);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) break;
+        o += (size_t)r;
+    }
+    close(fd);
+    if (!ST_RD) return "";
+    ST_RD[o] = 0;
+    return ST_RD;
+}
+
 static _Thread_local char ST_B64[8192];
 const char *st_b64_of(const char *in) {
     if (st_b64(in, ST_B64, (int)sizeof ST_B64) < 0) { ST_B64[0] = 0; }
@@ -426,6 +515,7 @@ int ex_spawn(int cpid, const char *argvfile, const char *envfile,
             _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
         }
         dup2(o, 1); dup2(e, 2); close(o); close(e);
+        ex_close_inherited();
         if (cwd && cwd[0]) { if (chdir(cwd) != 0) chdir("/"); } else chdir("/");
         /* execvpe is glibc's; everywhere else the environment is set first and
          * execvp inherits it. Same result, and it compiles on both. */
@@ -551,6 +641,7 @@ int ex_spawn_in(int cpid, const char *argvfile, const char *envfile,
         }
         dup2(p[0], 0); dup2(o, 1); dup2(e, 2);
         close(p[0]); close(o); close(e);
+        ex_close_inherited();
         if (cwd && cwd[0]) { if (chdir(cwd) != 0) chdir("/"); } else chdir("/");
         if (envp) for (char **v = envp; *v; v++) {
             char *eq = strchr(*v, '=');

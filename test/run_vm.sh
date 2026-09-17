@@ -56,6 +56,14 @@ set -u
 pkill mengd 2>/dev/null; sleep 1
 install -m755 $SRC/.build/mengd-linux /usr/local/bin/mengd
 install -m755 $(cd "$MRUN_SRC" && pwd)/.build/mrun-linux /usr/local/bin/mrun
+# UNMOUNT BEFORE DELETING. A container's rootfs is an overlay mount inside the
+# store, so removing /var/lib/mengd cannot take one away -- the mount stays,
+# with the image's files visible through it. A previous run that was killed
+# left thirty-one of them, the next run started with those containers still
+# listed, and its first check failed for a reason belonging to the run before.
+for m in \$(mount | grep ' /var/lib/mengd' | awk '{print \$3}' | sort -r); do
+  umount -l "\$m" 2>/dev/null
+done
 rm -rf /var/lib/mengd /var/run/mengd.sock; mkdir -p /var/lib/mengd
 # The registry in this check serves plaintext, and plaintext is opt-in now:
 # HTTPS is the default, by host and port, the way docker does it. Naming it

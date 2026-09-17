@@ -18,6 +18,25 @@
 #include <sys/un.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+
+/* CLOSE-ON-EXEC, on every socket this daemon owns.
+ *
+ * A container is started with fork+exec, and without this flag the child gets
+ * the listening socket and every client connection that was open at that
+ * moment -- and holds them for as long as it runs. store_shim.c closes them in
+ * the child as well; this is the half that does not depend on remembering to.
+ *
+ * accept4(SOCK_CLOEXEC) would be one call, but it is Linux-only and this file
+ * is compiled on macOS too. fcntl is both, and the window between accept and
+ * fcntl matters only if something execs in it -- nothing here does.
+ */
+static int cloexec(int fd) {
+    if (fd < 0) return fd;
+    int f = fcntl(fd, F_GETFD, 0);
+    if (f >= 0) fcntl(fd, F_SETFD, f | FD_CLOEXEC);
+    return fd;
+}
 
 static int fill(struct sockaddr_un *a, const char *path) {
     memset(a, 0, sizeof *a);
@@ -37,12 +56,12 @@ int unix_listen(const char *path) {
     if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) return -1;
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
     if (listen(fd, 128) < 0) { close(fd); return -1; }
-    return fd;
+    return cloexec(fd);
 }
 
 int unix_accept(int fd) {
     int c = accept(fd, 0, 0);
-    return c < 0 ? -1 : c;
+    return c < 0 ? -1 : cloexec(c);
 }
 
 int unix_connect(const char *path) {
@@ -51,7 +70,7 @@ int unix_connect(const char *path) {
     if (fill(&a, path) != 0) return -2;
     if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) return -1;
     if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
-    return fd;
+    return cloexec(fd);
 }
 
 /* AF_VSOCK, on the kernel that has it. A guest daemon binds VMADDR_CID_ANY and
@@ -73,7 +92,7 @@ int vsock_listen(int port) {
     if ((fd = socket(AF_VSOCK, SOCK_STREAM, 0)) < 0) return -1;
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
     if (listen(fd, 128) < 0) { close(fd); return -1; }
-    return fd;
+    return cloexec(fd);
 }
 #else
 int vsock_listen(int port) { (void)port; return -3; }   /* no AF_VSOCK on this platform */

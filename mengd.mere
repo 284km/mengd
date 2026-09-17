@@ -38,6 +38,7 @@ extern fn st_shutdown: unit -> int;
 extern fn st_mono_ms: unit -> int;
 extern fn st_reap_pid: int -> int;
 extern fn st_write_str: str -> str -> int;
+extern fn st_read_str: str -> str;
 extern fn st_unb64: str -> str;
 
 extern fn st_mount_overlay: str -> str -> int;
@@ -636,9 +637,10 @@ let images_body = fn (store: str) ->
 
 let cdir = fn (store: str) -> fn (id: str) -> store ++ "/containers/" ++ id;
 
+// The same gap as read_file_or had, and the one crossed most often: every
+// field of every container, read while another request may be removing it.
 let cread = fn (store: str) -> fn (id: str) -> fn (f: str) ->
-  let p = cdir store id ++ "/" ++ f in
-  if file_exists p then read_file p else "";
+  st_read_str (cdir store id ++ "/" ++ f);
 
 // THE SAME SHAPE AS read_file_or, ON THE WRITE SIDE. A container can be
 // removed while something is still watching it -- the supervisor waiting on
@@ -804,8 +806,17 @@ let image_dir = fn (store: str) -> fn (tag: str) ->
 // once something has written it -- a volume nobody created explicitly, a
 // network with no labels -- and `docker compose down` asks for exactly those.
 // The daemon died on a GET /volumes with a label filter.
+// ONE CALL, not two. `if file_exists p then read_file p else dflt` has a gap
+// between the two calls, and a store field is precisely what another thread is
+// deleting: removing thirty-six containers at once stepped through it and the
+// daemon ended with a path as its last word. st_read_str opens and reads, or
+// answers nothing -- and cannot raise, which is what matters here.
+//
+// It cannot tell an empty file from a missing one, and nothing here needs to:
+// every caller treats both as "not set".
 let read_file_or = fn (path: str) -> fn (dflt: str) ->
-  if file_exists path then read_file path else dflt;
+  let v = st_read_str path in
+  if str_len v == 0 then dflt else v;
 
 let vol_dir = fn (store: str) -> fn (name: str) -> store ++ "/volumes/" ++ name ++ "/_data";
 
@@ -1736,6 +1747,59 @@ let net_is_user = fn (store: str) -> fn (mode: str) ->
   str_len mode > 0 && mode != "host" && mode != "none" && mode != "default"
   && mode != "bridge" && file_exists (ndir store mode ++ "/id");
 
+// ---- a proxy a CONTAINER can reach -----------------------------------------
+//
+// The daemon and a build step run in the machine's own network namespace,
+// where the forwarder out is on 127.0.0.1. A container is in a namespace of
+// its own, and 127.0.0.1 THERE is its own loopback: naming it would send the
+// container's traffic to itself. What a container can reach is the gateway of
+// the network it is on -- this machine's address on that bridge -- and the
+// forwarder listens on 0.0.0.0, so it is already there.
+//
+// Measured rather than assumed: from inside a container, that address answers
+// "connection refused" on a closed port, which is reachability. An address
+// nothing can reach times out instead.
+//
+// Same port, different host. The port is whoever started the machine's
+// decision and is not this daemon's to change.
+let proxy_env_c = fn (gw: str) ->
+  let p = env_or "MENGD_PROXY" in
+  if str_len p == 0 || str_len gw == 0 then ""
+  else
+    let c = last_index_of_str p ":" in
+    let port = if c < 0 then "" else substring p (c + 1) (str_len p) in
+    if str_len port == 0 then ""
+    else
+      let url = "http://" ++ gw ++ ":" ++ port in
+      s ("HTTP_PROXY=" ++ url) ++ "," ++ s ("HTTPS_PROXY=" ++ url) ++ ","
+      ++ s ("http_proxy=" ++ url) ++ "," ++ s ("https_proxy=" ++ url);
+
+// WHICH CONTAINERS GET ONE, and why not all of them.
+//
+// On a network somebody created, container names resolve -- that is the whole
+// difference between it and the default bridge. An HTTP client with a proxy in
+// its environment stops resolving names itself and asks the proxy instead, and
+// the proxy is outside this machine and cannot know them. The usual escape is
+// no_proxy; the client that ships in the commonest base image does not have
+// one. Measured, on alpine:
+//
+//   busybox wget 1.37: no_proxy=peer / * / <ip> / <name>,<ip>  -> all time out
+//
+// So a proxy on a user-defined network turns "reach the service next to you"
+// into "ask a stranger for a name it has never heard", with nothing the person
+// running it can set to stop it. It is not added there unless asked for by
+// name: MENGD_CONTAINER_PROXY=all.
+//
+// The default bridge resolves no names at all, so there is nothing to break.
+// --network host IS the machine's namespace, so 127.0.0.1 is right.
+// --network none has nowhere to send anything.
+let proxy_gw = fn (store: str) -> fn (netmode: str) -> fn (netname: str) ->
+  if netmode == "none" then ""
+  else if netmode == "host" then "127.0.0.1"
+  else if str_len netname == 0 then ""
+  else if net_is_user store netmode && env_or "MENGD_CONTAINER_PROXY" != "all" then ""
+  else net_prefix store netname ++ ".1";
+
 // A network that exists because something asked to be on it. `docker network
 // create` makes one explicitly; the DEFAULT BRIDGE is made the first time a
 // container that named no network starts, which is the only moment anyone
@@ -2089,6 +2153,114 @@ let fwd_stop = fn (store: str) -> fn (id: str) ->
   let _ = cwrite store id "fwdpids" "" in
   0;
 
+// Can this filesystem hold an overlay's upper directory? Asked of a place
+// rather than assumed, because an overlay cannot be stacked on an overlay --
+// which is what a store inside a container is -- and the answer decides
+// between two correct shapes rather than between working and not.
+let ovl_usable_at = fn (base: str) ->
+  let d = base ++ "/.ovlprobe" in
+  let m = d ++ "/m" in
+  let _ = mkdir_p (d ++ "/l") in
+  let _ = mkdir_p (d ++ "/u") in
+  let _ = mkdir_p (d ++ "/w") in
+  let _ = mkdir_p m in
+  let rc = st_mount_overlay m ("lowerdir=" ++ d ++ "/l,upperdir=" ++ d
+                            ++ "/u,workdir=" ++ d ++ "/w") in
+  let _ = if rc == 0 then (let _ = st_umount m in ()) else () in
+  let _ = st_rmtree d in
+  rc == 0;
+
+// ---- a container's root filesystem -----------------------------------------
+//
+// Unpacking every layer into every container costs 230 ms each, measured, and
+// it is the same bytes every time. The kernel has a way to say "this tree,
+// plus whatever you write on top": overlayfs, which the build already uses --
+// a build step's layer IS the upper directory of one.
+//
+// So the image is unpacked ONCE and every container gets an overlay whose
+// lower is that and whose upper is its own. Flattened rather than one lower
+// per layer: applying whiteouts as deletions is what `walk_opt` already does
+// and what the layer order means, and giving each layer its own lower would
+// mean writing overlay's own whiteouts (character device 0:0, an opaque
+// xattr) to say the same thing in a second language.
+//
+// The image directory is the key, because it already is one: the same image is
+// the same directory, and deleting the image takes this with it.
+let img_rootfs = fn (dir: str) ->
+  let r = dir ++ "/.rootfs" in
+  let done = dir ++ "/.rootfs.done" in
+  if file_exists done then r
+  else
+    // ATOMIC, because two `docker run` of the same image arrive on two threads
+    // and both would unpack into the same directory at the same time. mkdir is
+    // the lease: whoever makes it does the work, and the others wait for the
+    // marker rather than for the directory, which exists from the first moment.
+    if st_mkdir_excl r == 0 then
+      let n = build_rootfs dir r in
+      if n < 0 then (let _ = st_rmtree r in "")
+      else (let _ = st_write_str done "" in r)
+    else
+      let rec wait = fn (i: int) ->
+        if file_exists done then r
+        else if i > 600 then ""            // 60 s: longer than any image here
+        else let _ = sleep_ms 100 in wait (i + 1) in
+      wait 0;
+
+// Put an image's filesystem under a container's own writable layer.
+// Returns "" on success or the reason.
+let ctr_mount = fn (store: str) -> fn (id: str) -> fn (dir: str) ->
+  let cd = cdir store id in
+  let lower = img_rootfs dir in
+  if str_len lower == 0 then "mengd: cannot unpack " ++ dir
+  else
+    let up = cd ++ "/upper" in
+    let wk = cd ++ "/work" in
+    let merged = cd ++ "/bundle/rootfs" in
+    let _ = mkdir_p up in
+    let _ = mkdir_p wk in
+    let _ = mkdir_p merged in
+    if st_mount_overlay merged ("lowerdir=" ++ lower ++ ",upperdir=" ++ up
+                             ++ ",workdir=" ++ wk) != 0 then
+      "mengd: cannot mount an overlay at " ++ merged
+    else "";
+
+// And take it off again, before anything deletes the directory it is in.
+//
+// WHAT ACTUALLY GOES WRONG, measured by removing the call and watching:
+// **not** the image. overlayfs protects its own lower layer -- a delete
+// through the merged view becomes a whiteout in the upper -- so the image
+// survives, which is worth knowing because the opposite is the obvious guess.
+// What fails is the removal itself: a directory containing a mount point
+// cannot be removed, so `docker rm` leaves the container listed and its mount
+// behind. Forty-four containers that could not be deleted, and a store that a
+// later `rm -rf` cannot clean either.
+//
+// Returns 0 when there is nothing mounted there any more.
+let ctr_unmount = fn (store: str) -> fn (id: str) ->
+  if cread store id "ovl" != "1" then 0
+  else
+    let merged = cdir store id ++ "/bundle/rootfs" in
+    // A container's last process can still hold the mount for a moment after
+    // the kill returns -- EBUSY, and the first version of this read that as
+    // "refuse forever": two of forty were never deleted. So it is asked again
+    // for two seconds before it is believed.
+    //
+    // Each attempt drains stacked mounts (st_umount escalates to MNT_DETACH
+    // itself), then looks: a directory that still shows the image's files is
+    // still mounted, and that is the only answer that matters here.
+    let still = fn (u: unit) ->
+      file_exists (merged ++ "/etc") || file_exists (merged ++ "/bin") in
+    let rec drain = fn (i: int) ->
+      if i > 8 then () else if st_umount merged == 0 then drain (i + 1) else () in
+    let rec attempt = fn (n: int) ->
+      let _ = drain 0 in
+      if not (still ()) then 0
+      else if n > 20 then
+        (let _ = print_err ("mengd: " ++ substring id 0 12
+                         ++ ": its rootfs is still mounted after 2 s") in 0 - 1)
+      else let _ = sleep_ms 100 in attempt (n + 1) in
+    attempt 0;
+
 let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) ->
   // Length only. A create body carries the container's environment, which is
   // where people put credentials; a daemon log is not the place for it.
@@ -2115,7 +2287,12 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
     let cd = cdir store id in
     let _ = mkdir_p (cd ++ "/bundle") in
     let _ = tc "build_rootfs" in
-    let n = build_rootfs dir (cd ++ "/bundle/rootfs") in
+    // The overlay first, and the old way when the machine cannot mount one:
+    // a store on top of another overlay cannot be an upper directory, and
+    // that is a smaller machine rather than a broken one.
+    let ovl = if ovl_usable_at store then str_len (ctr_mount store id dir) == 0 else false in
+    let _ = if ovl then (let _ = cwrite store id "ovl" "1" in ()) else () in
+    let n = if ovl then 1 else build_rootfs dir (cd ++ "/bundle/rootfs") in
     let _ = tc "rootfs done" in
     if n < 0 then
       respond fd "500 Internal Server Error" "application/json"
@@ -2201,7 +2378,13 @@ let c_create = fn (fd: int) -> fn (store: str) -> fn (body: str) -> fn (q: str) 
                  let body = go 0 "" in
                  if str_len body == 0 then "" else "\{" ++ body ++ "}") in
       let _ = cwrite store id "cgroup" ("mengd/" ++ substring id 0 12) in
-      let cfg = oci_config argv env wd (jstr (jget spec "Hostname")) host_net bj netns
+      // The proxy goes at the HEAD, so the image's ENV and a -e both override
+      // it -- the same rule the build steps state ("the Dockerfile wins").
+      let pe = proxy_env_c (proxy_gw store netmode netname) in
+      let env2 = if str_len pe == 0 then env
+                 else if env == "[]" then "[" ++ pe ++ "]"
+                 else "[" ++ pe ++ "," ++ substring env 1 (str_len env) in
+      let cfg = oci_config argv env2 wd (jstr (jget spec "Hostname")) host_net bj netns
                            ("mengd/" ++ substring id 0 12) res in
       let _ = write_file (cd ++ "/bundle/config.json") cfg in
       let _ = cwrite store id "name" name in
@@ -3002,6 +3185,26 @@ let c_image_delete = fn (fd: int) -> fn (store: str) -> fn (name: str) ->
         if field l 1 == want then rebuild tl acc others
         else rebuild tl (acc ++ l ++ "\n") (if field l 2 == dir then others + 1 else others) in
     let (idx, others) = rebuild (read_index store) "" 0 in
+    // IS ANYTHING USING IT. Every container's rootfs is an overlay whose lower
+    // is this directory's one unpacked copy. Removing it under a running
+    // container leaves that container reading a filesystem that is being
+    // deleted beneath it. Docker refuses the same thing in the same words.
+    let users = (let d = store ++ "/containers" in
+                 if not (file_exists d) then 0
+                 else
+                   let rec go = fn (xs: str list) -> fn (n: int) ->
+                     match xs with
+                     | [] -> n
+                     | [h, ...t] ->
+                         go t (if image_dir store (cread store h "image") == dir
+                               then n + 1 else n) in
+                   go (list_dir d) 0) in
+    if others == 0 && users > 0 then
+      respond fd "409 Conflict" "application/json"
+        (obj [("message", s ("conflict: unable to delete " ++ want
+                         ++ " (must be forced) - image is being used by "
+                         ++ show users ++ " container(s)"))])
+    else
     let _ = write_file (index_path store) idx in
     let _ = if others == 0 then (let _ = st_rmtree dir in ()) else () in
     respond fd "200 OK" "application/json"
@@ -3070,9 +3273,15 @@ let c_prune_containers = fn (fd: int) -> fn (store: str) ->
               match xs with
               | [] -> ()
               | [h, ...t] ->
+                  // Same rule as DELETE: a container still mounted is left
+                  // alone rather than deleted through its mount.
                   let _ = if cread store h "state" == "exited" then
                             (let _ = net_down store h in
                              let _ = net_release store (cread store h "net") h in
+                             if ctr_unmount store h != 0 then
+                               (let _ = print_err ("mengd: " ++ substring h 0 12
+                                     ++ " is still mounted; not pruning it") in ())
+                             else
                              let _ = st_rmtree (cdir store h) in
                              let _ = vec_push gone h in ()) else () in
                   go t in
@@ -3790,17 +3999,7 @@ let step_key = fn (prev: str) -> fn (line: str) -> fn (extra: str) ->
 // cannot mount an overlay can still build a correct image -- one flat layer,
 // which is what this did for every build until now -- but it is a different
 // shape, and a different shape arrived at silently is the thing to avoid.
-let ovl_usable = fn (work: str) ->
-  let m = work ++ "/probe/m" in
-  let _ = mkdir_p (work ++ "/probe/l") in
-  let _ = mkdir_p (work ++ "/probe/u") in
-  let _ = mkdir_p (work ++ "/probe/w") in
-  let _ = mkdir_p m in
-  let rc = st_mount_overlay m ("lowerdir=" ++ work ++ "/probe/l"
-                            ++ ",upperdir=" ++ work ++ "/probe/u"
-                            ++ ",workdir=" ++ work ++ "/probe/w") in
-  let _ = if rc == 0 then (let _ = st_umount m in ()) else () in
-  rc == 0;
+let ovl_usable = fn (work: str) -> ovl_usable_at work;
 
 let c_build = fn (fd: int) -> fn (store: str) -> fn (ctx: str) -> fn (q: str) ->
               fn (runtime: str) ->
@@ -4523,9 +4722,16 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
                   let pid = int_or (cread store id "pid") 0 in
                   let _ = if cpid > 0 then st_kill cpid 9 else 0 in
                   let _ = if pid > 0 then st_kill pid 9 else 0 in
+                  // BOTH, not just the runtime. The runtime is the parent and
+                  // the container's init is its child: waiting only for the
+                  // parent returns while the child is still exiting, and the
+                  // answer "it is removed" is given to a client that can then
+                  // count processes and find them. Four of thirty-six.
                   let rec wait_gone = fn (n: int) ->
-                    if pid <= 0 || st_kill pid 0 != 0 then ()
-                    else if n > 20 then ()
+                    let live = (pid > 0 && st_kill pid 0 == 0)
+                            || (cpid > 0 && st_kill cpid 0 == 0) in
+                    if not live then ()
+                    else if n > 40 then ()
                     else let _ = sleep_ms 50 in wait_gone (n + 1) in
                   wait_gone 0) in
          let _ = fwd_stop store id in
@@ -4534,6 +4740,16 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
          // one that is already taken.
          let _ = net_down store id in
          let _ = net_release store (cread store id "net") id in
+         // THE MOUNT COMES OFF FIRST, and if it will not, nothing is deleted
+         // and the client is told. A directory with a mount point inside it
+         // cannot be removed: the delete half-succeeds, the container stays
+         // listed, and the mount is left for the next thing that tries to
+         // clean the store to trip over.
+         if ctr_unmount store id != 0 then
+           respond fd "500 Internal Server Error" "application/json"
+             (obj [("message", s ("mengd: " ++ substring id 0 12
+                              ++ " is still mounted; refusing to delete it"))])
+         else
          let _ = st_rmtree (cdir store id) in
          respond fd "204 No Content" "text/plain" ""
        else respond fd "404 Not Found" "application/json"
@@ -4589,6 +4805,21 @@ let reconcile = fn (store: str) ->
       | [h, ...t] ->
           let st = cread store h "state" in
           let pid = int_or (cread store h "pid") 0 in
+          // A MOUNT DOES NOT SURVIVE THE MACHINE. After a reboot the
+          // container's rootfs is an empty directory where an overlay used to
+          // be, and starting it -- or `docker cp` out of it -- would find
+          // nothing. Put back before anything asks.
+          let _ = if cread store h "ovl" == "1"
+                     && not (file_exists (cdir store h ++ "/bundle/rootfs/etc"))
+                     && not (file_exists (cdir store h ++ "/bundle/rootfs/bin")) then
+                    (let d = image_dir store (cread store h "image") in
+                     let _ = if str_len d == 0 then
+                               (let _ = print_err ("mengd: " ++ substring h 0 12
+                                     ++ " has no image left to mount") in ())
+                             else
+                               let e = ctr_mount store h d in
+                               if str_len e > 0 then (let _ = print_err e in ()) else () in ())
+                  else () in
           let _ = if (st == "running" || st == "restarting")
                      && (pid <= 0 || st_kill pid 0 != 0) then
                     (let _ = cwrite store h "state" "exited" in

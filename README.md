@@ -614,6 +614,46 @@ given.
 **The handshake still happens here**, with the real host, through the tunnel.
 The proxy sees the name in the CONNECT line and ciphertext after it.
 
+### And what a container is told
+
+A build step shares the machine's network namespace, so it is given
+`HTTP_PROXY` and friends spelt `127.0.0.1:<port>`, where the forwarder out is.
+**A container is not in that namespace**, and `127.0.0.1` there is its own
+loopback — naming it would send the container's traffic to itself. What a
+container can reach is the **gateway of the network it is on**, this machine's
+address on that bridge, and the forwarder listens on `0.0.0.0`, so it is
+already there. Measured rather than assumed: from inside a container that
+address answers *connection refused* on a closed port, which is reachability;
+an address nothing can reach times out.
+
+**Not every container gets one.** On a network somebody created, container
+names resolve — that is the whole difference between it and the default bridge.
+An HTTP client with a proxy in its environment stops resolving names itself and
+asks the proxy, which is outside this machine and has never heard of them. The
+usual escape is `no_proxy`, and the client in the commonest base image does not
+have one:
+
+```
+busybox wget 1.37, no_proxy = peer / * / <ip> / <name>,<ip>   -> all time out
+```
+
+So the rule, with a reason for each line:
+
+| | |
+|---|---|
+| the default bridge | **gets it** — no names resolve there, so nothing can break |
+| a network you created | **does not**, unless `MENGD_CONTAINER_PROXY=all` |
+| `--network host` | gets it, spelt `127.0.0.1` — it *is* the machine's namespace |
+| `--network none` | never — there is nowhere to send anything |
+
+The four names go at the **head** of the environment, so an image's `ENV` and a
+`-e` both override them: the same rule the build steps state.
+
+Docker does this in its **client**, not its daemon — a create sent straight to
+the API gets no proxy at all, measured. Doing it here is a deliberate
+difference, for a reason only the daemon can act on: the value depends on which
+network the container is on, and the client cannot know that address.
+
 ## Where to dial, and what to verify
 
 `MENGD_DIAL=<registry host:port>=<host:port>` separates the socket from the
@@ -724,6 +764,42 @@ that is mrun's half. Without it the option meant nothing, silently.
 `GET /volumes` with a label filter, and the daemon died. Every read of a field
 that exists only once something has written it goes through `read_file_or`
 now — the same shape as `jparse`, and found the same way.
+
+## A container's root filesystem is an overlay
+
+Unpacking every layer into every container costs **230 ms each**, measured, and
+it is the same bytes every time. So the image is unpacked **once** and every
+container gets an overlay whose lower is that and whose upper is its own —
+which is the machinery the build already uses, where a step's layer *is* the
+upper directory of one. One container went from **294 ms to 78 ms**; forty
+started at once, from 12.4 s to 5.3 s.
+
+Flattened rather than one lower per layer: applying whiteouts as deletions is
+what the unpacker already does, and giving each layer its own lower would mean
+writing overlay's own whiteouts — a character device 0:0, an opaque xattr — to
+say the same thing in a second language.
+
+**The mount comes off before the directory is deleted**, and if it will not,
+nothing is deleted and the client is told. Removing that guard and watching
+showed the obvious guess was wrong: the image is *not* destroyed — overlayfs
+protects its own lower, and a delete through the merged view becomes a whiteout
+in the upper. What breaks is the removal itself. A directory with a mount point
+inside it cannot be removed, so forty-four containers stayed listed with their
+mounts behind them, and a later `rm -rf` of the store could not clean them
+either. Anything that deletes this store has to unmount first.
+
+**`docker rmi` now refuses an image a container is using** (409, the same words
+docker uses), because that image directory is the lower of every one of their
+mounts.
+
+**A mount does not survive the machine.** After a reboot a container's rootfs is
+an empty directory where an overlay used to be, so the daemon puts it back at
+startup, before anything asks.
+
+A store that cannot hold an overlay's upper directory — one inside another
+overlay, which is what a store inside a container is — gets the old shape, one
+unpacked copy per container. That is a smaller machine, not a broken one, and
+it is decided by asking rather than by assuming.
 
 ## A network between containers
 
