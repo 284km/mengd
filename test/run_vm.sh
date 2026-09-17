@@ -719,6 +719,23 @@ echo "\$a" | grep -q pssrun && echo "\$a" | grep -q psgone
 say \$? "docker ps -a lists both (\$a)"
 timeout 20 docker rm -f pssrun psgone >/dev/null 2>&1
 
+# A FILTER THAT IS IGNORED HANDS BACK EVERYTHING, and the caller is often about
+# to delete what it gets: docker rm -f \$(docker ps -aq --filter name=tmp)
+# removed every container on the machine here, including the one a measurement
+# was running in. The daemon applied label filters and silently ignored the
+# rest.
+timeout 60 docker run -d --name filtaaa alpine:latest sleep 300 >/dev/null 2>&1
+timeout 60 docker run -d --name filtbbb alpine:latest sleep 300 >/dev/null 2>&1
+timeout 60 docker run --name filtccc alpine:latest true >/dev/null 2>&1
+sleep 1
+n=\$(timeout 20 docker ps -a --format '{{.Names}}' --filter name=filtaaa 2>/dev/null | tr -d '\r' | wc -l | tr -d ' ')
+[ "\$n" = 1 ]; say \$? "docker ps --filter name= returns the one that matches (\$n)"
+o=\$(timeout 20 docker ps -a --format '{{.Names}}' --filter name=filtbbb 2>/dev/null | tr -d '\r\n')
+[ "\$o" = "filtbbb" ]; say \$? "and it is the right one (\$o)"
+o=\$(timeout 20 docker ps -a --format '{{.Names}}' --filter status=exited 2>/dev/null | tr -d '\r' | grep -c filtccc)
+[ "\$o" = 1 ]; say \$? "--filter status= works too (\$o)"
+timeout 30 docker rm -f filtaaa filtbbb filtccc >/dev/null 2>&1
+
 # --rm IS THE DAEMON'S JOB. Modern docker sets HostConfig.AutoRemove and lets
 # the daemon delete the container after it exits; a daemon that does not read
 # it leaves one behind every time, and no count notices because every check

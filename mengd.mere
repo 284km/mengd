@@ -984,8 +984,11 @@ let query_param = fn (q: str) -> fn (k: str) ->
 // percent-encoded. A daemon that ignores the filter hands compose every
 // container on the host and it adopts them all.
 
-// Every key of filters.label, as stored: "k=v" or "k".
-let filter_labels = fn (q: str) ->
+// The values under one key of `filters`, whatever the key is.
+//
+// It was written for `label` alone and the shape is the same for all of them:
+// filters={"name":{"web":true},"status":{"running":true}}.
+let filter_key = fn (q: str) -> fn (key: str) ->
   let raw = query_param q "filters" in
   if str_len raw == 0 then []
   else
@@ -996,7 +999,7 @@ let filter_labels = fn (q: str) ->
            | [] -> []
            | [p, ...t] ->
                let (k, v) = p in
-               if k == "label" then
+               if k == key then
                  (match v with
                   | Json.JObj ls ->
                       (let rec keys = fn (qs: (str * Json.json) list) ->
@@ -1008,6 +1011,60 @@ let filter_labels = fn (q: str) ->
                else find t in
          find kvs)
     | _ -> [];
+
+// Every key of filters.label, as stored: "k=v" or "k".
+let filter_labels = fn (q: str) -> filter_key q "label";
+
+// A NAME FILTER THAT IS IGNORED HANDS BACK EVERYTHING, and the caller is often
+// about to delete what it gets:
+//
+//     docker rm -f $(docker ps -aq --filter name=tmp)
+//
+// That line removed every container on the machine here, including the one the
+// measurement was running in. Docker matches the name as a regular expression;
+// every name anybody types is a plain string, and for those a substring test
+// is what that means. Several values are OR -- unlike labels, which are AND.
+let filter_names = fn (nm: str) -> fn (pats: str list) ->
+  match pats with
+  | [] -> true
+  | _ ->
+      (let rec any = fn (ps: str list) ->
+         match ps with
+         | [] -> false
+         | [p, ...t] -> if str_index_of nm p >= 0 then true else any t in
+       any pats);
+
+// The same for status, which is the other one a script uses before deleting.
+let filter_status = fn (st: str) -> fn (pats: str list) ->
+  match pats with
+  | [] -> true
+  | _ ->
+      (let rec any = fn (ps: str list) ->
+         match ps with
+         | [] -> false
+         | [p, ...t] -> if st == p then true else any t in
+       any pats);
+
+// EVERY OTHER KEY IS SAID OUT LOUD. A filter this daemon does not apply is a
+// client being handed more than it asked for, and silence about it is how the
+// one above went unnoticed. Not an error: a list is still a legal answer.
+let warn_unknown_filters = fn (q: str) ->
+  let raw = query_param q "filters" in
+  if str_len raw == 0 then ()
+  else
+    match jparse (url_decode raw) with
+    | Json.JObj kvs ->
+        (let rec go = fn (ps: (str * Json.json) list) ->
+           match ps with
+           | [] -> ()
+           | [p, ...t] ->
+               let (k, v) = p in
+               let _ = if k != "label" && k != "name" && k != "status" then
+                         (let _ = print_err ("mengd: ignoring a filter this daemon does not apply: "
+                                          ++ k) in ()) else () in
+               go t in
+         go kvs)
+    | _ -> ();
 
 // The container's own labels, stored at create as the raw JSON object.
 let has_label = fn (labels: str) -> fn (want: str) ->
@@ -3794,6 +3851,8 @@ let c_list_body = fn (store: str) -> fn (q: str) ->
           // the same answer for both commands, so one of them was always
           // wrong.
           if not (matches_all (cread store h "labels") (filter_labels q)) then go t acc
+          else if not (filter_names (cread store h "name") (filter_key q "name")) then go t acc
+          else if not (filter_status (cread store h "state") (filter_key q "status")) then go t acc
           else if query_param q "all" != "true" && query_param q "all" != "1"
                   && cread store h "state" != "running"
                   && cread store h "state" != "restarting" then go t acc else
@@ -4719,7 +4778,8 @@ let handle = fn (fd: int) -> fn (buf: int) -> fn (cap: int) -> fn (st) ->
      else respond fd "404 Not Found" "application/json"
             (obj [("message", s ("mengd: " ++ m ++ " " ++ path ++ " is not implemented"))]))
   else if path == "/containers/json" then
-    respond fd "200 OK" "application/json" (c_list_body store q)
+    (let _ = warn_unknown_filters q in
+     respond fd "200 OK" "application/json" (c_list_body store q))
   else if path == "/containers/create" then
     let clen = header_int req "Content-Length: " in
     let body = read_body fd buf cap st clen in
