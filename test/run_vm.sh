@@ -765,6 +765,38 @@ n=\$(timeout 20 docker ps -q 2>/dev/null | wc -l | tr -d ' ')
 o=\$(timeout 30 docker run --rm alpine:latest echo still-answering 2>/dev/null | tr -d '\\r\\n')
 [ "\$o" = "still-answering" ]; say \$? "and the daemon still answers a new client (\$o)"
 
+# AND THE SAME NUMBER OF CLIENTS AT ONCE, WHICH IS A DIFFERENT QUESTION.
+#
+# The check above starts its 36 one after another: it asks whether 36 RUNNING
+# containers hold anything, and the answer is no. It never asked what happens
+# when 36 CLIENTS arrive together, and that is where the daemon stopped.
+#
+# docker run opens /wait on a connection of its own and sends /start only
+# after /wait's headers come back. A /wait that keeps its buffer slot while it
+# polls is holding the buffer the /start it is waiting for needs, so past the
+# slot count they wedge against each other. Measured before the fix, at eighty:
+# 80 /wait opened and 32 answered, those 32 clients sent /start, all 32 starts
+# queued behind the waits, and not one of eighty containers was started -- with
+# every client having been handed a container id and reporting no error.
+for n in \$(timeout 60 docker ps -aq 2>/dev/null); do timeout 30 docker rm -f "\$n" >/dev/null 2>&1; done
+rm -rf /tmp/burst; mkdir -p /tmp/burst
+i=0
+while [ "\$i" -lt 80 ]; do
+  ( timeout 120 docker run -d --name burst\$i alpine:latest sh -c 'exit 0' >/dev/null 2>&1
+    echo d > /tmp/burst/ok.\$i ) &
+  i=\$((i + 1))
+done
+w=0
+while [ "\$(ls /tmp/burst/ok.* 2>/dev/null | wc -l | tr -d ' ')" -lt 80 ] && [ "\$w" -lt 90 ]; do
+  sleep 3; w=\$((w + 3))
+done
+n=\$(ls /tmp/burst/ok.* 2>/dev/null | wc -l | tr -d ' ')
+[ "\$n" = 80 ]; say \$? "80 clients at once, all 80 returned (\$n) -- not 36 one after another"
+o=\$(timeout 30 docker run --rm alpine:latest echo after-the-burst 2>/dev/null | tr -d '\\r\\n')
+[ "\$o" = "after-the-burst" ]; say \$? "and the daemon still answers afterwards (\$o)"
+for n in \$(timeout 60 docker ps -aq 2>/dev/null); do timeout 30 docker rm -f "\$n" >/dev/null 2>&1; done
+rm -rf /tmp/burst
+
 # REMOVING ONE MUST TAKE ITS PROCESSES WITH IT. The runtime is the parent and
 # the container's init is its child: killing a parent orphans a child. Removing
 # a container used to leave one behind every time, and a machine collected them
