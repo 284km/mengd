@@ -69,6 +69,7 @@ extern fn unix_time: unit -> int;
 extern fn st_slots: unit -> int;
 extern fn st_slot_acquire: unit -> int;
 extern fn st_slot_release: int -> int;
+extern fn st_slot_drop: unit -> int;
 extern fn fs_last_error: unit -> str;
 extern fn fs_fail: str -> str -> int;
 extern fn fs_clear_error: unit -> int;
@@ -3238,6 +3239,12 @@ let c_wait = fn (fd: int) -> fn (store: str) -> fn (id: str) ->
   // Headers first, before the container has even been started: the client
   // sends /start only after these arrive.
   let _ = respond_chunked_head fd "application/json" in
+  // AND GIVE THE BUFFER SLOT BACK BEFORE WAITING. The client sends /start only
+  // after the headers above arrive, and /start needs a slot of its own. Held
+  // through the poll below, this slot is exactly what that start is queued
+  // for: with every slot held by a wait, no container is ever started and the
+  // daemon answers nothing at all. Nothing after this line uses the buffer.
+  let _ = st_slot_drop () in
   // AND NOTICE WHEN THE CLIENT GOES AWAY. `docker run -d` opens a wait before
   // it starts the container and then leaves; this polled for five minutes
   // regardless, holding a thread and a buffer slot the whole time. One per

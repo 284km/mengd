@@ -161,25 +161,58 @@ static pthread_mutex_t slot_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  slot_c = PTHREAD_COND_INITIALIZER;
 static unsigned char   slot_used[MENGD_SLOTS];
 
+/* WHICH SLOT THIS THREAD HOLDS. One connection is one thread and a thread
+ * takes at most one slot, so the thread can be asked -- which is what lets a
+ * handler give its slot back EARLY and leaves the accept loop's release
+ * afterwards a no-op, rather than freeing a slot somebody else has since
+ * taken. */
+static _Thread_local int MY_SLOT = -1;
+
 int st_slots(void) { return MENGD_SLOTS; }
 
 int st_slot_acquire(void) {
     pthread_mutex_lock(&slot_m);
     for (;;) {
         for (int i = 0; i < MENGD_SLOTS; i++)
-            if (!slot_used[i]) { slot_used[i] = 1; pthread_mutex_unlock(&slot_m); return i; }
+            if (!slot_used[i]) {
+                slot_used[i] = 1; MY_SLOT = i;
+                pthread_mutex_unlock(&slot_m);
+                return i;
+            }
         pthread_cond_wait(&slot_c, &slot_m);
     }
 }
 
+/* Give back the slot this thread holds. The index is what the caller believes
+ * it has; the thread is the authority. A thread that has already given its
+ * slot back returns 0 and touches nothing, which is what makes calling this
+ * twice safe -- and the accept loop always calls it once. */
 int st_slot_release(int i) {
-    if (i < 0 || i >= MENGD_SLOTS) return -1;
+    (void)i;
+    int s = MY_SLOT;
+    if (s < 0) return 0;
+    MY_SLOT = -1;
     pthread_mutex_lock(&slot_m);
-    slot_used[i] = 0;
+    slot_used[s] = 0;
     pthread_cond_signal(&slot_c);
     pthread_mutex_unlock(&slot_m);
     return 0;
 }
+
+/* FOR A HANDLER THAT IS ABOUT TO WAIT FOR SOMETHING THAT IS NOT ITS REQUEST.
+ *
+ * /wait answers its headers first and then polls until the container exits --
+ * and the docker CLI sends /start only AFTER those headers arrive. So a /wait
+ * that keeps its slot while polling is holding the buffer that the /start it
+ * is waiting for needs. At eighty parallel `docker run` the measurement was
+ * exact: 80 /wait opened, 32 of them got slots and answered their headers,
+ * those 32 clients sent /start, all 32 /start queued for a slot that would
+ * never come free, and nothing finished -- 80 create requests answered, not
+ * one container started. Thirty-two is MENGD_SLOTS.
+ *
+ * A handler that calls this must not touch its pooled buffer afterwards.
+ * c_wait never receives one. */
+int st_slot_drop(void) { return st_slot_release(-1); }
 
 /* ---- timestamps -------------------------------------------------------- */
 /*
