@@ -1859,8 +1859,18 @@ let proxy_env_c = fn (gw: str) ->
     if str_len port == 0 then ""
     else
       let url = "http://" ++ gw ++ ":" ++ port in
+      // AND THE SAME ADDRESS AS SOCKS, because the four names above reach only
+      // what speaks HTTP to a proxy. The proxy answers both protocols on this
+      // one port and decides from the first byte, so this is the same place
+      // said twice, for the clients that read a different variable.
+      //
+      // socks5h, not socks5: the h is "let the proxy resolve the name". This
+      // guest has no resolver, so a client that resolves first has already
+      // failed -- which is the whole reason there is a proxy at all.
+      let sx = "socks5h://" ++ gw ++ ":" ++ port in
       s ("HTTP_PROXY=" ++ url) ++ "," ++ s ("HTTPS_PROXY=" ++ url) ++ ","
-      ++ s ("http_proxy=" ++ url) ++ "," ++ s ("https_proxy=" ++ url);
+      ++ s ("http_proxy=" ++ url) ++ "," ++ s ("https_proxy=" ++ url) ++ ","
+      ++ s ("ALL_PROXY=" ++ sx) ++ "," ++ s ("all_proxy=" ++ sx);
 
 // WHICH CONTAINERS GET ONE, and why not all of them.
 //
