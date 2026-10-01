@@ -42,7 +42,7 @@ let block = 512;
 
 // ---- header field readers (offsets are relative to the 512-byte block) ----
 
-let str_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (maxlen: int) ->
+let str_at = fn (b: ByteBuf['r]) -> fn (off: int) -> fn (maxlen: int) ->
   let rec go = fn (i: int) -> fn (acc: str) ->
     if i == maxlen then acc
     else
@@ -52,7 +52,7 @@ let str_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (maxlen: int) ->
 
 // Octal ASCII, NUL- or space-padded. Non-digits are skipped, which is the
 // same answer as stopping at the first one for a well-formed field.
-let oct_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (len: int) ->
+let oct_at = fn (b: ByteBuf['r]) -> fn (off: int) -> fn (len: int) ->
   let rec go = fn (i: int) -> fn (acc: int) ->
     if i == len then acc
     else
@@ -63,7 +63,7 @@ let oct_at = fn (b: ByteBuf[R]) -> fn (off: int) -> fn (len: int) ->
   go 0 0;
 
 // The header checksum, computed with the checksum field itself read as spaces.
-let header_sum = fn (b: ByteBuf[R]) ->
+let header_sum = fn (b: ByteBuf['r]) ->
   let rec go = fn (i: int) -> fn (acc: int) ->
     if i == block then acc
     else
@@ -72,7 +72,7 @@ let header_sum = fn (b: ByteBuf[R]) ->
       go (i + 1) (acc + c) in
   go 0 0;
 
-let all_zero = fn (b: ByteBuf[R]) ->
+let all_zero = fn (b: ByteBuf['r]) ->
   let rec go = fn (i: int) ->
     if i == block then true
     else if bytebuf_get b i == 0 then go (i + 1) else false in
